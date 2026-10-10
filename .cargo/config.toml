@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# statically link the CRT: the exe needs no VCRUNTIME140.dll on clean machines
+rustflags = ["-C", "target-feature=+crt-static"]

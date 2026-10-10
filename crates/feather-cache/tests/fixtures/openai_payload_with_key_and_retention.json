@@ -1,0 +1,7 @@
+{
+  "model": "gpt-5.5",
+  "stream": true,
+  "messages": [{ "role": "user", "content": "hi" }],
+  "prompt_cache_key": "pi-0123456789abcdef0123456789abcdef",
+  "prompt_cache_retention": "24h"
+}

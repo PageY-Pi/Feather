@@ -1,0 +1,14 @@
+{
+  "model": "claude-sonnet-5",
+  "max_tokens": 4096,
+  "stream": true,
+  "system": [
+    { "type": "text", "text": "you are feather", "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+  ],
+  "tools": [
+    { "name": "read", "description": "read", "input_schema": {}, "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+  ],
+  "messages": [
+    { "role": "user", "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }] }
+  ]
+}

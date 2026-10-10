@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/feather-core",
+    "crates/feather-cache",
+    "crates/feather-hashline",
+    "crates/feather",
+    "crates/feather-gui",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.78"
+
+[workspace.dependencies]
+feather-core = { path = "crates/feather-core" }
+feather-cache = { path = "crates/feather-cache" }
+feather-hashline = { path = "crates/feather-hashline" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "io-util", "io-std", "time", "sync", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "blocking", "socks"] }
+futures-util = { version = "0.3", default-features = false }
+bytes = "1"
+redb = "2"
+sha2 = "0.10"
+regex = "1"
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

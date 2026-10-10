@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <clipPath id="bodyClip">
+      <path d="M 250 840 C 315 610 465 315 815 105 C 880 285 800 520 610 705 C 480 835 340 875 250 840 Z"/>
+    </clipPath>
+  </defs>
+  <path d="M 250 840 C 315 610 465 315 815 105 C 880 285 800 520 610 705 C 480 835 340 875 250 840 Z" fill="#78927f" stroke="#26312d" stroke-width="44" stroke-linejoin="round"/>
+  <g clip-path="url(#bodyClip)" fill="none" stroke="#26312d" stroke-width="32" stroke-linecap="round">
+    <path d="M 430 545 C 520 505 615 435 705 335"/>
+    <path d="M 500 665 C 585 640 675 585 745 505"/>
+    <path d="M 345 760 C 430 715 520 690 610 680"/>
+  </g>
+  <path d="M 185 945 C 300 730 480 505 815 105" fill="none" stroke="#26312d" stroke-width="62" stroke-linecap="round"/>
+  <path d="M 185 945 C 300 730 480 505 815 105" fill="none" stroke="#42584d" stroke-width="34" stroke-linecap="round"/>
+</svg>

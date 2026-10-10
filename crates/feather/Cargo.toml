@@ -1,0 +1,28 @@
+[package]
+name = "feather"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "feather binary: pi kernel + hashline + cache-optimizer + subagent-feather + task-tracker + omp theme in one binary"
+
+[[bin]]
+name = "feather"
+path = "src/main.rs"
+
+[dependencies]
+feather-core.workspace = true
+feather-cache.workspace = true
+feather-hashline.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9"
+globset = "0.4"
+regex.workspace = true
+scraper = "0.22"
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+getrandom = "0.2"
+fs2 = "0.4"
+redb.workspace = true

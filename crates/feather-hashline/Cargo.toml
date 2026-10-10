@@ -1,0 +1,17 @@
+[package]
+name = "feather-hashline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hashline/anchor editing: 4-char anchors, anchor-addressed read/replace/insert/copy/move + anchor_grep"
+
+[dependencies]
+feather-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

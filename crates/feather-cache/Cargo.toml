@@ -1,0 +1,13 @@
+[package]
+name = "feather-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cache-optimizer: stable prefix tracking, cache breakpoints, hit-rate metrics"
+
+[dependencies]
+feather-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
