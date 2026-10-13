@@ -160,12 +160,6 @@ struct FeatherApp {
     rows: Vec<ChatRow>,
     history: history::History,
     input: String,
-    /// True while the platform reports a non-empty IME pre-edit string.
-    ///
-    /// Windows IMEs can still forward the physical Backspace key to egui while
-    /// consuming it to edit the composition. Keep that key out of TextEdit so
-    /// correcting pinyin cannot delete committed Hanzi from the composer.
-    ime_preedit_active: bool,
     running: bool,
     last_stop: Option<StopReason>,
     queued_hint: usize,
@@ -315,7 +309,6 @@ impl FeatherApp {
             rows,
             history: transcript_history,
             input: String::new(),
-            ime_preedit_active: false,
             running: false,
             last_stop: None,
             queued_hint: 0,
@@ -3284,44 +3277,6 @@ fn short_path(p: &std::path::Path) -> String {
 // ---------------------------------------------------------------------------
 // eframe entry
 // ---------------------------------------------------------------------------
-/// Drop the duplicate Backspace key that Windows IMEs can forward while they
-/// are editing a non-empty pre-edit string. Without this guard, the IME removes
-/// one pinyin syllable and egui::TextEdit removes the preceding committed Hanzi.
-fn suppress_ime_backspace(input: &mut egui::RawInput, ime_preedit_active: &mut bool) {
-    let had_preedit = *ime_preedit_active;
-    let has_nonempty_preedit = input.events.iter().any(|event| {
-        matches!(
-            event,
-            egui::Event::Ime(egui::ImeEvent::Preedit(text)) if !text.is_empty()
-        )
-    });
-
-    if had_preedit || has_nonempty_preedit {
-        input.events.retain(|event| {
-            !matches!(
-                event,
-                egui::Event::Key {
-                    key: egui::Key::Backspace,
-                    pressed: true,
-                    ..
-                }
-            )
-        });
-    }
-
-    for event in &input.events {
-        match event {
-            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
-                *ime_preedit_active = !text.is_empty();
-            }
-            egui::Event::Ime(egui::ImeEvent::Commit(_))
-            | egui::Event::Ime(egui::ImeEvent::Disabled) => {
-                *ime_preedit_active = false;
-            }
-            _ => {}
-        }
-    }
-}
 
 impl eframe::App for FeatherApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -3333,7 +3288,6 @@ impl eframe::App for FeatherApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         self.frame_pacer.before_frame();
         graphics::bound_font_texture(input);
-        suppress_ime_backspace(input, &mut self.ime_preedit_active);
         if self.preview
             && std::env::var("FEATHER_UI_PREVIEW_HOVER").ok().as_deref() == Some("close")
         {

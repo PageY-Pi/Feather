@@ -1,0 +1,49 @@
+# Vendored egui-winit 0.29.1 with a Windows IME-consumed-key backport.
+# Dependency versions/features are unchanged from the published crate.
+
+[package]
+name = "egui-winit"
+version = "0.29.1"
+edition = "2021"
+rust-version = "1.76"
+authors = ["Emil Ernerfeldt <emil.ernerfeldt@gmail.com>"]
+description = "Bindings for using egui with winit"
+homepage = "https://github.com/emilk/egui/tree/master/crates/egui-winit"
+repository = "https://github.com/emilk/egui/tree/master/crates/egui-winit"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+include = ["LICENSE-APACHE", "LICENSE-MIT", "README.md", "**/*.rs", "Cargo.toml"]
+
+[features]
+default = ["clipboard", "links", "wayland", "winit/default", "x11"]
+accesskit = ["accesskit_winit", "egui/accesskit"]
+android-game-activity = ["winit/android-game-activity"]
+android-native-activity = ["winit/android-native-activity"]
+bytemuck = ["egui/bytemuck"]
+clipboard = ["arboard", "smithay-clipboard"]
+links = ["webbrowser"]
+puffin = ["dep:puffin", "egui/puffin"]
+serde = ["egui/serde", "dep:serde"]
+wayland = ["winit/wayland", "bytemuck"]
+x11 = ["winit/x11", "bytemuck"]
+
+[dependencies]
+egui = { version = "0.29.1", default-features = false, features = ["log"] }
+ahash = { version = "0.8.11", default-features = false, features = ["no-rng", "std"] }
+log = "0.4"
+raw-window-handle = "0.6.0"
+web-time = "1.1.0"
+winit = { version = "0.30.5", default-features = false }
+accesskit_winit = { version = "0.22", optional = true }
+document-features = { version = "0.2.8", optional = true }
+puffin = { version = "0.19", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+webbrowser = { version = "1.0.0", optional = true }
+arboard = { version = "3.3", default-features = false, optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+smithay-clipboard = { version = "0.7.2", optional = true }
+wayland-cursor = { version = "0.31.1", default-features = false, optional = true }
+
+[lints]
+rust.unsafe_code = "deny"

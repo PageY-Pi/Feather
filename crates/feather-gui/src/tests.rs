@@ -9,7 +9,6 @@ pub(crate) fn fixture() -> FeatherApp {
         agent: None,
         abort_tx,
         input_queue: Default::default(),
-        ime_preedit_active: false,
         ev_tx,
         ev_rx,
         egui_ctx: Default::default(),
@@ -61,84 +60,6 @@ pub(crate) fn fixture() -> FeatherApp {
     }
 }
 
-#[test]
-fn ime_preedit_backspace_is_not_forwarded_to_text_edit() {
-    let mut ime_preedit_active = false;
-    let backspace = || egui::Event::Key {
-        key: egui::Key::Backspace,
-        physical_key: Some(egui::Key::Backspace),
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::NONE,
-    };
-    let mut input = egui::RawInput {
-        events: vec![
-            egui::Event::Ime(egui::ImeEvent::Enabled),
-            egui::Event::Ime(egui::ImeEvent::Preedit("ceshi".into())),
-            backspace(),
-        ],
-        ..Default::default()
-    };
-
-    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
-    assert!(ime_preedit_active);
-    assert!(!input.events.iter().any(|event| {
-        matches!(
-            event,
-            egui::Event::Key {
-                key: egui::Key::Backspace,
-                pressed: true,
-                ..
-            }
-        )
-    }));
-
-    // The IME may report the next pre-edit value in a later frame. Until it
-    // reports an empty value, an isolated Backspace is still IME-owned.
-    input.events = vec![backspace()];
-    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
-    assert!(input.events.is_empty());
-
-    // Once the composition is empty, the next ordinary Backspace belongs to
-    // TextEdit and can remove a committed character normally.
-    input.events = vec![
-        egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
-        backspace(),
-    ];
-    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
-    assert!(!ime_preedit_active);
-    assert!(!input.events.iter().any(|event| {
-        matches!(
-            event,
-            egui::Event::Key {
-                key: egui::Key::Backspace,
-                pressed: true,
-                ..
-            }
-        )
-    }));
-    input.events = vec![backspace()];
-    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
-    assert_eq!(input.events, vec![backspace()]);
-}
-
-#[test]
-fn ordinary_backspace_is_preserved_without_ime_preedit() {
-    let mut ime_preedit_active = false;
-    let mut input = egui::RawInput {
-        events: vec![egui::Event::Key {
-            key: egui::Key::Backspace,
-            physical_key: Some(egui::Key::Backspace),
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        }],
-        ..Default::default()
-    };
-    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
-    assert_eq!(input.events.len(), 1);
-    assert!(!ime_preedit_active);
-}
 
 fn call(id: &str) -> ToolCall {
     ToolCall {

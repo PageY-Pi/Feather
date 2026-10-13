@@ -25,8 +25,8 @@ Build:
 3. Install Inno Setup 6, then `ISCC installer\Feather.iss`.
 
 This version:
-- 1.0.5 fixes Windows Chinese IME composition editing: Backspace used to correct
-  pinyin no longer deletes already committed Hanzi from the Feather composer.
+- 1.0.5 fixes Sogou/Windows Chinese IME popup editing: native `VK_PROCESSKEY` events are filtered before egui's physical-key fallback, so Backspace used to correct pinyin no longer also deletes committed Hanzi from the Feather composer. Both CPU and GPU hosts use the same boundary.
+- Ordinary Backspace remains unchanged when no IME-owned key is reported.
 - 1.0.0 efficiency review: shared request ownership (no deep history/tool-schema
   clone), cached token/hash/prefix planning, linear SSE/FIFO, combined audit/meta
   commits, borrowed compaction serialization and GUI buffer/menu reuse.
