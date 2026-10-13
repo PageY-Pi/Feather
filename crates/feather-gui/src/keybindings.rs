@@ -290,8 +290,11 @@ impl Keybindings {
             active.insert((*id).to_string(), combos);
         }
         let mut overridden = std::collections::BTreeSet::new();
-        if let Ok(Some(value))=feather::config_store::read(path.parent().unwrap_or_else(||std::path::Path::new(".")),"keybindings") {
-            if let serde_json::Value::Object(map)=value {
+        if let Ok(Some(value)) = feather::config_store::read(
+            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+            "keybindings",
+        ) {
+            if let serde_json::Value::Object(map) = value {
                 for (id, val) in map {
                     let specs: Vec<String> = match val {
                         serde_json::Value::String(s) => vec![s],
@@ -333,8 +336,8 @@ impl Keybindings {
     /// Write a user override for one action (settings panel editor).
     #[allow(dead_code)] // settings-panel per-key editing will call this
     pub fn persist_override(&self, action: &str, specs: &[String]) -> std::io::Result<()> {
-        feather::config_store::update(&feather::config::feather_home(),"keybindings",|value|{
-            value[action]=serde_json::json!(specs);
+        feather::config_store::update(&feather::config::feather_home(), "keybindings", |value| {
+            value[action] = serde_json::json!(specs);
         })
     }
 

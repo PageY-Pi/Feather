@@ -160,7 +160,9 @@ async fn child_stream_error_is_failure_in_parent_and_redb() {
     let session = temp.0.join("session");
     // Terminal quota fixture needs one HTTP response. Transient errors now
     // retry 3 times (covered with paused-time scripted provider tests).
-    let (base, handle) = server("data: {\"error\":{\"message\":\"synthetic stream error: insufficient_quota\"}}\n\n");
+    let (base, handle) = server(
+        "data: {\"error\":{\"message\":\"synthetic stream error: insufficient_quota\"}}\n\n",
+    );
     let tool = tool(
         &temp.0,
         &session,

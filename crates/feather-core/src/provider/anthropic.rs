@@ -336,21 +336,33 @@ impl AnthropicProvider {
         }
         if oauth {
             headers.extend([
-                ("anthropic-beta".into(), "claude-code-20250219,oauth-2025-04-20".into()),
+                (
+                    "anthropic-beta".into(),
+                    "claude-code-20250219,oauth-2025-04-20".into(),
+                ),
                 ("user-agent".into(), "claude-cli/2.1.280".into()),
                 ("x-app".into(), "cli".into()),
-                ("anthropic-dangerous-direct-browser-access".into(), "true".into()),
+                (
+                    "anthropic-dangerous-direct-browser-access".into(),
+                    "true".into(),
+                ),
             ]);
             apply_oauth_identity(&mut body, req.cache.system);
         }
-        let tool_names: Vec<String> = if oauth { req.tools.iter().map(|t| t.name.clone()).collect() } else { Vec::new() };
+        let tool_names: Vec<String> = if oauth {
+            req.tools.iter().map(|t| t.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
         let handler: EventHandler = Box::new(move |payload, out| {
             let start = out.len();
             anthropic_event(payload, out);
             if oauth {
                 for event in &mut out[start..] {
                     if let StreamEvent::ToolCallStart { name, .. } = event {
-                        if let Some(original) = tool_names.iter().find(|t| t.eq_ignore_ascii_case(name)) {
+                        if let Some(original) =
+                            tool_names.iter().find(|t| t.eq_ignore_ascii_case(name))
+                        {
                             *name = original.clone();
                         }
                     }
@@ -368,16 +380,24 @@ fn apply_oauth_identity(body: &mut Value, cache_system: bool) {
         "text": "You are Claude Code, Anthropic's official CLI for Claude."
     });
     if cache_system {
-        let policy = body.pointer("/system/0/cache_control").cloned()
+        let policy = body
+            .pointer("/system/0/cache_control")
+            .cloned()
             .unwrap_or_else(|| json!({"type":"ephemeral"}));
         identity["cache_control"] = policy;
     }
-    let system = body.as_object_mut().unwrap().entry("system").or_insert_with(|| json!([]));
+    let system = body
+        .as_object_mut()
+        .unwrap()
+        .entry("system")
+        .or_insert_with(|| json!([]));
     system.as_array_mut().unwrap().insert(0, identity);
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
             if let Some(name) = tool.get_mut("name") {
-                if let Some(s) = name.as_str() { *name = json!(claude_tool_name(s)); }
+                if let Some(s) = name.as_str() {
+                    *name = json!(claude_tool_name(s));
+                }
             }
         }
     }
@@ -397,10 +417,31 @@ fn apply_oauth_identity(body: &mut Value, cache_system: bool) {
 }
 
 fn claude_tool_name(name: &str) -> String {
-    const NAMES: &[&str] = &["Read", "Write", "Edit", "Bash", "Grep", "Glob", "AskUserQuestion",
-        "EnterPlanMode", "ExitPlanMode", "KillShell", "NotebookEdit", "Skill", "Task", "TaskOutput",
-        "TodoWrite", "WebFetch", "WebSearch"];
-    NAMES.iter().find(|s| s.eq_ignore_ascii_case(name)).copied().unwrap_or(name).to_string()
+    const NAMES: &[&str] = &[
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Grep",
+        "Glob",
+        "AskUserQuestion",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "KillShell",
+        "NotebookEdit",
+        "Skill",
+        "Task",
+        "TaskOutput",
+        "TodoWrite",
+        "WebFetch",
+        "WebSearch",
+    ];
+    NAMES
+        .iter()
+        .find(|s| s.eq_ignore_ascii_case(name))
+        .copied()
+        .unwrap_or(name)
+        .to_string()
 }
 
 /// Static per-model Anthropic thinking metadata, keyed by model ID. pi keeps

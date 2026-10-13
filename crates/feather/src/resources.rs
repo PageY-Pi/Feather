@@ -264,8 +264,11 @@ fn load_skills_dir_inner(
     let mut skills = Vec::new();
     let mut diags = Vec::new();
     if depth > 64 {
-        diags.push(Diagnostic::warn(Some(dir.to_path_buf()),"skill scan depth exceeds 64 directories"));
-        return (skills,diags);
+        diags.push(Diagnostic::warn(
+            Some(dir.to_path_buf()),
+            "skill scan depth exceeds 64 directories",
+        ));
+        return (skills, diags);
     }
     if !dir.exists() {
         return (skills, diags);

@@ -1,6 +1,6 @@
-# Feather 1.0.0 Windows installer
+# Feather 1.0.5 Windows installer
 
-Share `dist/Feather-1.0.0-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.0.5-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -25,6 +25,8 @@ Build:
 3. Install Inno Setup 6, then `ISCC installer\Feather.iss`.
 
 This version:
+- 1.0.5 fixes Windows Chinese IME composition editing: Backspace used to correct
+  pinyin no longer deletes already committed Hanzi from the Feather composer.
 - 1.0.0 efficiency review: shared request ownership (no deep history/tool-schema
   clone), cached token/hash/prefix planning, linear SSE/FIFO, combined audit/meta
   commits, borrowed compaction serialization and GUI buffer/menu reuse.

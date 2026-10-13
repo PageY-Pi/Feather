@@ -222,7 +222,10 @@ mod tests {
             Some(ThinkingLevel::Low)
         );
         assert_eq!(compaction_thinking(&Value::Null, None), None);
-        assert_eq!(compaction_thinking(&Value::Null, Some(ThinkingLevel::Off)), None);
+        assert_eq!(
+            compaction_thinking(&Value::Null, Some(ThinkingLevel::Off)),
+            None
+        );
         assert_eq!(
             compaction_thinking(&json!({ "reasoning": false }), Some(ThinkingLevel::High)),
             None

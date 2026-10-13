@@ -7,8 +7,8 @@
 //! the native GUI and headless/RPC mode.
 
 use crate::compaction::{
-    self, file_ops, should_compact, shrink_kept_span, summary_message,
-    CompactionSettings, SUMMARY_SYSTEM,
+    self, file_ops, should_compact, shrink_kept_span, summary_message, CompactionSettings,
+    SUMMARY_SYSTEM,
 };
 use crate::message::{Api, ContentBlock, Message, StopReason, ToolCall, Usage};
 use crate::provider::{CacheHints, ChatRequest, StreamEvent, ThinkingLevel, ToolDef};
@@ -27,8 +27,14 @@ pub trait CachePlanner: Send + Sync {
     fn plan(&self, req: &mut ChatRequest, history_hash: u64);
     /// Fast path for immutable Session context. Compatibility planners may
     /// ignore these scalar caches and use their original request-based method.
-    fn plan_cached(&self,req:&mut ChatRequest,history_hash:u64,_message_hashes:&[u64],_prefix_tokens:&[u64]) {
-        self.plan(req,history_hash);
+    fn plan_cached(
+        &self,
+        req: &mut ChatRequest,
+        history_hash: u64,
+        _message_hashes: &[u64],
+        _prefix_tokens: &[u64],
+    ) {
+        self.plan(req, history_hash);
     }
     /// Record provider usage so hit-rate metrics accumulate.
     fn record(&self, usage: &Usage);
@@ -58,7 +64,9 @@ pub struct AgentConfig {
 pub enum AgentEvent {
     /// All audit rows up to this exclusive raw cursor are durable. Enables
     /// frontends to page/offload finalized rows during long tool-loop runs.
-    AuditCommitted {raw_before:u64},
+    AuditCommitted {
+        raw_before: u64,
+    },
     TurnStart(u64),
     /// Streaming deltas.
     ThinkingDelta(String),
@@ -290,7 +298,6 @@ mod test_support {
         },
     }
 
-
     pub struct ScriptedProvider {
         items: Mutex<VecDeque<ScriptItem>>,
         calls: AtomicUsize,
@@ -336,7 +343,10 @@ mod test_support {
                         chunks.push(Err(e));
                     }
                     Ok(crate::provider::ResponseStream::new(
-                        Box::pin(ScriptedBytes { chunks: chunks.into(), pos: 0 }),
+                        Box::pin(ScriptedBytes {
+                            chunks: chunks.into(),
+                            pos: 0,
+                        }),
                         Box::new(decode),
                     ))
                 }
@@ -366,8 +376,13 @@ mod test_support {
         match event {
             StreamEvent::TextDelta(t) => format!("text:{}", t.replace('\n', "\\n")),
             StreamEvent::ThinkingDelta(t) => format!("thinking:{}", t.replace('\n', "\\n")),
-            StreamEvent::ToolCallStart{index,id,name}=>format!("toolstart:{}",serde_json::json!([index,id,name])),
-            StreamEvent::ToolCallDelta{index,json_fragment}=>format!("tooldelta:{}",serde_json::json!([index,json_fragment])),
+            StreamEvent::ToolCallStart { index, id, name } => {
+                format!("toolstart:{}", serde_json::json!([index, id, name]))
+            }
+            StreamEvent::ToolCallDelta {
+                index,
+                json_fragment,
+            } => format!("tooldelta:{}", serde_json::json!([index, json_fragment])),
             StreamEvent::Usage(u) => format!("usage:{}", u.output),
             StreamEvent::MessageEnd { stop_reason } => match stop_reason {
                 StopReason::ToolUse => "end:tool".into(),
@@ -382,11 +397,18 @@ mod test_support {
     }
 
     fn decode(payload: &str, out: &mut Vec<StreamEvent>) {
-        if let Some(t)=payload.strip_prefix("toolstart:") {
-            let (index,id,name)=serde_json::from_str::<(usize,String,String)>(t).unwrap();out.push(StreamEvent::ToolCallStart{index,id,name});return;
+        if let Some(t) = payload.strip_prefix("toolstart:") {
+            let (index, id, name) = serde_json::from_str::<(usize, String, String)>(t).unwrap();
+            out.push(StreamEvent::ToolCallStart { index, id, name });
+            return;
         }
-        if let Some(t)=payload.strip_prefix("tooldelta:") {
-            let(index,json_fragment)=serde_json::from_str::<(usize,String)>(t).unwrap();out.push(StreamEvent::ToolCallDelta{index,json_fragment});return;
+        if let Some(t) = payload.strip_prefix("tooldelta:") {
+            let (index, json_fragment) = serde_json::from_str::<(usize, String)>(t).unwrap();
+            out.push(StreamEvent::ToolCallDelta {
+                index,
+                json_fragment,
+            });
+            return;
         }
         if let Some(t) = payload.strip_prefix("text:") {
             out.push(StreamEvent::TextDelta(t.replace("\\n", "\n")));
@@ -529,7 +551,12 @@ impl Agent {
         };
         if let Some(p) = &self.planner {
             let hash = self.session.history_hash();
-            p.plan_cached(&mut req,hash,self.session.message_hashes(),self.session.prefix_tokens());
+            p.plan_cached(
+                &mut req,
+                hash,
+                self.session.message_hashes(),
+                self.session.prefix_tokens(),
+            );
         }
         req
     }
@@ -801,21 +828,27 @@ impl Agent {
                     self.record_provider_usage(total_usage, usage);
                     return Ok(msg);
                 }
-                Err(failure) if matches!(failure.error, crate::provider::ProviderError::Aborted) => {
+                Err(failure)
+                    if matches!(failure.error, crate::provider::ProviderError::Aborted) =>
+                {
                     self.record_provider_usage(total_usage, failure.usage);
                     return Err(AgentError::Aborted);
                 }
                 Err(failure) => {
                     self.record_provider_usage(total_usage, failure.usage);
-                    let Some(plan) = crate::provider::retry::plan(&failure.error, failed_attempt) else {
+                    let Some(plan) = crate::provider::retry::plan(&failure.error, failed_attempt)
+                    else {
                         if publish {
-                            let _ = self.events.send(AgentEvent::Error(failure.error.to_string()));
+                            let _ = self
+                                .events
+                                .send(AgentEvent::Error(failure.error.to_string()));
                         }
                         return Err(failure.error.into());
                     };
                     // Deadlines are anchored to the first error; subtract time
                     // already spent (including this failed request) so retries
-                    // land at +5s/+30s/+60s rather than stacking sequential sleeps.
+                    // land at +5s/+10s/+30s/+60s rather than stacking sequential sleeps.
+
                     let first_error = *first_error_at.get_or_insert_with(tokio::time::Instant::now);
                     let delay = crate::provider::retry::delay_until(
                         &plan,
@@ -829,6 +862,13 @@ impl Agent {
                             delay_ms: delay.as_millis() as u64,
                             reason: failure.error.to_string(),
                         });
+                        if failure.published
+                            && failed_attempt + 2 >= crate::provider::retry::MAX_ATTEMPTS
+                        {
+                            let _ = self
+                                .events
+                                .send(AgentEvent::Error(failure.error.to_string()));
+                        }
                     }
                     // Failed usage has already been recorded; retry only the
                     // provider response. No assistant message has been persisted
@@ -1007,6 +1047,7 @@ impl Agent {
 
         if aborted {
             stop_reason = StopReason::Aborted;
+            // Final-stream errors are emitted by the retry supervisor.
         }
 
         Ok((
@@ -1034,7 +1075,13 @@ impl Agent {
         for diagnostic in self.session.take_runtime_diagnostics() {
             let _ = self.events.send(AgentEvent::Notice(diagnostic));
         }
-        if let Some(store)=self.session.transcript_store(){if let Ok(count)=store.raw_len(){let _=self.events.send(AgentEvent::AuditCommitted{raw_before:count as u64});}}
+        if let Some(store) = self.session.transcript_store() {
+            if let Ok(count) = store.raw_len() {
+                let _ = self.events.send(AgentEvent::AuditCommitted {
+                    raw_before: count as u64,
+                });
+            }
+        }
         Ok(turn)
     }
 
@@ -1049,7 +1096,10 @@ impl Agent {
         let settings = self.config.compaction.clone();
         let before_chars = compaction::context_characters(self.session.messages());
         let before_tokens = self.session.context_tokens();
-        let cut = compaction::plan_cut_without_thinking(self.session.messages(), settings.keep_recent_tokens);
+        let cut = compaction::plan_cut_without_thinking(
+            self.session.messages(),
+            settings.keep_recent_tokens,
+        );
         if cut == 0 {
             return Ok(0); // nothing to summarize
         }
@@ -1061,7 +1111,13 @@ impl Agent {
         if let Some(p) = &self.planner {
             p.demote_one_off();
         }
-        let serialized = compaction::serialize_messages(to_summarize.iter().filter(|m|!(m.role==crate::message::Role::User&&m.text_cow().starts_with("## Conversation summary"))),settings.summary_tool_result_budget);
+        let serialized = compaction::serialize_messages(
+            to_summarize.iter().filter(|m| {
+                !(m.role == crate::message::Role::User
+                    && m.text_cow().starts_with("## Conversation summary"))
+            }),
+            settings.summary_tool_result_budget,
+        );
         let previous = to_summarize
             .iter()
             .rev()
@@ -1095,7 +1151,9 @@ impl Agent {
             max_tokens: settings.reserve_tokens.min(8192) as u32,
             temperature: None,
             cache: CacheHints::default(),
-            thinking: self.provider.compaction_thinking(self.config.thinking_level),
+            thinking: self
+                .provider
+                .compaction_thinking(self.config.thinking_level),
             session_id: self.session.id().to_string(),
         };
         let mut _sink = Usage::default();
@@ -1106,10 +1164,14 @@ impl Agent {
             return Err(AgentError::Aborted);
         }
         let summary = summary_msg.text();
-        if summary.trim().is_empty() || summary_msg.stop_reason == Some(StopReason::Error)
+        if summary.trim().is_empty()
+            || summary_msg.stop_reason == Some(StopReason::Error)
             || summary_msg.iter_tool_calls().next().is_some()
         {
-            return Err(crate::provider::ProviderError::Stream("compaction produced no usable summary; context left unchanged".into()).into());
+            return Err(crate::provider::ProviderError::Stream(
+                "compaction produced no usable summary; context left unchanged".into(),
+            )
+            .into());
         }
 
         // rewrite the linear context: summary + shrunk kept span
@@ -1179,33 +1241,102 @@ async fn execute_progress(
 mod retry_tests {
     #[test]
     fn request_build_shares_large_history_and_tool_definitions() {
-        let mut agent=Agent::new(config(),Session::memory(std::path::Path::new("fixture"),"request-share"),
-            Arc::new(ToolRegistry::new()),ProviderRef::Scripted(test_support::ScriptedProvider::new(Vec::new())),None);
-        agent.session_mut().push(Message::user_text("large payload".repeat(50_000))).unwrap();
-        let request=agent.build_request();let second=agent.build_request();
-        assert!(std::ptr::eq(request.messages.as_slice().as_ptr(),agent.session().messages().as_ptr()));
-        assert!(Arc::ptr_eq(&request.messages,&second.messages));
-        assert!(Arc::ptr_eq(&request.tools,&second.tools));
+        let mut agent = Agent::new(
+            config(),
+            Session::memory(std::path::Path::new("fixture"), "request-share"),
+            Arc::new(ToolRegistry::new()),
+            ProviderRef::Scripted(test_support::ScriptedProvider::new(Vec::new())),
+            None,
+        );
+        agent
+            .session_mut()
+            .push(Message::user_text("large payload".repeat(50_000)))
+            .unwrap();
+        let request = agent.build_request();
+        let second = agent.build_request();
+        assert!(std::ptr::eq(
+            request.messages.as_slice().as_ptr(),
+            agent.session().messages().as_ptr()
+        ));
+        assert!(Arc::ptr_eq(&request.messages, &second.messages));
+        assert!(Arc::ptr_eq(&request.tools, &second.tools));
     }
     #[tokio::test]
     async fn illegal_tool_error_is_visible_in_next_request_and_run_continues() {
         struct Blocked;
         impl crate::tool::AgentTool for Blocked {
-            fn name(&self)->&'static str{"blocked"}
-            fn description(&self)->&'static str{"Synthetic blocked command"}
-            fn parameters(&self)->serde_json::Value{serde_json::json!({"type":"object"})}
-            fn execute<'a>(&'a self,_:serde_json::Value,_:tokio::sync::watch::Receiver<bool>)->crate::tool::BoxFut<'a>{Box::pin(async{crate::tool::ToolOutcome::err("[ILLEGAL_COMMAND] command blocked before execution; choose an allowed alternative")})}
+            fn name(&self) -> &'static str {
+                "blocked"
+            }
+            fn description(&self) -> &'static str {
+                "Synthetic blocked command"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object"})
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: tokio::sync::watch::Receiver<bool>,
+            ) -> crate::tool::BoxFut<'a> {
+                Box::pin(async {
+                    crate::tool::ToolOutcome::err("[ILLEGAL_COMMAND] command blocked before execution; choose an allowed alternative")
+                })
+            }
         }
-        let root=std::env::temp_dir().join(crate::provider::gen_id("illegal-agent"));std::fs::create_dir_all(&root).unwrap();
-        let provider=test_support::ScriptedProvider::new(vec![
-            test_support::ScriptItem::Stream{events:vec![StreamEvent::ToolCallStart{index:0,id:"blocked-1".into(),name:"blocked".into()},StreamEvent::ToolCallDelta{index:0,json_fragment:"{}".into()},StreamEvent::MessageEnd{stop_reason:StopReason::ToolUse}],terminal:None},
-            test_support::ScriptItem::Stream{events:vec![StreamEvent::TextDelta("corrected safely".into()),StreamEvent::MessageEnd{stop_reason:StopReason::Stop}],terminal:None},
+        let root = std::env::temp_dir().join(crate::provider::gen_id("illegal-agent"));
+        std::fs::create_dir_all(&root).unwrap();
+        let provider = test_support::ScriptedProvider::new(vec![
+            test_support::ScriptItem::Stream {
+                events: vec![
+                    StreamEvent::ToolCallStart {
+                        index: 0,
+                        id: "blocked-1".into(),
+                        name: "blocked".into(),
+                    },
+                    StreamEvent::ToolCallDelta {
+                        index: 0,
+                        json_fragment: "{}".into(),
+                    },
+                    StreamEvent::MessageEnd {
+                        stop_reason: StopReason::ToolUse,
+                    },
+                ],
+                terminal: None,
+            },
+            test_support::ScriptItem::Stream {
+                events: vec![
+                    StreamEvent::TextDelta("corrected safely".into()),
+                    StreamEvent::MessageEnd {
+                        stop_reason: StopReason::Stop,
+                    },
+                ],
+                terminal: None,
+            },
         ]);
-        let mut tools=ToolRegistry::new();tools.add(Arc::new(Blocked));let mut cfg=config();cfg.tools=tools.defs().into();
-        let mut agent=Agent::new(cfg,Session::memory(&root,"illegal"),Arc::new(tools),ProviderRef::Scripted(provider.clone()),None);
-        let result=agent.prompt("try operation").await.unwrap();assert_eq!(result.final_text,"corrected safely");assert_eq!(provider.calls(),2);
-        let requests=provider.requests.lock().unwrap();assert!(requests[1].messages.iter().any(|m|m.role==crate::message::Role::ToolResult&&m.is_error&&m.text().contains("ILLEGAL_COMMAND")));
-        drop(requests);std::fs::remove_dir_all(root).unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.add(Arc::new(Blocked));
+        let mut cfg = config();
+        cfg.tools = tools.defs().into();
+        let mut agent = Agent::new(
+            cfg,
+            Session::memory(&root, "illegal"),
+            Arc::new(tools),
+            ProviderRef::Scripted(provider.clone()),
+            None,
+        );
+        let result = agent.prompt("try operation").await.unwrap();
+        assert_eq!(result.final_text, "corrected safely");
+        assert_eq!(provider.calls(), 2);
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|m| m.role == crate::message::Role::ToolResult
+                && m.is_error
+                && m.text().contains("ILLEGAL_COMMAND")));
+        drop(requests);
+        std::fs::remove_dir_all(root).unwrap();
     }
     use super::*;
     use crate::compaction::CompactionSettings;
@@ -1235,21 +1366,32 @@ mod retry_tests {
         let provider = test_support::ScriptedProvider::new(vec![
             test_support::ScriptItem::Stream {
                 events: vec![
-                    StreamEvent::Usage(Usage { output: 2, ..Usage::default() }),
+                    StreamEvent::Usage(Usage {
+                        output: 2,
+                        ..Usage::default()
+                    }),
                     StreamEvent::TextDelta("partial".into()),
                 ],
                 terminal: Some(ProviderError::Stream("transient one".into())),
             },
             test_support::ScriptItem::StartErr(ProviderError::Http("transient two".into())),
             test_support::ScriptItem::Stream {
-                events: vec![StreamEvent::Usage(Usage { output: 4, ..Usage::default() })],
+                events: vec![StreamEvent::Usage(Usage {
+                    output: 4,
+                    ..Usage::default()
+                })],
                 terminal: Some(ProviderError::Stream("transient three".into())),
             },
             test_support::ScriptItem::Stream {
                 events: vec![
-                    StreamEvent::Usage(Usage { output: 3, ..Usage::default() }),
+                    StreamEvent::Usage(Usage {
+                        output: 3,
+                        ..Usage::default()
+                    }),
                     StreamEvent::TextDelta("ok".into()),
-                    StreamEvent::MessageEnd { stop_reason: StopReason::Stop },
+                    StreamEvent::MessageEnd {
+                        stop_reason: StopReason::Stop,
+                    },
                 ],
                 terminal: None,
             },
@@ -1279,9 +1421,9 @@ mod retry_tests {
                 AgentEvent::TextDelta(t) if t == "ok" => saw_ok = true,
                 AgentEvent::ResponseReset { delay_ms, .. } => {
                     resets += 1;
-                    // Deadlines are anchored to the first error: +5s, +30s, +60s,
-                    // i.e. remaining waits of 5s, 25s and 30s in paused time.
-                    assert!(matches!(delay_ms, 5_000 | 25_000 | 30_000));
+                    // Deadlines are anchored to the first error: +5s, +10s, +30s and +60s.
+                    // i.e. remaining waits are measured from that first error.
+                    assert!(delay_ms <= 60_000);
                 }
                 _ => {}
             }
@@ -1292,14 +1434,16 @@ mod retry_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-
     #[tokio::test(start_paused = true)]
     async fn retries_fatal_error_event_and_premature_eof() {
         let root = std::env::temp_dir().join(crate::provider::gen_id("retry-fatal-eof"));
         std::fs::create_dir_all(&root).unwrap();
         let provider = test_support::ScriptedProvider::new(vec![
             test_support::ScriptItem::Stream {
-                events: vec![StreamEvent::TextDelta("fatal partial".into()), StreamEvent::FatalError("fatal midstream".into())],
+                events: vec![
+                    StreamEvent::TextDelta("fatal partial".into()),
+                    StreamEvent::FatalError("fatal midstream".into()),
+                ],
                 terminal: None,
             },
             test_support::ScriptItem::Stream {
@@ -1307,7 +1451,12 @@ mod retry_tests {
                 terminal: None,
             },
             test_support::ScriptItem::Stream {
-                events: vec![StreamEvent::TextDelta("ok".into()), StreamEvent::MessageEnd { stop_reason: StopReason::Stop }],
+                events: vec![
+                    StreamEvent::TextDelta("ok".into()),
+                    StreamEvent::MessageEnd {
+                        stop_reason: StopReason::Stop,
+                    },
+                ],
                 terminal: None,
             },
         ]);
@@ -1358,8 +1507,11 @@ mod retry_tests {
         let mut events = agent.subscribe();
 
         let err = agent.prompt("hi").await.unwrap_err();
-        assert!(matches!(err, AgentError::Provider(ProviderError::Stream(_))));
-        assert_eq!(provider.calls(), 4);
+        assert!(matches!(
+            err,
+            AgentError::Provider(ProviderError::Stream(_))
+        ));
+        assert_eq!(provider.calls(), 5);
         assert_eq!(agent.session().messages().len(), 1);
         assert_eq!(agent.session().messages()[0].text(), "hi");
 
@@ -1372,6 +1524,7 @@ mod retry_tests {
                 AgentEvent::AssistantMessage(m) if m.text().contains("do not persist") => {
                     panic!("partial failure was finalized into context: {m:?}");
                 }
+                // Four retry deadlines mean five total provider calls.
                 _ => {}
             }
         }
@@ -1383,9 +1536,13 @@ mod retry_tests {
     async fn quota_exhaustion_is_not_retried() {
         let root = std::env::temp_dir().join(crate::provider::gen_id("retry-quota"));
         std::fs::create_dir_all(&root).unwrap();
-        let provider = test_support::ScriptedProvider::new(vec![test_support::ScriptItem::StartErr(
-            ProviderError::Api { status: 429, body: "insufficient_quota".into() },
-        )]);
+        let provider =
+            test_support::ScriptedProvider::new(vec![test_support::ScriptItem::StartErr(
+                ProviderError::Api {
+                    status: 429,
+                    body: "insufficient_quota".into(),
+                },
+            )]);
         let mut agent = Agent::new(
             config(),
             Session::memory(&root, "quota-test"),
@@ -1394,7 +1551,10 @@ mod retry_tests {
             None,
         );
         let err = agent.prompt("hi").await.unwrap_err();
-        assert!(matches!(err, AgentError::Provider(ProviderError::Api { .. })));
+        assert!(matches!(
+            err,
+            AgentError::Provider(ProviderError::Api { .. })
+        ));
         assert_eq!(provider.calls(), 1);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -51,11 +51,16 @@ pub trait AgentTool: Send + Sync {
     /// JSON Schema of the arguments object.
     fn parameters(&self) -> serde_json::Value;
 
-    fn parallel_safe(&self) -> bool { false }
+    fn parallel_safe(&self) -> bool {
+        false
+    }
 
-    fn execute_with_progress<'a>(&'a self, args: serde_json::Value,
+    fn execute_with_progress<'a>(
+        &'a self,
+        args: serde_json::Value,
         abort: tokio::sync::watch::Receiver<bool>,
-        _progress: tokio::sync::mpsc::UnboundedSender<String>) -> BoxFut<'a> {
+        _progress: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> BoxFut<'a> {
         self.execute(args, abort)
     }
     /// Run the tool with owned, parsed arguments plus an abort signal.

@@ -50,9 +50,12 @@ impl ResponsesProvider {
         self
     }
 
-
     pub fn api(&self) -> Api {
-        if self.codex { Api::OpenaiCodexResponses } else { Api::OpenaiResponses }
+        if self.codex {
+            Api::OpenaiCodexResponses
+        } else {
+            Api::OpenaiResponses
+        }
     }
     pub fn with_codex(mut self, codex: bool) -> Self {
         self.codex = codex;
@@ -62,7 +65,11 @@ impl ResponsesProvider {
     pub async fn stream(&self, req: &ChatRequest) -> Result<ResponseStream, ProviderError> {
         let cred = self.credentials.resolve().await?;
         let base = cred.base_url.clone().or_else(|| self.base_url.clone());
-        let url = if self.codex { codex_url(base) } else { responses_url(base) };
+        let url = if self.codex {
+            codex_url(base)
+        } else {
+            responses_url(base)
+        };
         let body = if self.codex {
             build_codex_body(req, &self.compat)
         } else {
@@ -71,9 +78,9 @@ impl ResponsesProvider {
         let mut headers = cred.request_headers(req);
         headers.push(("authorization".into(), format!("Bearer {}", cred.api_key)));
         if self.codex {
-            let account_id = cred
-                .account_id
-                .ok_or_else(|| ProviderError::Auth("OpenAI Codex OAuth account id missing".into()))?;
+            let account_id = cred.account_id.ok_or_else(|| {
+                ProviderError::Auth("OpenAI Codex OAuth account id missing".into())
+            })?;
             headers.push(("chatgpt-account-id".into(), account_id));
             headers.push(("originator".into(), "pi".into()));
             headers.push(("OpenAI-Beta".into(), "responses=experimental".into()));
@@ -85,18 +92,32 @@ impl ResponsesProvider {
         headers.push(("accept".into(), "text/event-stream".into()));
         headers.push(("content-type".into(), "application/json".into()));
         let mut state = ResponsesEventState::default();
-        let handler: EventHandler = Box::new(move |payload, out| responses_event(payload, out, &mut state));
+        let handler: EventHandler =
+            Box::new(move |payload, out| responses_event(payload, out, &mut state));
         http_post_sse(&self.client, &url, headers, body, handler).await
     }
 }
 
 fn responses_url(base: Option<String>) -> String {
-    format!("{}/responses", base.unwrap_or_else(|| DEFAULT_RESPONSES_BASE_URL.into()).trim_end_matches('/'))
+    format!(
+        "{}/responses",
+        base.unwrap_or_else(|| DEFAULT_RESPONSES_BASE_URL.into())
+            .trim_end_matches('/')
+    )
 }
 
 fn codex_url(base: Option<String>) -> String {
-    let n = base.unwrap_or_else(|| DEFAULT_CODEX_BASE_URL.into()).trim_end_matches('/').to_string();
-    if n.ends_with("/codex/responses") { n } else if n.ends_with("/codex") { format!("{n}/responses") } else { format!("{n}/codex/responses") }
+    let n = base
+        .unwrap_or_else(|| DEFAULT_CODEX_BASE_URL.into())
+        .trim_end_matches('/')
+        .to_string();
+    if n.ends_with("/codex/responses") {
+        n
+    } else if n.ends_with("/codex") {
+        format!("{n}/responses")
+    } else {
+        format!("{n}/codex/responses")
+    }
 }
 
 pub fn build_responses_body(req: &ChatRequest, compat: &Value) -> Value {
@@ -107,8 +128,14 @@ pub fn build_responses_body(req: &ChatRequest, compat: &Value) -> Value {
         "store": false,
         "max_output_tokens": req.max_tokens.max(16),
     });
-    if !req.session_id.is_empty() { body["prompt_cache_key"] = json!(crate::provider::openai::derive_prompt_cache_key(&req.session_id)); }
-    if let Some(t) = req.temperature { body["temperature"] = json!(t); }
+    if !req.session_id.is_empty() {
+        body["prompt_cache_key"] = json!(crate::provider::openai::derive_prompt_cache_key(
+            &req.session_id
+        ));
+    }
+    if let Some(t) = req.temperature {
+        body["temperature"] = json!(t);
+    }
     add_tools_and_reasoning(&mut body, req, compat, false);
     body
 }
@@ -125,7 +152,11 @@ pub fn build_codex_body(req: &ChatRequest, compat: &Value) -> Value {
         "tool_choice": "auto",
         "parallel_tool_calls": true,
     });
-    if !req.session_id.is_empty() { body["prompt_cache_key"] = json!(crate::provider::openai::derive_prompt_cache_key(&req.session_id)); }
+    if !req.session_id.is_empty() {
+        body["prompt_cache_key"] = json!(crate::provider::openai::derive_prompt_cache_key(
+            &req.session_id
+        ));
+    }
     add_tools_and_reasoning(&mut body, req, compat, true);
     body
 }
@@ -138,11 +169,21 @@ fn add_tools_and_reasoning(body: &mut Value, req: &ChatRequest, compat: &Value, 
         if level != super::ThinkingLevel::Off {
             let raw = level.as_str();
             let map = parse_level_map(compat).unwrap_or_default();
-            let clamped = if map.is_empty() { raw.to_string() } else { clamp_level(&map, raw) };
-            let mapped = if map.is_empty() { json!(clamped) } else { json!(effective_effort(&map, &clamped)) };
+            let clamped = if map.is_empty() {
+                raw.to_string()
+            } else {
+                clamp_level(&map, raw)
+            };
+            let mapped = if map.is_empty() {
+                json!(clamped)
+            } else {
+                json!(effective_effort(&map, &clamped))
+            };
             if !mapped.is_null() {
                 body["reasoning"] = json!({"effort": mapped, "summary": "auto"});
-                if !codex { body["include"] = json!(["reasoning.encrypted_content"]); }
+                if !codex {
+                    body["include"] = json!(["reasoning.encrypted_content"]);
+                }
             }
         }
     }
@@ -150,7 +191,9 @@ fn add_tools_and_reasoning(body: &mut Value, req: &ChatRequest, compat: &Value, 
 
 fn convert_messages(req: &ChatRequest, include_system: bool, api: Api) -> Vec<Value> {
     let mut out = Vec::new();
-    if include_system && !req.system.is_empty() { out.push(json!({"role":"developer","content":req.system})); }
+    if include_system && !req.system.is_empty() {
+        out.push(json!({"role":"developer","content":req.system}));
+    }
     for m in req.messages.iter() {
         match m.role {
             Role::User => out.push(json!({"role":"user","content":user_content(m)})),
@@ -214,111 +257,278 @@ pub struct ResponsesEventState {
 }
 
 pub fn responses_event(payload: &str, out: &mut Vec<StreamEvent>, state: &mut ResponsesEventState) {
-    if payload == "[DONE]" { return; }
-    let v: Value = match serde_json::from_str(payload) { Ok(v) => v, Err(_) => return };
-    if let Some(err) = v.get("error") { out.push(StreamEvent::FatalError(err.get("message").and_then(|m|m.as_str()).unwrap_or("unknown error").into())); return; }
+    if payload == "[DONE]" {
+        return;
+    }
+    let v: Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if let Some(err) = v.get("error") {
+        out.push(StreamEvent::FatalError(
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+                .into(),
+        ));
+        return;
+    }
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-        "response.output_item.added" => if let (Some(i), Some(item)) = (v.get("output_index").and_then(|i| i.as_u64()), v.get("item")) { start_item(i as usize, item, out, state); },
-        "response.output_item.done" => if let (Some(i), Some(item)) = (v.get("output_index").and_then(|i| i.as_u64()), v.get("item")) { done_item(i as usize, item, out, state); },
-        "response.output_text.delta" | "response.refusal.delta" => if let (Some(i), Some(d))=(v.get("output_index").and_then(|i|i.as_u64()), v.get("delta").and_then(|d|d.as_str())) {
-            state.text.entry(i as usize).or_default().push_str(d);
-            out.push(StreamEvent::TextDelta(d.into()));
-        },
-        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => if let (Some(i), Some(d))=(v.get("output_index").and_then(|i|i.as_u64()), v.get("delta").and_then(|d|d.as_str())) {
-            state.thinking.entry(i as usize).or_default().push_str(d);
-            out.push(StreamEvent::ThinkingDelta(d.into()));
-        },
-        "response.function_call_arguments.delta" => if let (Some(i), Some(d))=(v.get("output_index").and_then(|i|i.as_u64()), v.get("delta").and_then(|d|d.as_str())) {
-            let i = i as usize;
-            state.tool_args.entry(i).or_default().push_str(d);
-            out.push(StreamEvent::ToolCallDelta{index:i,json_fragment:d.into()});
-        },
-        "response.function_call_arguments.done" => if let (Some(i), Some(a))=(v.get("output_index").and_then(|i|i.as_u64()), v.get("arguments").and_then(|a|a.as_str())) {
-            let i = i as usize;
-            let prior = state.tool_args.entry(i).or_default();
-            if let Some(rest) = a.strip_prefix(prior.as_str()) {
-                if !rest.is_empty() { out.push(StreamEvent::ToolCallDelta{index:i,json_fragment:rest.into()}); }
+        "response.output_item.added" => {
+            if let (Some(i), Some(item)) = (
+                v.get("output_index").and_then(|i| i.as_u64()),
+                v.get("item"),
+            ) {
+                start_item(i as usize, item, out, state);
             }
-            *prior = a.to_string();
-        },
-        "response.completed" | "response.incomplete" => finalize(v.get("response").unwrap_or(&v), out, state),
-        "response.failed" => out.push(StreamEvent::FatalError(v.pointer("/response/error/message").and_then(|m|m.as_str()).unwrap_or("response failed").into())),
-        "error" => out.push(StreamEvent::FatalError(v.get("message").and_then(|m|m.as_str()).unwrap_or("unknown error").into())),
+        }
+        "response.output_item.done" => {
+            if let (Some(i), Some(item)) = (
+                v.get("output_index").and_then(|i| i.as_u64()),
+                v.get("item"),
+            ) {
+                done_item(i as usize, item, out, state);
+            }
+        }
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let (Some(i), Some(d)) = (
+                v.get("output_index").and_then(|i| i.as_u64()),
+                v.get("delta").and_then(|d| d.as_str()),
+            ) {
+                state.text.entry(i as usize).or_default().push_str(d);
+                out.push(StreamEvent::TextDelta(d.into()));
+            }
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let (Some(i), Some(d)) = (
+                v.get("output_index").and_then(|i| i.as_u64()),
+                v.get("delta").and_then(|d| d.as_str()),
+            ) {
+                state.thinking.entry(i as usize).or_default().push_str(d);
+                out.push(StreamEvent::ThinkingDelta(d.into()));
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            if let (Some(i), Some(d)) = (
+                v.get("output_index").and_then(|i| i.as_u64()),
+                v.get("delta").and_then(|d| d.as_str()),
+            ) {
+                let i = i as usize;
+                state.tool_args.entry(i).or_default().push_str(d);
+                out.push(StreamEvent::ToolCallDelta {
+                    index: i,
+                    json_fragment: d.into(),
+                });
+            }
+        }
+        "response.function_call_arguments.done" => {
+            if let (Some(i), Some(a)) = (
+                v.get("output_index").and_then(|i| i.as_u64()),
+                v.get("arguments").and_then(|a| a.as_str()),
+            ) {
+                let i = i as usize;
+                let prior = state.tool_args.entry(i).or_default();
+                if let Some(rest) = a.strip_prefix(prior.as_str()) {
+                    if !rest.is_empty() {
+                        out.push(StreamEvent::ToolCallDelta {
+                            index: i,
+                            json_fragment: rest.into(),
+                        });
+                    }
+                }
+                *prior = a.to_string();
+            }
+        }
+        "response.completed" | "response.incomplete" => {
+            finalize(v.get("response").unwrap_or(&v), out, state)
+        }
+        "response.failed" => out.push(StreamEvent::FatalError(
+            v.pointer("/response/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("response failed")
+                .into(),
+        )),
+        "error" => out.push(StreamEvent::FatalError(
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+                .into(),
+        )),
         _ => {}
     }
 }
 
-fn start_item(index: usize, item: &Value, out: &mut Vec<StreamEvent>, state: &mut ResponsesEventState) {
+fn start_item(
+    index: usize,
+    item: &Value,
+    out: &mut Vec<StreamEvent>,
+    state: &mut ResponsesEventState,
+) {
     if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
         state.tool_started.insert(index);
         state.tools_emitted = true;
-        let call_id = item.get("call_id").and_then(|s|s.as_str()).unwrap_or_default();
-        let id = item.get("id").and_then(|s|s.as_str());
-        let stored_id = id.map(|id| format!("{call_id}|{id}")).unwrap_or_else(|| call_id.to_string());
-        out.push(StreamEvent::ToolCallStart{ index, id: stored_id, name: item.get("name").and_then(|s|s.as_str()).unwrap_or_default().to_string() });
-        if let Some(a)=item.get("arguments").and_then(|a|a.as_str()).filter(|s| !s.is_empty()) {
+        let call_id = item
+            .get("call_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+        let id = item.get("id").and_then(|s| s.as_str());
+        let stored_id = id
+            .map(|id| format!("{call_id}|{id}"))
+            .unwrap_or_else(|| call_id.to_string());
+        out.push(StreamEvent::ToolCallStart {
+            index,
+            id: stored_id,
+            name: item
+                .get("name")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+        if let Some(a) = item
+            .get("arguments")
+            .and_then(|a| a.as_str())
+            .filter(|s| !s.is_empty())
+        {
             state.tool_args.insert(index, a.to_string());
-            out.push(StreamEvent::ToolCallDelta{index,json_fragment:a.into()});
+            out.push(StreamEvent::ToolCallDelta {
+                index,
+                json_fragment: a.into(),
+            });
         }
     }
 }
 
-fn done_item(index: usize, item: &Value, out: &mut Vec<StreamEvent>, state: &mut ResponsesEventState) {
+fn done_item(
+    index: usize,
+    item: &Value,
+    out: &mut Vec<StreamEvent>,
+    state: &mut ResponsesEventState,
+) {
     match item.get("type").and_then(|t| t.as_str()) {
         Some("function_call") => {
-            if !state.tool_started.contains(&index) { start_item(index, item, out, state); }
+            if !state.tool_started.contains(&index) {
+                start_item(index, item, out, state);
+            }
             if let Some(a) = item.get("arguments").and_then(|a| a.as_str()) {
                 let prior = state.tool_args.entry(index).or_default();
                 if let Some(rest) = a.strip_prefix(prior.as_str()) {
-                    if !rest.is_empty() { out.push(StreamEvent::ToolCallDelta{index,json_fragment:rest.into()}); }
+                    if !rest.is_empty() {
+                        out.push(StreamEvent::ToolCallDelta {
+                            index,
+                            json_fragment: rest.into(),
+                        });
+                    }
                 }
                 *prior = a.to_string();
             }
         }
         Some("reasoning") => {
-            let text = item.get("summary").and_then(|s|s.as_array()).map(|a| a.iter().filter_map(|x|x.get("text").and_then(|t|t.as_str())).collect::<Vec<_>>().join("\n\n")).unwrap_or_default();
+            let text = item
+                .get("summary")
+                .and_then(|s| s.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default();
             let prior = state.thinking.entry(index).or_default();
             if let Some(rest) = text.strip_prefix(prior.as_str()) {
-                if !rest.is_empty() { out.push(StreamEvent::ThinkingDelta(rest.into())); }
+                if !rest.is_empty() {
+                    out.push(StreamEvent::ThinkingDelta(rest.into()));
+                }
             } else if prior.is_empty() && !text.is_empty() {
                 out.push(StreamEvent::ThinkingDelta(text.clone()));
             }
             *prior = text;
-            if item.get("encrypted_content").is_some() { out.push(StreamEvent::ThinkingSignatureDelta(item.to_string())); }
-        }
-        Some("message") => if let Some(arr)=item.get("content").and_then(|c|c.as_array()) {
-            let text = arr.iter().filter_map(|c| c.get("text").or_else(||c.get("refusal")).and_then(|t|t.as_str())).collect::<String>();
-            let prior = state.text.entry(index).or_default();
-            if let Some(rest) = text.strip_prefix(prior.as_str()) {
-                if !rest.is_empty() { out.push(StreamEvent::TextDelta(rest.into())); }
-            } else if prior.is_empty() && !text.is_empty() {
-                out.push(StreamEvent::TextDelta(text.clone()));
+            if item.get("encrypted_content").is_some() {
+                out.push(StreamEvent::ThinkingSignatureDelta(item.to_string()));
             }
-            *prior = text;
-        },
+        }
+        Some("message") => {
+            if let Some(arr) = item.get("content").and_then(|c| c.as_array()) {
+                let text = arr
+                    .iter()
+                    .filter_map(|c| {
+                        c.get("text")
+                            .or_else(|| c.get("refusal"))
+                            .and_then(|t| t.as_str())
+                    })
+                    .collect::<String>();
+                let prior = state.text.entry(index).or_default();
+                if let Some(rest) = text.strip_prefix(prior.as_str()) {
+                    if !rest.is_empty() {
+                        out.push(StreamEvent::TextDelta(rest.into()));
+                    }
+                } else if prior.is_empty() && !text.is_empty() {
+                    out.push(StreamEvent::TextDelta(text.clone()));
+                }
+                *prior = text;
+            }
+        }
         _ => {}
     }
 }
 
 fn finalize(resp: &Value, out: &mut Vec<StreamEvent>, state: &mut ResponsesEventState) {
-    if state.terminal { return; }
+    if state.terminal {
+        return;
+    }
     state.terminal = true;
-    if let Some(u)=resp.get("usage") { out.push(StreamEvent::Usage(parse_usage(u))); }
-    out.push(StreamEvent::MessageEnd{ stop_reason: map_status(resp, state.tools_emitted) });
+    if let Some(u) = resp.get("usage") {
+        out.push(StreamEvent::Usage(parse_usage(u)));
+    }
+    out.push(StreamEvent::MessageEnd {
+        stop_reason: map_status(resp, state.tools_emitted),
+    });
 }
 
 fn parse_usage(u: &Value) -> Usage {
-    let g=|k:&str| u.get(k).and_then(|x|x.as_u64()).unwrap_or(0);
+    let g = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
     let details = u.get("input_tokens_details");
-    let cached = details.and_then(|d|d.get("cached_tokens")).and_then(|x|x.as_u64()).unwrap_or(0);
-    let written = details.and_then(|d|d.get("cache_write_tokens")).and_then(|x|x.as_u64()).unwrap_or(0);
-    Usage{ input:g("input_tokens").saturating_sub(cached+written), output:g("output_tokens"), cache_read:cached, cache_write:written }
+    let cached = details
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let written = details
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    Usage {
+        input: g("input_tokens").saturating_sub(cached + written),
+        output: g("output_tokens"),
+        cache_read: cached,
+        cache_write: written,
+    }
 }
 fn map_status(resp: &Value, tools_emitted: bool) -> StopReason {
-    if tools_emitted && resp.get("status").and_then(|s| s.as_str()).unwrap_or("completed") == "completed" { return StopReason::ToolUse; }
-    match resp.get("status").and_then(|s|s.as_str()).unwrap_or("completed") {
+    if tools_emitted
+        && resp
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("completed")
+            == "completed"
+    {
+        return StopReason::ToolUse;
+    }
+    match resp
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("completed")
+    {
         "completed" => StopReason::Stop,
-        "incomplete" => if resp.pointer("/incomplete_details/reason").and_then(|r|r.as_str()) == Some("max_output_tokens") { StopReason::Length } else { StopReason::Error },
+        "incomplete" => {
+            if resp
+                .pointer("/incomplete_details/reason")
+                .and_then(|r| r.as_str())
+                == Some("max_output_tokens")
+            {
+                StopReason::Length
+            } else {
+                StopReason::Error
+            }
+        }
         "cancelled" => StopReason::Aborted,
         "failed" => StopReason::Error,
         _ => StopReason::Stop,
@@ -329,56 +539,209 @@ fn map_status(resp: &Value, tools_emitted: bool) -> StopReason {
 mod tests {
     use super::*;
     use crate::provider::{CacheHints, ThinkingLevel};
-    fn req() -> ChatRequest { ChatRequest{system:"sys".into(),messages:vec![Message::user_text("hi")].into(),tools:vec![].into(),model:"gpt".into(),max_tokens:8,temperature:None,cache:CacheHints::default(),thinking:Some(ThinkingLevel::Low),session_id:"sess".into()} }
-    #[test] fn codex_body_shape() { let mut r=req(); r.temperature=Some(0.2); let b=build_codex_body(&r, &Value::Null); assert_eq!(b["store"], false); assert_eq!(b["instructions"], "sys"); assert_eq!(b["text"]["verbosity"], "low"); assert!(b.get("temperature").is_none()); assert!(b["include"].as_array().unwrap().contains(&json!("reasoning.encrypted_content"))); }
-    #[test] fn sse_tool_delta_done_not_duplicated() { let mut out=vec![]; let mut st=ResponsesEventState::default(); responses_event(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc","name":"t","arguments":""}}"#, &mut out, &mut st); responses_event(r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}"#, &mut out, &mut st); responses_event(r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"a\":1}"}"#, &mut out, &mut st); assert!(matches!(out[0], StreamEvent::ToolCallStart{..})); assert_eq!(out.iter().filter(|e| matches!(e, StreamEvent::ToolCallStart{..})).count(),1); }
+    fn req() -> ChatRequest {
+        ChatRequest {
+            system: "sys".into(),
+            messages: vec![Message::user_text("hi")].into(),
+            tools: vec![].into(),
+            model: "gpt".into(),
+            max_tokens: 8,
+            temperature: None,
+            cache: CacheHints::default(),
+            thinking: Some(ThinkingLevel::Low),
+            session_id: "sess".into(),
+        }
+    }
+    #[test]
+    fn codex_body_shape() {
+        let mut r = req();
+        r.temperature = Some(0.2);
+        let b = build_codex_body(&r, &Value::Null);
+        assert_eq!(b["store"], false);
+        assert_eq!(b["instructions"], "sys");
+        assert_eq!(b["text"]["verbosity"], "low");
+        assert!(b.get("temperature").is_none());
+        assert!(b["include"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("reasoning.encrypted_content")));
+    }
+    #[test]
+    fn sse_tool_delta_done_not_duplicated() {
+        let mut out = vec![];
+        let mut st = ResponsesEventState::default();
+        responses_event(
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc","name":"t","arguments":""}}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"a\":1}"}"#,
+            &mut out,
+            &mut st,
+        );
+        assert!(matches!(out[0], StreamEvent::ToolCallStart { .. }));
+        assert_eq!(
+            out.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn text_and_thinking_done_emit_exactly_once() {
-        let mut out=vec![]; let mut st=ResponsesEventState::default();
-        responses_event(r#"{"type":"response.output_text.delta","output_index":0,"delta":"hel"}"#, &mut out, &mut st);
-        responses_event(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"hello"}]}}"#, &mut out, &mut st);
-        responses_event(r#"{"type":"response.reasoning_summary_text.delta","output_index":1,"delta":"th"}"#, &mut out, &mut st);
-        responses_event(r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs","summary":[{"text":"think"}],"encrypted_content":"enc"}}"#, &mut out, &mut st);
-        let text: String = out.iter().filter_map(|e| if let StreamEvent::TextDelta(s)=e {Some(s.as_str())} else {None}).collect();
-        let thinking: String = out.iter().filter_map(|e| if let StreamEvent::ThinkingDelta(s)=e {Some(s.as_str())} else {None}).collect();
+        let mut out = vec![];
+        let mut st = ResponsesEventState::default();
+        responses_event(
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"hel"}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"hello"}]}}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":1,"delta":"th"}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs","summary":[{"text":"think"}],"encrypted_content":"enc"}}"#,
+            &mut out,
+            &mut st,
+        );
+        let text: String = out
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::TextDelta(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let thinking: String = out
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ThinkingDelta(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(text, "hello");
         assert_eq!(thinking, "think");
-        assert_eq!(out.iter().filter(|e| matches!(e, StreamEvent::ThinkingSignatureDelta(_))).count(), 1);
+        assert_eq!(
+            out.iter()
+                .filter(|e| matches!(e, StreamEvent::ThinkingSignatureDelta(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn tool_done_suffix_and_completed_maps_tool_use() {
-        let mut out=vec![]; let mut st=ResponsesEventState::default();
-        responses_event(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call","id":"fc_item","name":"tool","arguments":""}}"#, &mut out, &mut st);
-        responses_event(r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}"#, &mut out, &mut st);
-        responses_event(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call","id":"fc_item","name":"tool","arguments":"{\"a\":1}"}}"#, &mut out, &mut st);
-        responses_event(r#"{"type":"response.completed","response":{"status":"completed"}}"#, &mut out, &mut st);
-        let args: String = out.iter().filter_map(|e| if let StreamEvent::ToolCallDelta{json_fragment,..}=e {Some(json_fragment.as_str())} else {None}).collect();
+        let mut out = vec![];
+        let mut st = ResponsesEventState::default();
+        responses_event(
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call","id":"fc_item","name":"tool","arguments":""}}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call","id":"fc_item","name":"tool","arguments":"{\"a\":1}"}}"#,
+            &mut out,
+            &mut st,
+        );
+        responses_event(
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+            &mut out,
+            &mut st,
+        );
+        let args: String = out
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCallDelta { json_fragment, .. } = e {
+                    Some(json_fragment.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(args, "{\"a\":1}");
         assert!(matches!(out[0], StreamEvent::ToolCallStart{ ref id, .. } if id == "call|fc_item"));
-        assert!(matches!(out.last().unwrap(), StreamEvent::MessageEnd{ stop_reason: StopReason::ToolUse }));
+        assert!(matches!(
+            out.last().unwrap(),
+            StreamEvent::MessageEnd {
+                stop_reason: StopReason::ToolUse
+            }
+        ));
     }
 
     #[test]
     fn two_turn_request_pairs_tool_output_and_user_image() {
-        let assistant = Message::assistant(vec![ContentBlock::ToolCall(crate::message::ToolCall{ id:"call|fc_item".into(), name:"tool".into(), arguments:json!({"a":1}) })], "gpt", Api::OpenaiResponses, Usage::default(), StopReason::ToolUse);
+        let assistant = Message::assistant(
+            vec![ContentBlock::ToolCall(crate::message::ToolCall {
+                id: "call|fc_item".into(),
+                name: "tool".into(),
+                arguments: json!({"a":1}),
+            })],
+            "gpt",
+            Api::OpenaiResponses,
+            Usage::default(),
+            StopReason::ToolUse,
+        );
         let tool = Message::tool_result("call|fc_item", "tool", "ok", false);
         let mut user = Message::user_text("see");
-        user.content.push(ContentBlock::Image{ media_type:"image/png".into(), data:"AAA".into() });
+        user.content.push(ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "AAA".into(),
+        });
         let mut r = req();
         r.messages = vec![user, assistant, tool].into();
         let b = build_responses_body(&r, &Value::Null);
         let input = b["input"].as_array().unwrap();
-        assert!(input.iter().any(|v| v["type"] == "function_call" && v["id"] == "fc_item"));
-        assert!(input.iter().any(|v| v["type"] == "function_call_output" && v["call_id"] == "call"));
-        assert!(input[1]["content"].as_array().unwrap().iter().any(|c| c["type"] == "input_image"));
+        assert!(input
+            .iter()
+            .any(|v| v["type"] == "function_call" && v["id"] == "fc_item"));
+        assert!(input
+            .iter()
+            .any(|v| v["type"] == "function_call_output" && v["call_id"] == "call"));
+        assert!(input[1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["type"] == "input_image"));
     }
 
-    struct StaticResolver { base_url: String }
+    struct StaticResolver {
+        base_url: String,
+    }
     impl crate::provider::credentials::CredentialResolver for StaticResolver {
         fn resolve(&self) -> crate::provider::credentials::CredentialFuture<'_> {
-            Box::pin(async move { Ok(crate::provider::credentials::ResolvedCredential { api_key: "tok".into(), account_id: Some("acct".into()), base_url: Some(self.base_url.clone()), headers: vec![("x-extra".into(), "yes".into())], ..Default::default() }) })
+            Box::pin(async move {
+                Ok(crate::provider::credentials::ResolvedCredential {
+                    api_key: "tok".into(),
+                    account_id: Some("acct".into()),
+                    base_url: Some(self.base_url.clone()),
+                    headers: vec![("x-extra".into(), "yes".into())],
+                    ..Default::default()
+                })
+            })
         }
     }
 
@@ -404,17 +767,36 @@ mod tests {
             );
             write!(s, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}", body.len(), body).unwrap();
         });
-        let p = ResponsesProvider::new("unused", None).with_codex(true).with_credentials(std::sync::Arc::new(StaticResolver{ base_url: format!("http://{}", addr) }));
+        let p = ResponsesProvider::new("unused", None)
+            .with_codex(true)
+            .with_credentials(std::sync::Arc::new(StaticResolver {
+                base_url: format!("http://{}", addr),
+            }));
         let mut stream = p.stream(&req()).await.unwrap();
         let mut seen = Vec::new();
-        while let Some(ev) = stream.next().await { seen.push(ev.unwrap()); }
+        while let Some(ev) = stream.next().await {
+            seen.push(ev.unwrap());
+        }
         let raw = rx.recv().unwrap();
         assert!(raw.starts_with("POST /codex/responses "));
-        assert!(raw.to_ascii_lowercase().contains("authorization: bearer tok"));
-        assert!(raw.to_ascii_lowercase().contains("chatgpt-account-id: acct"));
+        assert!(raw
+            .to_ascii_lowercase()
+            .contains("authorization: bearer tok"));
+        assert!(raw
+            .to_ascii_lowercase()
+            .contains("chatgpt-account-id: acct"));
         assert!(raw.contains("\"store\":false"));
-        assert!(seen.iter().any(|e| matches!(e, StreamEvent::ToolCallStart{ name, .. } if name == "t")));
-        assert_eq!(seen.iter().filter(|e| matches!(e, StreamEvent::ToolCallStart{..})).count(), 1);
-        assert!(seen.iter().any(|e| matches!(e, StreamEvent::MessageEnd{..})));
+        assert!(seen
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCallStart{ name, .. } if name == "t")));
+        assert_eq!(
+            seen.iter()
+                .filter(|e| matches!(e, StreamEvent::ToolCallStart { .. }))
+                .count(),
+            1
+        );
+        assert!(seen
+            .iter()
+            .any(|e| matches!(e, StreamEvent::MessageEnd { .. })));
     }
 }

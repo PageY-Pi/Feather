@@ -263,7 +263,14 @@ impl Settings {
         patch["maxTokens"] = serde_json::json!(self.max_tokens);
         patch["contextWindow"] = serde_json::json!(self.context_window);
         patch["baseUrl"] = serde_json::json!(self.base_url);
-        for (snake,camel) in [("reserve_tokens","reserveTokens"),("keep_recent_tokens","keepRecentTokens"),("summary_tool_result_budget","summaryToolResultBudget"),("kept_tool_result_budget","keptToolResultBudget"),("shrink_kept","shrinkKept"),("keep_last_turns_unshrunk","keepLastTurnsUnshrunk")] {
+        for (snake, camel) in [
+            ("reserve_tokens", "reserveTokens"),
+            ("keep_recent_tokens", "keepRecentTokens"),
+            ("summary_tool_result_budget", "summaryToolResultBudget"),
+            ("kept_tool_result_budget", "keptToolResultBudget"),
+            ("shrink_kept", "shrinkKept"),
+            ("keep_last_turns_unshrunk", "keepLastTurnsUnshrunk"),
+        ] {
             patch["compaction"][camel] = patch["compaction"][snake].clone();
         }
         crate::config_store::update(&feather_home(), "settings", |v| {
@@ -311,7 +318,9 @@ impl Settings {
 
     pub fn save_default_if_missing(&self) {
         if let Ok(Some(value)) = crate::config_store::read(&feather_home(), "settings") {
-            if value.as_object().map(|v| v.is_empty()).unwrap_or(false) { let _ = self.save(); }
+            if value.as_object().map(|v| v.is_empty()).unwrap_or(false) {
+                let _ = self.save();
+            }
         }
     }
 }

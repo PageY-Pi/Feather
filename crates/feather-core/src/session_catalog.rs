@@ -112,11 +112,7 @@ fn ensure_table(db: &Database) -> Result<(), SessionError> {
 }
 
 /// Mirror one session's discovery metadata into the global catalog.
-pub fn register_session(
-    home: &Path,
-    dir: &Path,
-    meta: &SessionMeta,
-) -> Result<(), SessionError> {
+pub fn register_session(home: &Path, dir: &Path, meta: &SessionMeta) -> Result<(), SessionError> {
     let path = catalog_path(home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -153,31 +149,60 @@ pub fn delete_session(home: &Path, dir: &Path) -> Result<(), SessionError> {
     let target = std::fs::canonicalize(dir)?;
     let meta = std::fs::symlink_metadata(dir)?;
     if meta.file_type().is_symlink() || target.parent() != Some(root.as_path()) || !meta.is_dir() {
-        return Err(SessionError::Catalog("Refusing to delete a path outside session history".into()));
+        return Err(SessionError::Catalog(
+            "Refusing to delete a path outside session history".into(),
+        ));
     }
-    let id = target.file_name().and_then(|s|s.to_str()).ok_or_else(||SessionError::Catalog("Invalid session ID".into()))?.to_string();
-    if !id.starts_with('s') || (!target.join("session.redb").is_file() && !target.join("session.jsonl").is_file()) {
+    let id = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| SessionError::Catalog("Invalid session ID".into()))?
+        .to_string();
+    if !id.starts_with('s')
+        || (!target.join("session.redb").is_file() && !target.join("session.jsonl").is_file())
+    {
         return Err(SessionError::Catalog("Not a session directory".into()));
     }
     let mut handles = Vec::new();
-    for name in ["session.redb","tasks.redb","checkpoints.redb","subagents.redb"] {
-        let path=target.join(name);
-        if path.exists() { handles.push(crate::database::open(path).map_err(|_|SessionError::Catalog("Session is active or locked; close it before deleting".into()))?); }
+    for name in [
+        "session.redb",
+        "tasks.redb",
+        "checkpoints.redb",
+        "subagents.redb",
+    ] {
+        let path = target.join(name);
+        if path.exists() {
+            handles.push(crate::database::open(path).map_err(|_| {
+                SessionError::Catalog(
+                    "Session is active or locked; close it before deleting".into(),
+                )
+            })?);
+        }
     }
     drop(handles);
-    let trash=root.join(format!(".deleted-{id}-{}",crate::message::now_millis()));
-    std::fs::rename(&target,&trash)?;
+    let trash = root.join(format!(".deleted-{id}-{}", crate::message::now_millis()));
+    std::fs::rename(&target, &trash)?;
     let result = (|| {
-        let db=open_catalog(&catalog_path(home))?;
-        let tx=db.begin_write().map_err(|e|SessionError::Catalog(e.to_string()))?;
+        let db = open_catalog(&catalog_path(home))?;
+        let tx = db
+            .begin_write()
+            .map_err(|e| SessionError::Catalog(e.to_string()))?;
         {
-            let mut table=tx.open_table(CATALOG).map_err(|e|SessionError::Catalog(e.to_string()))?;
-            table.remove(id.as_str()).map_err(|e|SessionError::Catalog(e.to_string()))?;
+            let mut table = tx
+                .open_table(CATALOG)
+                .map_err(|e| SessionError::Catalog(e.to_string()))?;
+            table
+                .remove(id.as_str())
+                .map_err(|e| SessionError::Catalog(e.to_string()))?;
         }
-        tx.commit().map_err(|e|SessionError::Catalog(e.to_string()))?;
-        Ok::<_,SessionError>(())
+        tx.commit()
+            .map_err(|e| SessionError::Catalog(e.to_string()))?;
+        Ok::<_, SessionError>(())
     })();
-    if let Err(e)=result {let _=std::fs::rename(&trash,&target);return Err(e);}
+    if let Err(e) = result {
+        let _ = std::fs::rename(&trash, &target);
+        return Err(e);
+    }
     std::fs::remove_dir_all(trash)?;
     Ok(())
 }
@@ -219,7 +244,14 @@ pub fn list_sessions(home: &Path, cwd: &Path) -> Result<Vec<SessionInfo>, Sessio
     // never opened by this build, and drop catalog rows whose dir is gone.
     if let Ok(dir_entries) = std::fs::read_dir(&root) {
         for dir in dir_entries.flatten().map(|e| e.path()) {
-            if dir.file_name().and_then(|s|s.to_str()).map(|s|s.starts_with(".deleted-")).unwrap_or(false) {continue;}
+            if dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with(".deleted-"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if !dir.is_dir() {
                 continue;
             }
@@ -227,13 +259,17 @@ pub fn list_sessions(home: &Path, cwd: &Path) -> Result<Vec<SessionInfo>, Sessio
                 continue;
             }
             if let Some(entry) = discover_dir(&dir) {
-                let _ = register_session(home, &dir, &SessionMeta {
-                    id: entry.id.clone(),
-                    cwd: entry.cwd.clone(),
-                    created_ms: entry.created_ms,
-                    modified_ms: entry.modified_ms,
-                    first_prompt: entry.first_prompt.clone(),
-                });
+                let _ = register_session(
+                    home,
+                    &dir,
+                    &SessionMeta {
+                        id: entry.id.clone(),
+                        cwd: entry.cwd.clone(),
+                        created_ms: entry.created_ms,
+                        modified_ms: entry.modified_ms,
+                        first_prompt: entry.first_prompt.clone(),
+                    },
+                );
                 entries.insert(entry.id.clone(), entry);
             }
         }
@@ -244,16 +280,11 @@ pub fn list_sessions(home: &Path, cwd: &Path) -> Result<Vec<SessionInfo>, Sessio
         .filter(|e| e.dir.is_dir())
         .map(CatalogEntry::info)
         .filter(|info| {
-            let folder =
-                std::fs::canonicalize(&info.cwd).unwrap_or_else(|_| info.cwd.clone());
+            let folder = std::fs::canonicalize(&info.cwd).unwrap_or_else(|_| info.cwd.clone());
             folder == cwd
         })
         .collect();
-    sessions.sort_by(|a, b| {
-        b.modified_ms
-            .cmp(&a.modified_ms)
-            .then(a.id.cmp(&b.id))
-    });
+    sessions.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms).then(a.id.cmp(&b.id)));
     Ok(sessions)
 }
 
@@ -287,7 +318,11 @@ fn discover_dir(dir: &Path) -> Option<CatalogEntry> {
     let mut id = String::new();
     let mut cwd = PathBuf::new();
     use std::io::BufRead;
-    for line in std::io::BufReader::new(file).lines().take(4096).map_while(Result::ok) {
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .take(4096)
+        .map_while(Result::ok)
+    {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -325,7 +360,6 @@ fn discover_dir(dir: &Path) -> Option<CatalogEntry> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,18 +385,19 @@ mod tests {
 
     #[test]
     fn deletion_rejects_active_and_external_paths_and_removes_history() {
-        let home=std::env::temp_dir().join(crate::provider::gen_id("delete-session"));
+        let home = std::env::temp_dir().join(crate::provider::gen_id("delete-session"));
         std::fs::create_dir_all(&home).unwrap();
-        let mut s=Session::new(&home,&home).unwrap();
-        s.push(Message::user_text("delete me")).unwrap();s.commit_turn().unwrap();
-        let dir=s.dir().to_path_buf();
-        assert!(delete_session(&home,&dir).is_err());
+        let mut s = Session::new(&home, &home).unwrap();
+        s.push(Message::user_text("delete me")).unwrap();
+        s.commit_turn().unwrap();
+        let dir = s.dir().to_path_buf();
+        assert!(delete_session(&home, &dir).is_err());
         assert!(dir.exists());
-        assert!(delete_session(&home,&home).is_err());
+        assert!(delete_session(&home, &home).is_err());
         drop(s);
-        delete_session(&home,&dir).unwrap();
+        delete_session(&home, &dir).unwrap();
         assert!(!dir.exists());
-        assert!(list_sessions(&home,&home).unwrap().is_empty());
+        assert!(list_sessions(&home, &home).unwrap().is_empty());
         std::fs::remove_dir_all(home).unwrap();
     }
     #[test]

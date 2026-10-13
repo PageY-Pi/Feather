@@ -83,11 +83,7 @@ fn rewind_restores_context_and_keeps_transcript_and_files() {
 
     // the raw redb audit keeps the full history (rewind is additive)
     let raw = s.raw_messages().unwrap();
-    assert_eq!(
-        raw.len(),
-        4,
-        "every pushed message"
-    );
+    assert_eq!(raw.len(), 4, "every pushed message");
     assert!(raw[2].text() == "now create generated.txt");
 
     // snapshots survive the rewind: forward-rewind is possible

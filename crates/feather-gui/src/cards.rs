@@ -9,6 +9,20 @@ pub fn render_row(ui: &mut egui::Ui, row: &mut ChatRow, now: f64, show_thinking:
     match row.kind {
         RowKind::User => {
             let max = (ui.available_width() * 0.82).min(650.0);
+            let text_width = ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(row.text.clone(), egui::FontId::proportional(15.5), TEXT)
+                    .size()
+                    .x
+            });
+            // Short one-line prompts should hug their content; multiline or
+            // wrapped text keeps the existing readable maximum bubble width.
+            let compact = !row.text.contains(['\n', '\r']) && text_width <= max - 36.0;
+            let bubble_width = if compact {
+                (text_width + 36.0).max(72.0).min(max)
+            } else {
+                max
+            };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 egui::Frame::none()
                     .fill(USER_BUBBLE)
@@ -20,11 +34,16 @@ pub fn render_row(ui: &mut egui::Ui, row: &mut ChatRow, now: f64, show_thinking:
                     })
                     .inner_margin(egui::Margin::symmetric(18.0, 13.0))
                     .show(ui, |ui| {
-                        ui.set_max_width(max);
+                        ui.set_width(bubble_width);
                         // The bubble is right-anchored by its parent, but its
                         // contents are normal left-aligned paragraphs, not RTL.
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min),|ui| {
-                            ui.add(egui::Label::new(egui::RichText::new(&row.text).size(15.5).color(TEXT)).wrap());
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&row.text).size(15.5).color(TEXT),
+                                )
+                                .wrap(),
+                            );
                         });
                     });
             });
@@ -54,9 +73,9 @@ pub fn render_row(ui: &mut egui::Ui, row: &mut ChatRow, now: f64, show_thinking:
                         // Global toggle applies once per row, including virtualized
                         // rows revisited later. Header clicks remain independently usable.
                         let mode_id = ui.id().with("thinking-global-mode");
-                        let previous = ui.data(|d|d.get_temp::<bool>(mode_id));
+                        let previous = ui.data(|d| d.get_temp::<bool>(mode_id));
                         let force = (previous != Some(show_thinking)).then_some(show_thinking);
-                        ui.data_mut(|d|d.insert_temp(mode_id,show_thinking));
+                        ui.data_mut(|d| d.insert_temp(mode_id, show_thinking));
                         egui::CollapsingHeader::new(
                             egui::RichText::new("Thoughts").size(12.5).color(TEAL),
                         )
@@ -361,8 +380,8 @@ pub fn begin_row_scroll(ctx: &egui::Context, anchor_top: Option<f32>, freeze_geo
     });
 }
 
-pub fn release_history_layouts(ctx:&egui::Context) {
-    *layout_cache::galley_ring(ctx).lock().unwrap()=layout_cache::GalleyRing::default();
+pub fn release_history_layouts(ctx: &egui::Context) {
+    *layout_cache::galley_ring(ctx).lock().unwrap() = layout_cache::GalleyRing::default();
 }
 #[cfg(test)]
 pub fn clear_layout_ring_for_test(ctx: &egui::Context) {
@@ -499,7 +518,8 @@ fn show_piece_lazy(
             galley = Some(shaped);
             *shape_budget -= 1;
         } else {
-            ui.ctx().request_repaint_after(crate::graphics::SHAPING_REPAINT_DELAY);
+            ui.ctx()
+                .request_repaint_after(crate::graphics::SHAPING_REPAINT_DELAY);
         }
     }
     let draw_height = if pass.freeze_geometry {
@@ -753,44 +773,154 @@ fn inline(text: &str) -> egui::text::LayoutJob {
 mod tests {
     #[test]
     fn user_bubble_is_right_anchored_but_each_line_is_left_aligned() {
-        for width in [360.0,900.0] {
-            let ctx=egui::Context::default();crate::theme::apply_theme(&ctx);
-            let text="A longer first line of a prompt\nshort\nA wrapping paragraph of uneven words. ".repeat(6);
-            let mut row=ChatRow::new(RowKind::User,text);
-            let mut output=None;
+        #[test]
+        fn short_one_line_user_bubble_hugs_text_but_long_text_keeps_maximum() {
+            let ctx = egui::Context::default();
+            crate::theme::apply_theme(&ctx);
+            let mut short = ChatRow::new(RowKind::User, "ok");
+            let mut long = ChatRow::new(RowKind::User, "long ".repeat(300));
+            let render = |ctx: &egui::Context, row: &mut ChatRow| {
+                let mut output = None;
+                for _ in 0..3 {
+                    output = Some(ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(900.0, 300.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default()
+                                .show(ctx, |ui| render_row(ui, row, 0.0, true));
+                        },
+                    ));
+                }
+                output.unwrap()
+            };
+            let short_output = render(&ctx, &mut short);
+            let long_output = render(&ctx, &mut long);
+            let rect = |output: &egui::FullOutput| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect) if rect.fill == USER_BUBBLE => Some(rect.rect),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            assert!(
+                rect(&short_output).width() < 120.0,
+                "short bubble should hug content: {:?}",
+                rect(&short_output)
+            );
+            assert!(
+                rect(&long_output).width() > rect(&short_output).width() * 3.0,
+                "long bubble should retain readable width"
+            );
+        }
+        for width in [360.0, 900.0] {
+            let ctx = egui::Context::default();
+            crate::theme::apply_theme(&ctx);
+            let text =
+                "A longer first line of a prompt\nshort\nA wrapping paragraph of uneven words. "
+                    .repeat(6);
+            let mut row = ChatRow::new(RowKind::User, text);
+            let mut output = None;
             for _ in 0..3 {
-                output=Some(ctx.run(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(width,800.0))),..Default::default()},|ctx| {
-                    egui::CentralPanel::default().show(ctx,|ui|render_row(ui,&mut row,0.0,true));
-                }));
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .show(ctx, |ui| render_row(ui, &mut row, 0.0, true));
+                    },
+                ));
             }
-            let output=output.unwrap();
-            let bubble=output.shapes.iter().find_map(|s|match &s.shape {egui::Shape::Rect(r) if r.fill==USER_BUBBLE=>Some(r.rect),_=>None}).unwrap();
-            assert!((bubble.right()-(width-8.0)).abs()<1.0,"bubble not on right: {bubble:?}");
-            assert!(bubble.width()<=650.0+36.0+1.0);
-            let text=output.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t),_=>None}).unwrap();
-            assert_eq!(text.galley.job.halign,egui::Align::Min);
-            assert!(text.galley.rows.len()>4);
-            for line in &text.galley.rows {assert!((line.rect.left()).abs()<0.1,"line must begin at the left edge: {:?}",line.rect);}
-            assert!((text.pos.x-bubble.left()-18.0).abs()<1.0);
+            let output = output.unwrap();
+            let bubble = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == USER_BUBBLE => Some(r.rect),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                (bubble.right() - (width - 8.0)).abs() < 1.0,
+                "bubble not on right: {bubble:?}"
+            );
+            assert!(bubble.width() <= 650.0 + 36.0 + 1.0);
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(text.galley.job.halign, egui::Align::Min);
+            assert!(text.galley.rows.len() > 4);
+            for line in &text.galley.rows {
+                assert!(
+                    (line.rect.left()).abs() < 0.1,
+                    "line must begin at the left edge: {:?}",
+                    line.rect
+                );
+            }
+            assert!((text.pos.x - bubble.left() - 18.0).abs() < 1.0);
         }
     }
     use super::*;
     #[test]
     fn global_thinking_toggle_folds_header_without_hiding_it() {
-        let ctx=egui::Context::default();ctx.style_mut(|s|s.animation_time=0.0);
-        let mut row=ChatRow::new(RowKind::Assistant,"answer");row.thinking="unique reasoning body".into();
-        let mut heights=Vec::new();
-        for expanded in [true,false,true] {
-            let output=ctx.run(egui::RawInput {screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(800.0,600.0))),..Default::default()},|ctx| {
-                egui::CentralPanel::default().show(ctx,|ui| {
-                    let start=ui.cursor().min.y;render_row(ui,&mut row,0.0,expanded);heights.push(ui.cursor().min.y-start);
-                });
-            });
-            let texts:Vec<&str>=output.shapes.iter().filter_map(|s|match &s.shape {egui::Shape::Text(t)=>Some(t.galley.job.text.as_str()),_=>None}).collect();
-            assert!(texts.contains(&"Thoughts"),"collapsed thinking header must remain visible");
-            assert_eq!(texts.iter().any(|s|s.contains("unique reasoning body")),expanded);
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let mut row = ChatRow::new(RowKind::Assistant, "answer");
+        row.thinking = "unique reasoning body".into();
+        let mut heights = Vec::new();
+        for expanded in [true, false, true] {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let start = ui.cursor().min.y;
+                        render_row(ui, &mut row, 0.0, expanded);
+                        heights.push(ui.cursor().min.y - start);
+                    });
+                },
+            );
+            let texts: Vec<&str> = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                texts.contains(&"Thoughts"),
+                "collapsed thinking header must remain visible"
+            );
+            assert_eq!(
+                texts.iter().any(|s| s.contains("unique reasoning body")),
+                expanded
+            );
         }
-        assert!(heights[0]>heights[1]);assert!(heights[2]>heights[1]);
+        assert!(heights[0] > heights[1]);
+        assert!(heights[2] > heights[1]);
     }
     #[test]
     fn expanded_tool_card_contains_chinese_argument_and_output_galleys() {

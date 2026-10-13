@@ -182,9 +182,11 @@ impl Session {
             meta.cwd.clone()
         };
         let first_prompt = if meta.first_prompt.is_empty() {
-            let page=store.raw_page_before(Some(64),64,256*1024)?;
-            session_store::first_prompt_from(page.entries.iter().map(|e|&e.message))
-        } else {meta.first_prompt.clone()};
+            let page = store.raw_page_before(Some(64), 64, 256 * 1024)?;
+            session_store::first_prompt_from(page.entries.iter().map(|e| &e.message))
+        } else {
+            meta.first_prompt.clone()
+        };
 
         let snapshots = SnapshotStore::open(&dir.join("snapshots"))?;
         let turn = snapshots.current_turn()?;
@@ -269,18 +271,31 @@ impl Session {
     pub fn shared_messages(&self) -> std::sync::Arc<Vec<Message>> {
         std::sync::Arc::clone(&self.messages)
     }
-    pub fn context_tokens(&self) -> u64 { self.context_tokens }
-    pub fn history_hash(&self) -> u64 { self.history_hash }
-    pub fn message_hashes(&self)->&[u64] {&self.message_hashes}
-    pub fn prefix_tokens(&self)->&[u64] {&self.prefix_tokens}
+    pub fn context_tokens(&self) -> u64 {
+        self.context_tokens
+    }
+    pub fn history_hash(&self) -> u64 {
+        self.history_hash
+    }
+    pub fn message_hashes(&self) -> &[u64] {
+        &self.message_hashes
+    }
+    pub fn prefix_tokens(&self) -> &[u64] {
+        &self.prefix_tokens
+    }
     fn refresh_context_metrics(&mut self) {
-        self.context_tokens=16;self.history_hash=crate::message::fnv1a(b"feather-history-v1");
-        self.message_hashes.clear();self.prefix_tokens.clear();self.prefix_tokens.push(16);
+        self.context_tokens = 16;
+        self.history_hash = crate::message::fnv1a(b"feather-history-v1");
+        self.message_hashes.clear();
+        self.prefix_tokens.clear();
+        self.prefix_tokens.push(16);
         for message in self.messages.iter() {
-            let hash=crate::message::json_hash(message).expect("Message serialization is infallible");
-            self.context_tokens+=crate::tokenizer::estimate_message_tokens(message);
-            self.history_hash=self.history_hash.rotate_left(1)^hash;
-            self.message_hashes.push(hash);self.prefix_tokens.push(self.context_tokens);
+            let hash =
+                crate::message::json_hash(message).expect("Message serialization is infallible");
+            self.context_tokens += crate::tokenizer::estimate_message_tokens(message);
+            self.history_hash = self.history_hash.rotate_left(1) ^ hash;
+            self.message_hashes.push(hash);
+            self.prefix_tokens.push(self.context_tokens);
         }
     }
 
@@ -334,11 +349,22 @@ impl Session {
             let is_first_prompt =
                 self.first_prompt.is_empty() && msg.role == crate::message::Role::User;
             let first_prompt = if is_first_prompt {
-                Some(crate::session_store::first_prompt_from(std::iter::once(&msg)))
-            } else { None };
-            store.append_raw_with_meta(&crate::provider::gen_id("e"),msg.timestamp,&msg,
-                crate::message::now_millis(),first_prompt.as_deref().unwrap_or(&self.first_prompt))?;
-            if let Some(first_prompt) = first_prompt { self.first_prompt = first_prompt; }
+                Some(crate::session_store::first_prompt_from(std::iter::once(
+                    &msg,
+                )))
+            } else {
+                None
+            };
+            store.append_raw_with_meta(
+                &crate::provider::gen_id("e"),
+                msg.timestamp,
+                &msg,
+                crate::message::now_millis(),
+                first_prompt.as_deref().unwrap_or(&self.first_prompt),
+            )?;
+            if let Some(first_prompt) = first_prompt {
+                self.first_prompt = first_prompt;
+            }
             if is_first_prompt {
                 // Make the prompt visible to discovery immediately, before the
                 // first turn commits.
@@ -348,7 +374,8 @@ impl Session {
         self.child_seq += 1;
         self.context_tokens += crate::tokenizer::estimate_message_tokens(&msg);
         self.history_hash = self.history_hash.rotate_left(1) ^ message_hash;
-        self.message_hashes.push(message_hash);self.prefix_tokens.push(self.context_tokens);
+        self.message_hashes.push(message_hash);
+        self.prefix_tokens.push(self.context_tokens);
         std::sync::Arc::make_mut(&mut self.messages).push(msg);
         Ok(())
     }
@@ -366,7 +393,24 @@ impl Session {
         // message snapshot from advancing. Rewind still has file_snapshots for
         // anchor-tool edits; git remains an auxiliary workspace restore path.
         let (_, writes) = crate::compaction::file_ops(&self.messages);
-        let mut files = writes;
+        let owned = crate::file_snapshots::FileSnapshots::new(&self.dir)
+            .tracked_paths()
+            .unwrap_or_default();
+        let mut files = writes
+            .into_iter()
+            .filter(|file| {
+                let raw = crate::workspace_path::normalize_input(Path::new(file));
+                let full = if raw.is_absolute() {
+                    raw
+                } else {
+                    self.cwd.join(raw)
+                };
+                !owned.iter().any(|path| {
+                    crate::workspace_path::comparison_key(path)
+                        == crate::workspace_path::comparison_key(&full)
+                })
+            })
+            .collect::<Vec<_>>();
         for tracker in ["TODO.md", "README.md"] {
             if !files.iter().any(|f| f == tracker) {
                 files.push(tracker.to_string());
@@ -385,10 +429,18 @@ impl Session {
             // it in the same durable snapshot so reopen cannot lose the reason
             // a checkpoint/path was skipped. Tool errors already persist as
             // ToolResult; internal host errors need this explicit bridge.
-            let diagnostics=self.runtime_diagnostics.iter().take(16).map(|d|d.chars().take(1200).collect::<String>()).collect::<Vec<_>>().join("\n");
+            let diagnostics = self
+                .runtime_diagnostics
+                .iter()
+                .take(16)
+                .map(|d| d.chars().take(1200).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
             let text=format!("<feather-runtime-diagnostic>\n{diagnostics}\nSome checkpoint paths or operations were skipped (see reasons above). Continue with an allowed alternative; do not retry the same illegal operation.\n</feather-runtime-diagnostic>");
-            let duplicate=self.messages.last().is_some_and(|m|m.text_cow()==text);
-            if !duplicate {self.push(Message::user_text(text))?;}
+            let duplicate = self.messages.last().is_some_and(|m| m.text_cow() == text);
+            if !duplicate {
+                self.push(Message::user_text(text))?;
+            }
         }
         crate::file_snapshots::FileSnapshots::new(&self.dir).commit(next_turn)?;
         self.snapshots
@@ -416,8 +468,15 @@ impl Session {
             ));
         };
         let msgs = snapshots.load(turn)?;
+        let workspace = crate::gitckpt::GitCheckpoints::open(&self.cwd);
+        let file_store = crate::file_snapshots::FileSnapshots::new(&self.dir);
+        let excluded = file_store.tracked_paths().unwrap_or_default();
         crate::file_snapshots::FileSnapshots::new(&self.dir).restore_with(turn, || {
-            crate::gitckpt::GitCheckpoints::open(&self.cwd).restore(turn, &self.dir)
+            if workspace.has_checkpoint(turn, &self.dir) {
+                workspace.restore_excluding(turn, &self.dir, &excluded)
+            } else {
+                Ok(())
+            }
         })?;
         // Durable current pointer: reopening after this rewind (with no further
         // prompt) restores `turn`, not the newest snapshot the store still
@@ -426,7 +485,7 @@ impl Session {
         let discarded = std::mem::replace(&mut self.messages, std::sync::Arc::new(msgs));
         self.refresh_context_metrics();
         self.turn = turn;
-        Ok(std::sync::Arc::try_unwrap(discarded).unwrap_or_else(|shared|shared.as_ref().clone()))
+        Ok(std::sync::Arc::try_unwrap(discarded).unwrap_or_else(|shared| shared.as_ref().clone()))
     }
 
     pub fn latest_snapshot_turn(&self) -> Result<u64, SessionError> {
@@ -550,40 +609,101 @@ pub fn add_usage(mut a: Usage, b: Usage) -> Usage {
 mod tests {
     #[test]
     fn shared_requests_and_cached_metrics_track_push_compaction_and_retention() {
-        let mut session=Session::memory(Path::new("fixture"),"metrics");
-        let check=|s:&Session| {
-            assert_eq!(s.context_tokens(),crate::tokenizer::estimate_context_tokens(s.messages()));
-            assert_eq!(s.history_hash(),SnapshotStore::history_hash(s.messages()));
-            assert_eq!(s.message_hashes().len(),s.messages().len());
-            for (index,message) in s.messages().iter().enumerate(){
-                assert_eq!(s.message_hashes()[index],crate::message::fnv1a(&serde_json::to_vec(message).unwrap()));
-                assert_eq!(s.prefix_tokens()[index+1],crate::tokenizer::estimate_context_tokens(&s.messages()[..=index]));
+        let mut session = Session::memory(Path::new("fixture"), "metrics");
+        let check = |s: &Session| {
+            assert_eq!(
+                s.context_tokens(),
+                crate::tokenizer::estimate_context_tokens(s.messages())
+            );
+            assert_eq!(s.history_hash(), SnapshotStore::history_hash(s.messages()));
+            assert_eq!(s.message_hashes().len(), s.messages().len());
+            for (index, message) in s.messages().iter().enumerate() {
+                assert_eq!(
+                    s.message_hashes()[index],
+                    crate::message::fnv1a(&serde_json::to_vec(message).unwrap())
+                );
+                assert_eq!(
+                    s.prefix_tokens()[index + 1],
+                    crate::tokenizer::estimate_context_tokens(&s.messages()[..=index])
+                );
             }
         };
         check(&session);
         for n in 0..50 {
-            session.push(Message::user_text(format!("{n} 羽毛 repeat"))).unwrap();check(&session);
-            let shared=session.shared_messages();assert!(std::ptr::eq(session.messages().as_ptr(),shared.as_slice().as_ptr()));
+            session
+                .push(Message::user_text(format!("{n} 羽毛 repeat")))
+                .unwrap();
+            check(&session);
+            let shared = session.shared_messages();
+            assert!(std::ptr::eq(
+                session.messages().as_ptr(),
+                shared.as_slice().as_ptr()
+            ));
             drop(shared);
         }
-        let retained=session.shared_messages();let old_len=retained.len();
-        session.push(Message::user_text("new")).unwrap();assert_eq!(retained.len(),old_len);check(&session);
-        session.set_messages_for_compaction(vec![Message::user_text("summary")]);check(&session);
-        assert_eq!(retained.len(),old_len);
+        let retained = session.shared_messages();
+        let old_len = retained.len();
+        session.push(Message::user_text("new")).unwrap();
+        assert_eq!(retained.len(), old_len);
+        check(&session);
+        session.set_messages_for_compaction(vec![Message::user_text("summary")]);
+        check(&session);
+        assert_eq!(retained.len(), old_len);
     }
     #[test]
     fn checkpoint_rejection_is_a_context_diagnostic_not_a_session_abort() {
-        let h=home("checkpoint-diagnostic");let root=h.join("workspace");std::fs::create_dir_all(&root).unwrap();
-        let mut session=Session::new(&h,&root).unwrap();session.push(Message::user_text("normal prompt")).unwrap();
-        let call=crate::message::ToolCall {id:"blocked-path".into(),name:"write".into(),arguments:serde_json::json!({"path":"../outside.txt"})};
-        session.push(Message::assistant(vec![crate::message::ContentBlock::ToolCall(call)],"synthetic",crate::message::Api::Faux,Usage::default(),crate::message::StopReason::ToolUse)).unwrap();
-        session.push(Message::tool_result("blocked-path","write","[ILLEGAL_COMMAND] outside path not executed",true)).unwrap();
-        assert_eq!(session.commit_turn().unwrap(),1);
-        assert!(session.messages().last().unwrap().text().contains("<feather-runtime-diagnostic>"));
-        assert!(session.messages().last().unwrap().text().contains("ILLEGAL_COMMAND"));
-        let dir=session.dir().to_path_buf();drop(session);let reopened=Session::open(&dir,&h).unwrap();
-        assert!(reopened.messages().last().unwrap().text().contains("ILLEGAL_COMMAND"));
-        assert!(!h.join("outside.txt").exists());drop(reopened);std::fs::remove_dir_all(h).unwrap();
+        let h = home("checkpoint-diagnostic");
+        let root = h.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut session = Session::new(&h, &root).unwrap();
+        session.push(Message::user_text("normal prompt")).unwrap();
+        let call = crate::message::ToolCall {
+            id: "blocked-path".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path":"../outside.txt"}),
+        };
+        session
+            .push(Message::assistant(
+                vec![crate::message::ContentBlock::ToolCall(call)],
+                "synthetic",
+                crate::message::Api::Faux,
+                Usage::default(),
+                crate::message::StopReason::ToolUse,
+            ))
+            .unwrap();
+        session
+            .push(Message::tool_result(
+                "blocked-path",
+                "write",
+                "[ILLEGAL_COMMAND] outside path not executed",
+                true,
+            ))
+            .unwrap();
+        assert_eq!(session.commit_turn().unwrap(), 1);
+        assert!(session
+            .messages()
+            .last()
+            .unwrap()
+            .text()
+            .contains("<feather-runtime-diagnostic>"));
+        assert!(session
+            .messages()
+            .last()
+            .unwrap()
+            .text()
+            .contains("ILLEGAL_COMMAND"));
+        let dir = session.dir().to_path_buf();
+        drop(session);
+        let reopened = Session::open(&dir, &h).unwrap();
+        assert!(reopened
+            .messages()
+            .last()
+            .unwrap()
+            .text()
+            .contains("ILLEGAL_COMMAND"));
+        assert!(!h.join("outside.txt").exists());
+        drop(reopened);
+        std::fs::remove_dir_all(h).unwrap();
     }
     use super::*;
     use crate::message::{ContentBlock, StopReason};

@@ -248,7 +248,8 @@ impl ApplicationHandler<Wake> for Host {
                     path,
                     format!(
                         "renderer=cpu\npresentation=softbuffer\nfont_texture_side={}\npid={}\n",
-                        crate::graphics::FONT_TEXTURE_SIDE,std::process::id()
+                        crate::graphics::FONT_TEXTURE_SIDE,
+                        std::process::id()
                     ),
                 );
             }
@@ -284,7 +285,7 @@ impl ApplicationHandler<Wake> for Host {
         }
         if matches!(event, WindowEvent::CloseRequested) {
             n.app.request_close();
-            n.next_frame=Some(Instant::now());
+            n.next_frame = Some(Instant::now());
             return;
         }
         let response = n.input.on_window_event(&n.window, &event);
@@ -330,11 +331,19 @@ impl ApplicationHandler<Wake> for Host {
         if n.app.exit.is_some() {
             n.app.drain_events();
             n.app.poll_exit(&self.ctx);
-            if n.app.exit_ready {n.window.set_visible(false);event_loop.exit();return;}
+            if n.app.exit_ready {
+                n.window.set_visible(false);
+                event_loop.exit();
+                return;
+            }
             // Minimized windows do not reliably deliver redraw requests. Close
             // cancellation must still advance without depending on paint.
-            if n.window.is_minimized()!=Some(true){n.window.request_redraw();}
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now()+Duration::from_millis(25)));
+            if n.window.is_minimized() != Some(true) {
+                n.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(25),
+            ));
             return;
         }
         if let Some(next) = n.next_frame {

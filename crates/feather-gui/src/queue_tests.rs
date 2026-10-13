@@ -212,10 +212,27 @@ fn auto_compaction_preserves_plain_text_rows_without_summary_leaks() {
     app.input = "new question".into();
     app.submit();
     wait_events(&mut app, |app| !app.running);
-    assert_eq!(app.rows.iter().filter(|r| r.kind == RowKind::Assistant && r.text == "PRIOR FINAL").count(), 1);
-    assert_eq!(app.rows.iter().filter(|r| r.kind == RowKind::Assistant && r.text == "NEW FINAL").count(), 1);
-    assert!(!app.rows.iter().any(|r| r.text.contains("SUMMARYMARKER") || r.streaming));
-    assert!(app.rows.iter().any(|r| r.kind == RowKind::Notice && r.text.starts_with("Context compacted") && !r.text.contains("· 0 characters")));
+    assert_eq!(
+        app.rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Assistant && r.text == "PRIOR FINAL")
+            .count(),
+        1
+    );
+    assert_eq!(
+        app.rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Assistant && r.text == "NEW FINAL")
+            .count(),
+        1
+    );
+    assert!(!app
+        .rows
+        .iter()
+        .any(|r| r.text.contains("SUMMARYMARKER") || r.streaming));
+    assert!(app.rows.iter().any(|r| r.kind == RowKind::Notice
+        && r.text.starts_with("Context compacted")
+        && !r.text.contains("· 0 characters")));
 }
 
 fn make_agent_seeded(session: Session, context_window: u64, script: FauxScript) -> Agent {
@@ -251,8 +268,11 @@ fn make_agent_seeded(session: Session, context_window: u64, script: FauxScript) 
 
 #[test]
 fn noop_compaction_does_not_create_refresh_or_replace_last_answer() {
-    let agent = make_agent_seeded(Session::memory(std::path::Path::new("fixture"), "noop"), 1000,
-        FauxScript::new().with_text("ONLY FINAL"));
+    let agent = make_agent_seeded(
+        Session::memory(std::path::Path::new("fixture"), "noop"),
+        1000,
+        FauxScript::new().with_text("ONLY FINAL"),
+    );
     let mut app = crate::tests::fixture();
     app.input_queue = agent.input_queue();
     app.abort_tx = agent.abort_sender();
@@ -260,8 +280,17 @@ fn noop_compaction_does_not_create_refresh_or_replace_last_answer() {
     app.input = "question ".repeat(1000);
     app.submit();
     wait_events(&mut app, |app| !app.running);
-    assert_eq!(app.rows.iter().filter(|r| r.kind == RowKind::Assistant && r.text == "ONLY FINAL").count(), 1);
-    assert!(!app.rows.iter().any(|r| r.kind == RowKind::Notice || r.streaming));
+    assert_eq!(
+        app.rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Assistant && r.text == "ONLY FINAL")
+            .count(),
+        1
+    );
+    assert!(!app
+        .rows
+        .iter()
+        .any(|r| r.kind == RowKind::Notice || r.streaming));
 }
 
 #[test]
@@ -270,13 +299,24 @@ fn compaction_notice_is_not_an_answer_and_new_turn_never_reuses_prior_row() {
     let mut prior = ChatRow::new(RowKind::Assistant, "PRIOR FINAL");
     prior.streaming = true;
     app.rows.push(prior);
-    app.on_agent_event(AgentEvent::CompactionDone { tokens_before: 100, tokens_after: 100, chars_saved: 0 });
+    app.on_agent_event(AgentEvent::CompactionDone {
+        tokens_before: 100,
+        tokens_after: 100,
+        chars_saved: 0,
+    });
     assert_eq!(app.rows.len(), 1);
     assert_eq!(app.rows[0].text, "PRIOR FINAL");
     app.on_agent_event(AgentEvent::TurnStart(2));
     app.on_agent_event(AgentEvent::TextDelta("NEW FINAL".into()));
     app.on_agent_event(AgentEvent::AssistantMessage(Message::assistant(
-        vec![ContentBlock::Text { text: "NEW FINAL".into() }], "test", Api::Faux, Usage::default(), StopReason::Stop)));
+        vec![ContentBlock::Text {
+            text: "NEW FINAL".into(),
+        }],
+        "test",
+        Api::Faux,
+        Usage::default(),
+        StopReason::Stop,
+    )));
     assert_eq!(app.rows.len(), 2);
     assert_eq!(app.rows[0].text, "PRIOR FINAL");
     assert_eq!(app.rows[1].text, "NEW FINAL");

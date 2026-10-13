@@ -43,7 +43,9 @@ impl AgentTool for BashTool {
             if *abort.borrow() {
                 return ToolOutcome::err("bash: aborted by user");
             }
-            if let Err(error)=crate::command_policy::check(&command){return ToolOutcome::err(error);}
+            if let Err(error) = crate::command_policy::check(&command) {
+                return ToolOutcome::err(error);
+            }
             let runtime = match crate::shell::BashRuntime::discover() {
                 Ok(shell) => shell,
                 Err(e) => return ToolOutcome::err(e),
@@ -87,7 +89,10 @@ impl AgentTool for BashTool {
                 } else if stdout.is_empty() {
                     stderr
                 } else {
-                    let mut output=stdout;output.push('\n');output.push_str(&stderr);output
+                    let mut output = stdout;
+                    output.push('\n');
+                    output.push_str(&stderr);
+                    output
                 };
                 Ok::<_, std::io::Error>((status, output))
             };
@@ -164,14 +169,18 @@ async fn drain_to_string(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Str
     if truncated {
         text.push_str("\n… (output exceeded 8MB cap, truncated) …");
     }
-    truncate_owned(text,20_000)
+    truncate_owned(text, 20_000)
 }
 
-fn truncate_owned(text:String,max_chars:usize)->String {
-    if text.chars().count()<=max_chars {text} else {truncate(&text,max_chars)}
+fn truncate_owned(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text
+    } else {
+        truncate(&text, max_chars)
+    }
 }
 fn truncate(s: &str, max_chars: usize) -> String {
-    let chars=s.chars().count();
+    let chars = s.chars().count();
     if chars <= max_chars {
         s.to_string()
     } else {
@@ -185,15 +194,30 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     #[tokio::test]
     async fn prohibited_chain_is_not_spawned_and_next_allowed_tool_still_runs() {
-        let root=std::env::temp_dir().join(feather_core::provider::gen_id("bash-policy"));std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("source.rs"),"original").unwrap();
-        let tool=BashTool{cwd:root.clone(),timeout:std::time::Duration::from_secs(2)};
-        let(_tx,rx)=tokio::sync::watch::channel(false);
+        let root = std::env::temp_dir().join(feather_core::provider::gen_id("bash-policy"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("source.rs"), "original").unwrap();
+        let tool = BashTool {
+            cwd: root.clone(),
+            timeout: std::time::Duration::from_secs(2),
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
         let blocked=tool.execute(serde_json::json!({"command":"touch should-not-exist; sed -i 's/original/changed/' source.rs"}),rx.clone()).await;
-        assert!(blocked.is_error);assert!(blocked.text.contains("[ILLEGAL_COMMAND]"));
-        assert!(!root.join("should-not-exist").exists());assert_eq!(std::fs::read_to_string(root.join("source.rs")).unwrap(),"original");
-        let next=tool.execute(serde_json::json!({"command":"printf 'allowed correction'"}),rx).await;
-        assert!(!next.is_error);assert!(next.text.contains("allowed correction"));
+        assert!(blocked.is_error);
+        assert!(blocked.text.contains("[ILLEGAL_COMMAND]"));
+        assert!(!root.join("should-not-exist").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("source.rs")).unwrap(),
+            "original"
+        );
+        let next = tool
+            .execute(
+                serde_json::json!({"command":"printf 'allowed correction'"}),
+                rx,
+            )
+            .await;
+        assert!(!next.is_error);
+        assert!(next.text.contains("allowed correction"));
         std::fs::remove_dir_all(root).unwrap();
     }
     use super::*;

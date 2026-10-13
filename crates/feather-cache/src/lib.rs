@@ -197,19 +197,37 @@ pub struct CacheSnapshot {
 
 impl feather_core::agent::CachePlanner for CacheOptimizer {
     fn plan(&self, req: &mut ChatRequest, _history_hash: u64) {
-        let hashes:Vec<_>=req.messages.iter().map(|message|feather_core::message::json_hash(message).expect("Message serialization is infallible")).collect();
-        let mut prefix=Vec::with_capacity(req.messages.len()+1);let mut tokens=16;prefix.push(tokens);
-        for message in req.messages.iter(){tokens+=feather_core::tokenizer::estimate_message_tokens(message);prefix.push(tokens);}
-        self.plan_cached(req,_history_hash,&hashes,&prefix);
+        let hashes: Vec<_> = req
+            .messages
+            .iter()
+            .map(|message| {
+                feather_core::message::json_hash(message)
+                    .expect("Message serialization is infallible")
+            })
+            .collect();
+        let mut prefix = Vec::with_capacity(req.messages.len() + 1);
+        let mut tokens = 16;
+        prefix.push(tokens);
+        for message in req.messages.iter() {
+            tokens += feather_core::tokenizer::estimate_message_tokens(message);
+            prefix.push(tokens);
+        }
+        self.plan_cached(req, _history_hash, &hashes, &prefix);
     }
-    fn plan_cached(&self,req:&mut ChatRequest,_history_hash:u64,new_hashes:&[u64],prefix_tokens:&[u64]) {
+    fn plan_cached(
+        &self,
+        req: &mut ChatRequest,
+        _history_hash: u64,
+        new_hashes: &[u64],
+        prefix_tokens: &[u64],
+    ) {
         let was_one_off = self.metrics.one_off.swap(false, Ordering::Relaxed);
-
 
         let stable = {
             let mut prev = self.prev_hashes.lock().unwrap_or_else(|e| e.into_inner());
             let s = self.stable_prefix_len(new_hashes, &prev);
-            prev.clear();prev.extend_from_slice(new_hashes);
+            prev.clear();
+            prev.extend_from_slice(new_hashes);
             s
         };
         let stable = if was_one_off { 0 } else { stable };
@@ -234,7 +252,9 @@ impl feather_core::agent::CachePlanner for CacheOptimizer {
         let stable_prefix_tokens = if stable == 0 {
             0
         } else {
-            prefix_tokens.get(stable).copied().unwrap_or_else(||feather_core::tokenizer::estimate_context_tokens(&req.messages[..stable]))
+            prefix_tokens.get(stable).copied().unwrap_or_else(|| {
+                feather_core::tokenizer::estimate_context_tokens(&req.messages[..stable])
+            })
         };
         let stable_message_index = if stable == 0 {
             *self
@@ -299,20 +319,40 @@ impl feather_core::agent::CachePlanner for CacheOptimizer {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn cached_planning_matches_uncached_after_append_and_replacement(){
-        let cached=CacheOptimizer::new();let regular=CacheOptimizer::new();
-        let mut session=feather_core::Session::memory(std::path::Path::new("fixture"),"planner");
-        for n in 0..6{
-            session.push(Message::user_text(format!("{n} {}","text ".repeat(1000)))).unwrap();
-            let mut a=req_with(session.messages().to_vec());let mut b=a.clone();
-            cached.plan_cached(&mut a,session.history_hash(),session.message_hashes(),session.prefix_tokens());regular.plan(&mut b,session.history_hash());
-            assert_eq!(a.cache.stable_message_index,b.cache.stable_message_index);
-            assert_eq!(cached.snapshot_metrics().last_stable_prefix_len,regular.snapshot_metrics().last_stable_prefix_len);
+    fn cached_planning_matches_uncached_after_append_and_replacement() {
+        let cached = CacheOptimizer::new();
+        let regular = CacheOptimizer::new();
+        let mut session = feather_core::Session::memory(std::path::Path::new("fixture"), "planner");
+        for n in 0..6 {
+            session
+                .push(Message::user_text(format!("{n} {}", "text ".repeat(1000))))
+                .unwrap();
+            let mut a = req_with(session.messages().to_vec());
+            let mut b = a.clone();
+            cached.plan_cached(
+                &mut a,
+                session.history_hash(),
+                session.message_hashes(),
+                session.prefix_tokens(),
+            );
+            regular.plan(&mut b, session.history_hash());
+            assert_eq!(a.cache.stable_message_index, b.cache.stable_message_index);
+            assert_eq!(
+                cached.snapshot_metrics().last_stable_prefix_len,
+                regular.snapshot_metrics().last_stable_prefix_len
+            );
         }
         session.set_messages_for_compaction(vec![Message::user_text("summary")]);
-        let mut a=req_with(session.messages().to_vec());let mut b=a.clone();
-        cached.plan_cached(&mut a,session.history_hash(),session.message_hashes(),session.prefix_tokens());regular.plan(&mut b,session.history_hash());
-        assert_eq!(a.cache.stable_message_index,b.cache.stable_message_index);
+        let mut a = req_with(session.messages().to_vec());
+        let mut b = a.clone();
+        cached.plan_cached(
+            &mut a,
+            session.history_hash(),
+            session.message_hashes(),
+            session.prefix_tokens(),
+        );
+        regular.plan(&mut b, session.history_hash());
+        assert_eq!(a.cache.stable_message_index, b.cache.stable_message_index);
     }
     use super::*;
     use feather_core::agent::CachePlanner;
@@ -326,7 +366,8 @@ mod tests {
                 name: "read".into(),
                 description: "read".into(),
                 parameters: serde_json::json!({}),
-            }].into(),
+            }]
+            .into(),
             model: "m".into(),
             max_tokens: 100,
             temperature: None,

@@ -15,7 +15,7 @@ support, durable redb sessions, lazy skills and a keyboard-first desktop UI.
 - More direct child/audit decoding, model merging, Bash output reuse and retained
   anchor persistence handles avoid temporary copies and repeated database opens.
 
-See [the review](code-review-1.0.0.md) for function-level changes, measurements,
+See [the review](code-review-1.0.0.md) for the 1.0.0 function-level changes, measurements,
 intentional ownership costs and deferred opportunities. Zero allocations/fixed
 whole-process memory are not claimed.
 
@@ -36,7 +36,7 @@ smokes passed on the release build; final installed version/hashes are verified.
 
 ## Distribution
 
-`dist/Feather-1.0.0-Setup-x64.exe` is a per-user Windows x64 installer. It bundles
+`dist/Feather-1.0.5-Setup-x64.exe` is a per-user Windows x64 installer. It bundles
 only feather.exe, feather-gui.exe and third-party notices, never credentials,
 config databases or sessions. Unsigned; SmartScreen may warn. Close and reopen
 a running old Feather window to activate the installed update.

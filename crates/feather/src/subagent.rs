@@ -48,7 +48,9 @@ const POLICY_DOC: &str = "subagent-policy";
 /// and Pi's allowlist are imported once; runtime never depends on them again.
 fn policy() -> Result<Option<serde_json::Value>, String> {
     let home = crate::config::feather_home();
-    crate::config_store::read(&home,POLICY_DOC).map(|value|value.filter(|v|!v.as_object().is_some_and(|m|m.is_empty()))).map_err(|_|"subagent policy redb read failed".into())
+    crate::config_store::read(&home, POLICY_DOC)
+        .map(|value| value.filter(|v| !v.as_object().is_some_and(|m| m.is_empty())))
+        .map_err(|_| "subagent policy redb read failed".into())
 }
 impl SubagentTool {
     async fn run(
@@ -158,10 +160,14 @@ impl SubagentTool {
             Err(e) => return ToolOutcome::err(format!("subagent: store failed: {e}")),
         };
         let anchor_home = self.session_dir.join("children").join(&id);
-        let anchors = Arc::new(AnchorStore::new(&anchor_home).with_snapshots(&self.session_dir, &self.root));
+        let anchors =
+            Arc::new(AnchorStore::new(&anchor_home).with_snapshots(&self.session_dir, &self.root));
         let mut all = ToolRegistry::new();
         all.add(Arc::new(crate::web::WebFetchTool))
-            .add(Arc::new(crate::web::WebSearchTool { model: requested.unwrap_or(&self.model).to_string(), base_url: None }));
+            .add(Arc::new(crate::web::WebSearchTool {
+                model: requested.unwrap_or(&self.model).to_string(),
+                base_url: None,
+            }));
         all.add(Arc::new(ReadTool {
             store: anchors.clone(),
         }))

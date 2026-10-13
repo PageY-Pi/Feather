@@ -44,8 +44,8 @@ pub const RED: Color32 = Color32::from_rgb(0xA8, 0x40, 0x55);
 pub const WARN: Color32 = Color32::from_rgb(0x7C, 0x56, 0x0F);
 /// Whisper-soft edge tint. Used instead of harsh outlines.
 pub const BORDER: Color32 = Color32::from_rgb(0xE8, 0xE2, 0xD9);
-pub const ERROR_BG: Color32 = Color32::from_rgb(0xFC,0xED,0xEE);
-pub const TOOL_ERROR_BG: Color32 = Color32::from_rgb(0xFA,0xEE,0xEF);
+pub const ERROR_BG: Color32 = Color32::from_rgb(0xFC, 0xED, 0xEE);
+pub const TOOL_ERROR_BG: Color32 = Color32::from_rgb(0xFA, 0xEE, 0xEF);
 
 // ---------------------------------------------------------------------------
 // typography
@@ -62,22 +62,35 @@ fn font_definitions() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let faces = crate::font_store::faces();
     if let Some(data) = faces.ui {
-        fonts.font_data.insert("feather_ui".into(), FontData::from_static(data));
-        fonts.families.entry(FontFamily::Proportional).or_default().insert(0,"feather_ui".into());
+        fonts
+            .font_data
+            .insert("feather_ui".into(), FontData::from_static(data));
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "feather_ui".into());
     }
     if let Some(data) = faces.mono {
-        fonts.font_data.insert("feather_mono".into(), FontData::from_static(data));
-        fonts.families.entry(FontFamily::Monospace).or_default().insert(0,"feather_mono".into());
+        fonts
+            .font_data
+            .insert("feather_mono".into(), FontData::from_static(data));
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "feather_mono".into());
     }
-    if let Some((name,data)) = faces.cjk {
-        fonts.font_data.insert(name.into(),FontData::from_static(data));
-        for family in [FontFamily::Proportional,FontFamily::Monospace] {
+    if let Some((name, data)) = faces.cjk {
+        fonts
+            .font_data
+            .insert(name.into(), FontData::from_static(data));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
             fonts.families.entry(family).or_default().push(name.into());
         }
     }
     fonts
 }
-
 
 #[cfg(test)]
 fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
@@ -89,8 +102,8 @@ fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// Keep normal windows readable while giving large desktops a balanced column.
-pub fn content_width(available:f32)->f32 {
-    available.min((available*0.62).clamp(790.0,1080.0))
+pub fn content_width(available: f32) -> f32 {
+    available.min((available * 0.62).clamp(790.0, 1080.0))
 }
 /// A very soft drop shadow: low opacity, no darkness. Never a hard black slab.
 pub fn soft_shadow() -> Shadow {
@@ -128,16 +141,16 @@ pub fn apply_theme(ctx: &Context) {
         style.spacing.interact_size.y = 26.0;
         // A reserved, visible rail makes overflow discoverable and avoids text
         // sliding beneath a floating thumb in dense forms or narrow workspaces.
-        style.spacing.scroll=egui::style::ScrollStyle::thin();
-        style.spacing.scroll.floating_width=5.0;
-        style.spacing.scroll.bar_width=8.0;
-        style.spacing.scroll.floating_allocated_width=14.0;
-        style.spacing.scroll.bar_inner_margin=6.0;
-        style.spacing.scroll.foreground_color=true;
-        style.spacing.scroll.dormant_handle_opacity=0.52;
-        style.spacing.scroll.active_handle_opacity=0.55;
-        style.spacing.scroll.interact_handle_opacity=0.8;
-        style.spacing.scroll.dormant_background_opacity=0.15;
+        style.spacing.scroll = egui::style::ScrollStyle::thin();
+        style.spacing.scroll.floating_width = 5.0;
+        style.spacing.scroll.bar_width = 8.0;
+        style.spacing.scroll.floating_allocated_width = 14.0;
+        style.spacing.scroll.bar_inner_margin = 6.0;
+        style.spacing.scroll.foreground_color = true;
+        style.spacing.scroll.dormant_handle_opacity = 0.52;
+        style.spacing.scroll.active_handle_opacity = 0.55;
+        style.spacing.scroll.interact_handle_opacity = 0.8;
+        style.spacing.scroll.dormant_background_opacity = 0.15;
 
         let v = &mut style.visuals;
         v.dark_mode = false;

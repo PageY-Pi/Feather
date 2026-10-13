@@ -9,6 +9,7 @@ pub(crate) fn fixture() -> FeatherApp {
         agent: None,
         abort_tx,
         input_queue: Default::default(),
+        ime_preedit_active: false,
         ev_tx,
         ev_rx,
         egui_ctx: Default::default(),
@@ -47,10 +48,10 @@ pub(crate) fn fixture() -> FeatherApp {
         command_cursor: 0,
         capture_frames: 0,
         preview_timing: Default::default(),
-        frame_pacer:Default::default(),
-        rewind_turns:Default::default(),
-        skill_choices:Default::default(),
-        suggestions:Default::default(),
+        frame_pacer: Default::default(),
+        rewind_turns: Default::default(),
+        skill_choices: Default::default(),
+        suggestions: Default::default(),
         renderer: renderer_choice::Backend::Cpu,
         renderer_picker: None,
         request_picker: None,
@@ -58,6 +59,85 @@ pub(crate) fn fixture() -> FeatherApp {
         exit: None,
         exit_ready: false,
     }
+}
+
+#[test]
+fn ime_preedit_backspace_is_not_forwarded_to_text_edit() {
+    let mut ime_preedit_active = false;
+    let backspace = || egui::Event::Key {
+        key: egui::Key::Backspace,
+        physical_key: Some(egui::Key::Backspace),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let mut input = egui::RawInput {
+        events: vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("ceshi".into())),
+            backspace(),
+        ],
+        ..Default::default()
+    };
+
+    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
+    assert!(ime_preedit_active);
+    assert!(!input.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Backspace,
+                pressed: true,
+                ..
+            }
+        )
+    }));
+
+    // The IME may report the next pre-edit value in a later frame. Until it
+    // reports an empty value, an isolated Backspace is still IME-owned.
+    input.events = vec![backspace()];
+    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
+    assert!(input.events.is_empty());
+
+    // Once the composition is empty, the next ordinary Backspace belongs to
+    // TextEdit and can remove a committed character normally.
+    input.events = vec![
+        egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
+        backspace(),
+    ];
+    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
+    assert!(!ime_preedit_active);
+    assert!(!input.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Backspace,
+                pressed: true,
+                ..
+            }
+        )
+    }));
+    input.events = vec![backspace()];
+    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
+    assert_eq!(input.events, vec![backspace()]);
+}
+
+#[test]
+fn ordinary_backspace_is_preserved_without_ime_preedit() {
+    let mut ime_preedit_active = false;
+    let mut input = egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: Some(egui::Key::Backspace),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    };
+    suppress_ime_backspace(&mut input, &mut ime_preedit_active);
+    assert_eq!(input.events.len(), 1);
+    assert!(!ime_preedit_active);
 }
 
 fn call(id: &str) -> ToolCall {
@@ -361,7 +441,8 @@ fn temp_shake_composer_layout_stability() {
     theme::install_fonts(&ctx);
     theme::apply_theme(&ctx);
     for i in 0..6 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(10);
         app.rows.push(a);
@@ -428,7 +509,11 @@ fn temp_shake_composer_layout_stability() {
             }
         }
         (
-            output.viewport_output.values().next().map(|v| v.repaint_delay),
+            output
+                .viewport_output
+                .values()
+                .next()
+                .map(|v| v.repaint_delay),
             bottom.height(),
             inner.height(),
             central.top(),
@@ -500,7 +585,9 @@ fn temp_shake_composer_layout_stability() {
         let now = run(
             &mut app,
             t,
-            vec![egui::Event::Text(if frame % 2 == 0 { "x" } else { "y" }.into())],
+            vec![egui::Event::Text(
+                if frame % 2 == 0 { "x" } else { "y" }.into(),
+            )],
         );
         eprintln!(
             "type {frame}: h={:.3} dh={:+.3} inner={:.3} central_top={:.3} hint_y={:.3} caret={:?}",
@@ -526,7 +613,8 @@ fn temp_shake_caret_positions() {
         theme::apply_theme(&ctx);
         ctx.set_pixels_per_point(ppp);
         for i in 0..6 {
-            app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+            app.rows
+                .push(ChatRow::new(RowKind::User, format!("question {i}")));
             let mut a = ChatRow::new(RowKind::Assistant, "");
             a.text = "Reading the parser and the tokenizer first.\n".repeat(10);
             app.rows.push(a);
@@ -540,9 +628,11 @@ fn temp_shake_caret_positions() {
             // Park the caret deterministically.
             ctx.memory_mut(|m| m.request_focus(id));
             if let Some(mut state) = egui::text_edit::TextEditState::load(&ctx, id) {
-                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-                    egui::text::CCursor::new(caret),
-                )));
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(caret),
+                    )));
                 state.store(&ctx, id);
             }
             let mut bottom = egui::Rect::NOTHING;
@@ -600,7 +690,10 @@ fn temp_shake_caret_positions() {
                 prev = now;
             }
         }
-        eprintln!("ppp {ppp}: bottom_h={:.3} worst height change across carets: {worst:?}", prev.0);
+        eprintln!(
+            "ppp {ppp}: bottom_h={:.3} worst height change across carets: {worst:?}",
+            prev.0
+        );
     }
 }
 
@@ -608,7 +701,12 @@ fn temp_shake_caret_positions() {
 /// that is not stable across idle repaints (blink), typing, and caret moves.
 #[test]
 fn temp_shake_geometry_sweep() {
-    for (w, h) in [(1160.0_f32, 820.0_f32), (760.0, 520.0), (900.0, 600.0), (1160.0, 400.0)] {
+    for (w, h) in [
+        (1160.0_f32, 820.0_f32),
+        (760.0, 520.0),
+        (900.0, 600.0),
+        (1160.0, 400.0),
+    ] {
         for running in [false, true] {
             let mut app = fixture();
             let ctx = app.egui_ctx.clone();
@@ -616,7 +714,8 @@ fn temp_shake_geometry_sweep() {
             theme::apply_theme(&ctx);
             app.running = running;
             for i in 0..6 {
-                app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+                app.rows
+                    .push(ChatRow::new(RowKind::User, format!("question {i}")));
                 let mut a = ChatRow::new(RowKind::Assistant, "");
                 a.text = "Reading the parser and the tokenizer first.\n".repeat(10);
                 if running && i == 5 {
@@ -672,11 +771,14 @@ fn temp_shake_geometry_sweep() {
                                 .wrapping_mul(31)
                                 .wrapping_add(t.galley.text().len())
                                 .wrapping_add((t.pos.y * 64.0) as usize);
-                            ys.push((t.galley.text().chars().take(12).collect::<String>(), t.pos.y));
+                            ys.push((
+                                t.galley.text().chars().take(12).collect::<String>(),
+                                t.pos.y,
+                            ));
                         }
                         egui::Shape::LineSegment { points, .. } => {
-                            fingerprint = fingerprint
-                                .wrapping_add((points[0].y * 64.0) as usize + 7);
+                            fingerprint =
+                                fingerprint.wrapping_add((points[0].y * 64.0) as usize + 7);
                         }
                         egui::Shape::Circle(_) => fingerprint = fingerprint.wrapping_add(3),
                         _ => {}
@@ -725,7 +827,10 @@ fn temp_shake_geometry_sweep() {
                 if moved {
                     type_moves += 1;
                     if type_moves == 1 {
-                        eprintln!("  TYPE MOVE {w}x{h} running={running}: dh={:+.3}", now.1 - prev.1);
+                        eprintln!(
+                            "  TYPE MOVE {w}x{h} running={running}: dh={:+.3}",
+                            now.1 - prev.1
+                        );
                     }
                 }
                 prev = now;
@@ -737,7 +842,10 @@ fn temp_shake_geometry_sweep() {
                 if moved {
                     caret_moves += 1;
                     if caret_moves == 1 && i == 0 {
-                        eprintln!("  CARET MOVE {w}x{h} running={running}: dh={:+.3}", now.1 - prev.1);
+                        eprintln!(
+                            "  CARET MOVE {w}x{h} running={running}: dh={:+.3}",
+                            now.1 - prev.1
+                        );
                     }
                 }
                 prev = now;
@@ -758,12 +866,9 @@ fn temp_scene(output: &egui::FullOutput) -> std::collections::BTreeMap<String, u
     let mut rows = std::collections::BTreeMap::new();
     for shape in &output.shapes {
         let key = match &shape.shape {
-            egui::Shape::Text(t) => format!(
-                "text {:>8.2} {:>8.2} {}",
-                t.pos.x,
-                t.pos.y,
-                t.galley.text()
-            ),
+            egui::Shape::Text(t) => {
+                format!("text {:>8.2} {:>8.2} {}", t.pos.x, t.pos.y, t.galley.text())
+            }
             egui::Shape::Rect(r) => format!(
                 "rect {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
                 r.rect.min.x,
@@ -772,7 +877,10 @@ fn temp_scene(output: &egui::FullOutput) -> std::collections::BTreeMap<String, u
                 r.rect.height()
             ),
             egui::Shape::Circle(c) => {
-                format!("circ {:>8.2} {:>8.2} {:>6.2}", c.center.x, c.center.y, c.radius)
+                format!(
+                    "circ {:>8.2} {:>8.2} {:>6.2}",
+                    c.center.x, c.center.y, c.radius
+                )
             }
             egui::Shape::LineSegment { points, .. } => format!(
                 "line {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
@@ -829,9 +937,11 @@ fn temp_shake_real_frame_diff() {
         theme::install_fonts(&ctx);
         theme::apply_theme(&ctx);
         for i in 0..8 {
-            app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+            app.rows
+                .push(ChatRow::new(RowKind::User, format!("question {i}")));
             let mut a = ChatRow::new(RowKind::Assistant, "");
-            a.text = "Reading the parser and the tokenizer first.\n\nThe change is local.\n".repeat(6);
+            a.text =
+                "Reading the parser and the tokenizer first.\n\nThe change is local.\n".repeat(6);
             app.rows.push(a);
         }
         app.input = "composing a message".to_string();
@@ -875,7 +985,10 @@ fn temp_shake_real_frame_diff() {
             t += 1.0 / 60.0;
             let mut events = vec![egui::Event::Text("x".into())];
             if pointer {
-                events.push(egui::Event::PointerMoved(egui::pos2(600.0, 300.0 + i as f32)));
+                events.push(egui::Event::PointerMoved(egui::pos2(
+                    600.0,
+                    300.0 + i as f32,
+                )));
             }
             let now = run(&mut app, t, events);
             let diff = temp_first_diff(&last, &now);
@@ -901,7 +1014,8 @@ fn temp_shake_streaming_while_typing() {
     theme::apply_theme(&ctx);
     app.running = true;
     for i in 0..5 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(9);
         app.rows.push(a);
@@ -987,7 +1101,8 @@ fn temp_shake_status_bar_jitter() {
     app.settings.model = "deepseek/deepseek-chat-v3-0324:free".to_string();
     app.on_agent_event(AgentEvent::TurnStart(0));
     for i in 0..5 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(9);
         app.rows.push(a);
@@ -1058,7 +1173,8 @@ fn temp_shake_typing_geometry() {
     theme::install_fonts(&ctx);
     theme::apply_theme(&ctx);
     for i in 0..4 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(8);
         app.rows.push(a);
@@ -1072,9 +1188,9 @@ fn temp_shake_typing_geometry() {
         if let Some(mut state) = egui::text_edit::TextEditState::load(&ctx, id) {
             state
                 .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
-                    caret,
-                ))));
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(caret),
+                )));
             state.store(&ctx, id);
         }
         let mut bottom = egui::Rect::NOTHING;
@@ -1117,8 +1233,9 @@ fn temp_shake_typing_geometry() {
 
     // Type a long paragraph, one character at a time: the composer grows as it
     // wraps, and a trailing space at the wrap boundary is the classic trigger.
-    let text = "the quick brown fox jumps over the lazy dog and then keeps on running past the fence "
-        .repeat(4);
+    let text =
+        "the quick brown fox jumps over the lazy dog and then keeps on running past the fence "
+            .repeat(4);
     let mut t = 0.0;
     let mut prev = run(&mut app, t, 0);
     let mut flips = 0;
@@ -1157,7 +1274,8 @@ fn temp_shake_frame_cost_by_session_size() {
         theme::install_fonts(&ctx);
         theme::apply_theme(&ctx);
         for i in 0..rows {
-            app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+            app.rows
+                .push(ChatRow::new(RowKind::User, format!("question {i}")));
             let mut a = ChatRow::new(RowKind::Assistant, "");
             a.text = format!(
                 "## Plan {i}\n\nReading the parser and the tokenizer first, then the wrap cache.\n\n```rust\nlet x = {i};\n```\n\n- one\n- two\n\nAll good.\n"
@@ -1213,13 +1331,15 @@ fn temp_shake_long_composer() {
     theme::install_fonts(&ctx);
     theme::apply_theme(&ctx);
     for i in 0..4 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(8);
         app.rows.push(a);
     }
     // A long pasted prompt: way taller than the available window height.
-    app.input = "the quick brown fox jumps over the lazy dog and keeps running past the fence\n".repeat(30);
+    app.input =
+        "the quick brown fox jumps over the lazy dog and keeps running past the fence\n".repeat(30);
 
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1160.0, 820.0));
     let id = egui::Id::new("feather-composer");
@@ -1228,9 +1348,9 @@ fn temp_shake_long_composer() {
         if let Some(mut state) = egui::text_edit::TextEditState::load(&ctx, id) {
             state
                 .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
-                    caret,
-                ))));
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(caret),
+                )));
             state.store(&ctx, id);
         }
         let mut bottom = egui::Rect::NOTHING;
@@ -1325,7 +1445,8 @@ fn temp_shake_caret_scroll_target_leak() {
     theme::apply_theme(&ctx);
     app.running = false;
     for i in 0..6 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(8);
         app.rows.push(a);
@@ -1339,9 +1460,9 @@ fn temp_shake_caret_scroll_target_leak() {
         if let Some(mut state) = egui::text_edit::TextEditState::load(&ctx, id) {
             state
                 .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
-                    caret,
-                ))));
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(caret),
+                )));
             state.store(&ctx, id);
         }
         let mut bottom = egui::Rect::NOTHING;
@@ -1443,7 +1564,8 @@ fn temp_shake_composer_caret_leaks_into_chat() {
     theme::install_fonts(&ctx);
     theme::apply_theme(&ctx);
     for i in 0..9 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(8);
         app.rows.push(a);
@@ -1458,9 +1580,9 @@ fn temp_shake_composer_caret_leaks_into_chat() {
         if let Some(mut state) = egui::text_edit::TextEditState::load(&ctx, id) {
             state
                 .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(
-                    caret,
-                ))));
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(caret),
+                )));
             state.store(&ctx, id);
         }
         let mut bottom = egui::Rect::NOTHING;
@@ -1536,10 +1658,7 @@ fn temp_shake_composer_caret_leaks_into_chat() {
                 },
             ],
         );
-        eprintln!(
-            "scrolled: first_y={:.1} last_y={:.1}",
-            now.2, now.3
-        );
+        eprintln!("scrolled: first_y={:.1} last_y={:.1}", now.2, now.3);
         prev = now;
     }
 
@@ -1547,7 +1666,12 @@ fn temp_shake_composer_caret_leaks_into_chat() {
     for i in 0..4 {
         t += 1.0 / 60.0;
         app.input.push('x');
-        let now = run(&mut app, t, chars + i + 1, vec![egui::Event::Text("x".into())]);
+        let now = run(
+            &mut app,
+            t,
+            chars + i + 1,
+            vec![egui::Event::Text("x".into())],
+        );
         eprintln!(
             "typed {i}: bottom={:.1} central={:.1} first_y={:.1} ({:+.1}) last_y={:.1} ({:+.1})",
             now.0,
@@ -1584,7 +1708,8 @@ fn temp_shake_repaint_causes() {
     theme::install_fonts(&ctx);
     theme::apply_theme(&ctx);
     for i in 0..6 {
-        app.rows.push(ChatRow::new(RowKind::User, format!("question {i}")));
+        app.rows
+            .push(ChatRow::new(RowKind::User, format!("question {i}")));
         let mut a = ChatRow::new(RowKind::Assistant, "");
         a.text = "Reading the parser and the tokenizer first.\n".repeat(8);
         app.rows.push(a);

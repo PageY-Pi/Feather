@@ -19,8 +19,8 @@
 use crate::message::Message;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::ops::Bound;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const META: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("session_meta");
@@ -135,7 +135,11 @@ struct RawRecord {
 /// The write format is identical to RawRecord, but serialization borrows the
 /// already-owned message instead of cloning its text/images/tool arguments.
 #[derive(serde::Serialize)]
-struct RawRecordRef<'a> { id: &'a str, timestamp: u64, message: &'a Message }
+struct RawRecordRef<'a> {
+    id: &'a str,
+    timestamp: u64,
+    message: &'a Message,
+}
 
 /// Outcome of a legacy JSONL migration.
 #[derive(Debug, Clone)]
@@ -270,13 +274,24 @@ impl SessionStore {
     }
 
     /// Append audit and update discovery metadata with ONE durable commit.
-    pub fn append_raw_with_meta(&self, id:&str, timestamp:u64, message:&Message,
-        modified_ms:u64, first_prompt:&str) -> Result<u64, SessionStoreError> {
-        self.append_raw_inner(id,timestamp,message,Some((modified_ms,first_prompt)))
+    pub fn append_raw_with_meta(
+        &self,
+        id: &str,
+        timestamp: u64,
+        message: &Message,
+        modified_ms: u64,
+        first_prompt: &str,
+    ) -> Result<u64, SessionStoreError> {
+        self.append_raw_inner(id, timestamp, message, Some((modified_ms, first_prompt)))
     }
 
-    fn append_raw_inner(&self,id:&str,timestamp:u64,message:&Message,
-        touch:Option<(u64,&str)>) -> Result<u64,SessionStoreError> {
+    fn append_raw_inner(
+        &self,
+        id: &str,
+        timestamp: u64,
+        message: &Message,
+        touch: Option<(u64, &str)>,
+    ) -> Result<u64, SessionStoreError> {
         let txn = self.db.begin_write()?;
         let seq;
         {
@@ -286,10 +301,14 @@ impl SessionStore {
                 .get(K_RAW_COUNT)?
                 .map(|v| bytes_to_u64(v.value()))
                 .unwrap_or(0);
-            let rec = RawRecordRef { id, timestamp, message };
+            let rec = RawRecordRef {
+                id,
+                timestamp,
+                message,
+            };
             raw.insert(seq, serde_json::to_vec(&rec)?.as_slice())?;
             meta.insert(K_RAW_COUNT, (seq + 1).to_le_bytes().as_slice())?;
-            if let Some((modified_ms,first_prompt)) = touch {
+            if let Some((modified_ms, first_prompt)) = touch {
                 meta.insert(K_MODIFIED_MS, modified_ms.to_le_bytes().as_slice())?;
                 meta.insert(K_FIRST_PROMPT, first_prompt.as_bytes())?;
             }
@@ -408,7 +427,13 @@ impl SessionStore {
             if newest_first.len() >= limit {
                 // One look-ahead keeps `next_before == None` meaning exactly
                 // "no older rows", so a pager never needs an empty last page.
-                older_remain = match rows.next() {Some(row)=>{row?;true},None=>false};
+                older_remain = match rows.next() {
+                    Some(row) => {
+                        row?;
+                        true
+                    }
+                    None => false,
+                };
                 break;
             }
         }
@@ -445,7 +470,11 @@ impl SessionStore {
             t.insert(K_RAW_COUNT, (entries.len() as u64).to_le_bytes().as_slice())?;
             let mut raw = txn.open_table(RAW)?;
             for (seq, (id, timestamp, message)) in entries.iter().enumerate() {
-                let rec = RawRecordRef { id, timestamp: *timestamp, message };
+                let rec = RawRecordRef {
+                    id,
+                    timestamp: *timestamp,
+                    message,
+                };
                 raw.insert(seq as u64, serde_json::to_vec(&rec)?.as_slice())?;
             }
         }
@@ -730,22 +759,48 @@ mod tests {
 
     #[test]
     fn raw_paging_bounds_bytes_and_rows_and_keeps_cursors_stable_when_appending() {
-        let dir=temp("raw-pages");let store=SessionStore::open(&dir).unwrap();store.write_meta(&meta("pages",&dir)).unwrap();
-        for n in 0..30{store.append_raw(&format!("e{n}"),n,&Message::user_text(format!("原始消息 {n} {}","🙂".repeat(100)))).unwrap();}
-        let reader=store.clone();
-        let tail=reader.raw_page_before(None,7,2048).unwrap();assert!(tail.entries.len()<=7);assert!(tail.bytes<=2048||tail.entries.len()==1);
-        let mut all:Vec<_>=tail.entries.iter().map(|e|e.seq).collect();let mut before=tail.next_before;
-        store.append_raw("new",31,&Message::user_text("newly appended")).unwrap();
-        while let Some(cursor)=before {
-            let page=reader.raw_page_before(Some(cursor),5,1024).unwrap();
-            assert!(!page.entries.is_empty());assert!(page.entries.iter().all(|e|e.seq<cursor));
-            all.extend(page.entries.iter().map(|e|e.seq));before=page.next_before;
+        let dir = temp("raw-pages");
+        let store = SessionStore::open(&dir).unwrap();
+        store.write_meta(&meta("pages", &dir)).unwrap();
+        for n in 0..30 {
+            store
+                .append_raw(
+                    &format!("e{n}"),
+                    n,
+                    &Message::user_text(format!("原始消息 {n} {}", "🙂".repeat(100))),
+                )
+                .unwrap();
         }
-        all.sort_unstable();assert_eq!(all,(0..30).collect::<Vec<_>>());
-        let progress=reader.raw_page_before(None,0,0).unwrap();assert_eq!(progress.entries.len(),1);
-        assert_eq!(progress.entries[0].seq,30);assert_eq!(progress.total,31);
-        assert!(reader.raw_page_before(Some(0),usize::MAX,usize::MAX).unwrap().entries.is_empty());
-        drop(reader);drop(store);std::fs::remove_dir_all(dir).unwrap();
+        let reader = store.clone();
+        let tail = reader.raw_page_before(None, 7, 2048).unwrap();
+        assert!(tail.entries.len() <= 7);
+        assert!(tail.bytes <= 2048 || tail.entries.len() == 1);
+        let mut all: Vec<_> = tail.entries.iter().map(|e| e.seq).collect();
+        let mut before = tail.next_before;
+        store
+            .append_raw("new", 31, &Message::user_text("newly appended"))
+            .unwrap();
+        while let Some(cursor) = before {
+            let page = reader.raw_page_before(Some(cursor), 5, 1024).unwrap();
+            assert!(!page.entries.is_empty());
+            assert!(page.entries.iter().all(|e| e.seq < cursor));
+            all.extend(page.entries.iter().map(|e| e.seq));
+            before = page.next_before;
+        }
+        all.sort_unstable();
+        assert_eq!(all, (0..30).collect::<Vec<_>>());
+        let progress = reader.raw_page_before(None, 0, 0).unwrap();
+        assert_eq!(progress.entries.len(), 1);
+        assert_eq!(progress.entries[0].seq, 30);
+        assert_eq!(progress.total, 31);
+        assert!(reader
+            .raw_page_before(Some(0), usize::MAX, usize::MAX)
+            .unwrap()
+            .entries
+            .is_empty());
+        drop(reader);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn raw_history_round_trips_and_survives_reopen() {

@@ -247,10 +247,20 @@ pub struct KeybindingConfig {
 }
 impl KeybindingConfig {
     pub fn load(path: &Path) -> Self {
-        match crate::config_store::read(path.parent().unwrap_or_else(||Path::new(".")),"keybindings"){
-            Ok(Some(Value::Object(o)))=>Self::from_object(o),Ok(None)=>Self::default(),
-            Ok(Some(_))=>Self{diagnostics:vec!["keybindings redb document must be an object".into()],..Default::default()},
-            Err(_)=>Self{diagnostics:vec!["keybindings redb read failed".into()],..Default::default()},
+        match crate::config_store::read(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            "keybindings",
+        ) {
+            Ok(Some(Value::Object(o))) => Self::from_object(o),
+            Ok(None) => Self::default(),
+            Ok(Some(_)) => Self {
+                diagnostics: vec!["keybindings redb document must be an object".into()],
+                ..Default::default()
+            },
+            Err(_) => Self {
+                diagnostics: vec!["keybindings redb read failed".into()],
+                ..Default::default()
+            },
         }
     }
     pub fn from_object(o: Map<String, Value>) -> Self {
@@ -347,7 +357,11 @@ mod tests {
     fn save_patch_preserves_unknown() {
         let d = tmp("save");
         // Legacy JSON is imported once into the temp config.redb, then patches merge.
-        fs::write(d.join("settings.json"), "{\"unknown\":1,\"nested\":{\"a\":1}} ").unwrap();
+        fs::write(
+            d.join("settings.json"),
+            "{\"unknown\":1,\"nested\":{\"a\":1}} ",
+        )
+        .unwrap();
         save_settings_patch(&d.join("config.redb"), &json!({"nested":{"b":2}})).unwrap();
         let v = crate::config_store::read(&d, "settings").unwrap().unwrap();
         assert_eq!(v["unknown"], 1);

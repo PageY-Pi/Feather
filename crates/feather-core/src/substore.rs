@@ -135,9 +135,8 @@ impl SubagentStore {
             let mut subs = txn.open_table(SUBS)?;
             let mut rec: SubRecord = {
                 let bytes = subs
-                .get(id)?
-                .ok_or_else(|| SubStoreError::NotFound(id.into()))?
-                ;
+                    .get(id)?
+                    .ok_or_else(|| SubStoreError::NotFound(id.into()))?;
                 serde_json::from_slice(bytes.value())?
             };
             rec.lines = rec.lines.max(no + 1);
@@ -163,11 +162,11 @@ impl SubagentStore {
 
     pub fn messages(&self, id: &str) -> Result<Vec<crate::message::Message>, SubStoreError> {
         let mut out = Vec::new();
-        let key=id_key(id);
-        let txn=self.db.begin_read()?;
-        let lines=txn.open_table(SUB_LINES)?;
-        for row in lines.range((key,0)..=(key,u64::MAX))? {
-            let (_,value)=row?;
+        let key = id_key(id);
+        let txn = self.db.begin_read()?;
+        let lines = txn.open_table(SUB_LINES)?;
+        for row in lines.range((key, 0)..=(key, u64::MAX))? {
+            let (_, value) = row?;
             if let Ok(msg) = serde_json::from_slice::<crate::message::Message>(value.value()) {
                 out.push(msg);
             }

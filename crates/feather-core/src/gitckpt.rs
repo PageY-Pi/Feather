@@ -74,22 +74,21 @@ impl GitCheckpoints {
     }
 
     pub fn ensure_repo(&self) -> std::io::Result<(PathBuf, bool)> {
-        std::fs::create_dir_all(&self.start)?;
-        if self.start.join(".git").exists() {
-            return Ok((self.start.clone(), false));
+        let root = crate::workspace_path::normalize_input(&self.start);
+        std::fs::create_dir_all(&root)?;
+        let root = std::fs::canonicalize(root)?;
+        if root.join(".git").exists() {
+            return Ok((root, false));
         }
-        let out = command("git")
-            .arg("init")
-            .current_dir(&self.start)
-            .output()?;
+        let out = command("git").arg("init").current_dir(&root).output()?;
         if !out.status.success() {
             return Err(std::io::Error::other(format!(
                 "git init failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        ensure_gitignore_entries(&self.start, &[".feather/", ".pi-subagents/", ".pi/"]);
-        Ok((self.start.clone(), true))
+        ensure_gitignore_entries(&root, &[".feather/", ".pi-subagents/", ".pi/"]);
+        Ok((root, true))
     }
 
     fn run(repo: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -117,13 +116,16 @@ impl GitCheckpoints {
         let mut out = BTreeSet::new();
         let mut diagnostics = Vec::new();
         for f in files {
-            let p = Path::new(f);
+            let input = crate::workspace_path::normalize_input(Path::new(f));
+            let p = crate::workspace_path::comparison_key(&input);
+            let base = crate::workspace_path::comparison_key(repo);
             let rel_path: PathBuf = if p.is_absolute() {
-                match p.strip_prefix(repo) {
+                match p.strip_prefix(&base) {
                     Ok(r) => r.to_path_buf(),
                     Err(_) => {
                         diagnostics.push(
-                            "[ILLEGAL_COMMAND] checkpoint skipped path outside workspace".to_string(),
+                            "[ILLEGAL_COMMAND] checkpoint skipped path outside workspace"
+                                .to_string(),
                         );
                         continue;
                     }
@@ -144,20 +146,24 @@ impl GitCheckpoints {
                 continue;
             }
             let full = repo.join(&rel);
+            let full = crate::workspace_path::normalize_input(&full);
             match std::fs::symlink_metadata(&full) {
                 Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {}
                 Ok(_) => {
                     // A regular file under a symlinked directory can still
                     // escape the workspace; validate the canonical parent chain.
-                    if let (Ok(real),Ok(base))=(full.canonicalize(),repo.canonicalize()) {
-                        if !real.starts_with(&base){diagnostics.push("[ILLEGAL_COMMAND] checkpoint skipped symlink path outside workspace".into());continue;}
+                    if let (Ok(real), Ok(base)) = (full.canonicalize(), repo.canonicalize()) {
+                        if !real.starts_with(&base) {
+                            diagnostics.push("[ILLEGAL_COMMAND] checkpoint skipped symlink path outside workspace".into());
+                            continue;
+                        }
                     }
                     out.insert(rel);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => diagnostics.push(format!(
-                    "checkpoint skipped unreadable path {rel}: {e}"
-                )),
+                Err(e) => {
+                    diagnostics.push(format!("checkpoint skipped unreadable path {rel}: {e}"))
+                }
             }
         }
         (out.into_iter().collect(), diagnostics)
@@ -186,8 +192,10 @@ impl GitCheckpoints {
     /// rewind can remove files this session added after a no-op turn.
     ///
     /// Never moves the user's HEAD or index: commits are built through a
-    /// temporary `GIT_INDEX_FILE` and `commit-tree`, leaving the repo's refs
-    /// and staging area untouched. A repo feather created itself is restored
+    /// temporary `GIT_INDEX_FILE` and `commit-tree`, leaving the user's refs
+    /// and staging area untouched. The checkpoint commit is retained by a
+    /// per-session ref so Git garbage collection cannot erase it.
+    /// A repo Feather creates itself is restored
     /// exactly; a pre-existing repo only ever sees managed file contents.
     pub fn commit_turn(
         &self,
@@ -207,7 +215,12 @@ impl GitCheckpoints {
         let (repo, created) = self.ensure_repo()?;
         let (files, mut diagnostics) = Self::clean_files(&repo, files);
 
-        let index = session_dir.join(format!("git-index-{turn}.tmp"));
+        let session_root = crate::workspace_path::normalize_input(session_dir);
+        std::fs::create_dir_all(&session_root)?;
+        let session_root = std::fs::canonicalize(session_root)?;
+        let index = crate::workspace_path::comparison_key(&session_root)
+            .join(format!("git-index-{turn}.tmp"));
+
         let _ = std::fs::remove_file(&index);
         let mut added = Vec::new();
         for f in &files {
@@ -261,7 +274,26 @@ impl GitCheckpoints {
             )));
         }
         let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let ref_name = format!(
+            "refs/feather/{}/turn-{turn}",
+            session_dir
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+        );
+        let _ = Self::check(&repo, &["update-ref", &ref_name, &hash]);
         let mut map = Self::load_map(session_dir)?;
+        for stale in map.keys().copied().filter(|t| *t > turn) {
+            let ref_name = format!(
+                "refs/feather/{}/turn-{stale}",
+                session_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
+            );
+            let _ = Self::run(&repo, &["update-ref", "-d", &ref_name]);
+        }
+        map.retain(|t, _| *t <= turn);
         map.insert(
             turn,
             TurnCommit {
@@ -289,6 +321,15 @@ impl GitCheckpoints {
     /// edit that happened to land inside a managed file is recoverable. A
     /// backup write failure aborts the restore rather than destroying data.
     pub fn restore(&self, turn: u64, session_dir: &Path) -> std::io::Result<()> {
+        self.restore_excluding(turn, session_dir, &[])
+    }
+
+    pub fn restore_excluding(
+        &self,
+        turn: u64,
+        session_dir: &Path,
+        excluded: &[PathBuf],
+    ) -> std::io::Result<()> {
         let map = Self::load_map(session_dir)?;
         let rec = map
             .get(&turn)
@@ -302,16 +343,29 @@ impl GitCheckpoints {
         let (repo, _) = self.ensure_repo()?;
 
         let mut ever = BTreeSet::new();
+        let mut known_at_or_before_target = BTreeSet::new();
         for r in map.values() {
             ever.extend(r.files.iter().cloned());
+            if r.turn <= turn {
+                known_at_or_before_target.extend(r.files.iter().cloned());
+            }
         }
         let target: BTreeSet<String> = rec.files.iter().cloned().collect();
         let backup_root = session_dir
             .join("restore-backup")
             .join(format!("turn-{turn}"));
 
+        // A file is removable only when an earlier checkpoint proves it was
+        // managed at or before the target. A later-only file may be unrelated
+        // user work (or an omitted path after compaction) and must survive.
         for f in &ever {
-            let path = repo.join(f);
+            let path = crate::workspace_path::normalize_input(&repo.join(f));
+            if excluded.iter().any(|skip| {
+                crate::workspace_path::comparison_key(skip)
+                    == crate::workspace_path::comparison_key(&path)
+            }) {
+                continue;
+            }
             if target.contains(f) {
                 if rec.hash.is_empty() {
                     continue;
@@ -328,7 +382,7 @@ impl GitCheckpoints {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&path, out.stdout)?;
-            } else if path.exists() {
+            } else if !known_at_or_before_target.contains(f) && path.exists() {
                 let bytes = std::fs::read(&path)?;
                 Self::backup(&backup_root, f, &bytes)?;
                 std::fs::remove_file(&path)?;
@@ -626,8 +680,14 @@ mod tests {
             .unwrap();
         assert!(report.hash.is_some());
         assert!(report.diagnostics.iter().all(|d| !d.contains("secret.txt")));
-        assert!(report.diagnostics.iter().all(|d| !d.contains(&outside.display().to_string())));
-        assert!(report.diagnostics.iter().any(|d| d.contains("outside workspace")));
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|d| !d.contains(&outside.display().to_string())));
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("outside workspace")));
         assert!(!report.diagnostics.iter().any(|d| d.contains("ignored.log")));
         assert!(!report.diagnostics.iter().any(|d| d.contains("adir")));
         let _ = std::fs::remove_dir_all(dir);

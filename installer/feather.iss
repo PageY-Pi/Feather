@@ -1,6 +1,6 @@
 ; Build with Inno Setup 6: ISCC installer\Feather.iss
 ; Strict allowlist: no home directory, databases, models, auth or sessions.
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.5"
 [Setup]
 AppId={{BA63A0FA-5EDB-4C50-923B-56FEA51D6168}
 AppName=Feather
@@ -25,7 +25,7 @@ DisableProgramGroupPage=yes
 [Files]
 Source: "..\target\release\feather.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\feather-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\third-party-notices.md"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{group}\Feather"; Filename: "{app}\feather-gui.exe"; WorkingDir: "{userdocs}"
 Name: "{userdesktop}\Feather"; Filename: "{app}\feather-gui.exe"; WorkingDir: "{userdocs}"

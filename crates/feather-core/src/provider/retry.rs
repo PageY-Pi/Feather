@@ -1,22 +1,22 @@
 //! Provider retry policy shared by the agent loop and tests.
 //!
 //! t019: one initial attempt plus three automatic retries whose deadlines are
-//! anchored to the first failure at +5, +30 and +60 seconds (not cumulative
-//! 5/30/60-second sleeps). Time already spent on failed requests counts against
-//! each deadline, so an overdue retry runs at once. Quota exhaustion is a
-//! billing/capacity terminal condition and is intentionally not treated like
-//! ordinary rate limits.
+//! anchored at +5, +30 and +60 seconds from the first failure.
+//! Time spent on failed requests counts against each deadline; overdue retries run immediately.
+//! Quota exhaustion is terminal and is intentionally not retried.
 
 use super::ProviderError;
 use std::time::Duration;
 use tokio::time::Instant;
 
 /// Offsets, measured once from the first error, at which each retry may run.
-pub const RETRY_DELAYS: [Duration; 3] = [
+pub const RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(5),
+    Duration::from_secs(10),
     Duration::from_secs(30),
     Duration::from_secs(60),
 ];
+
 pub const MAX_ATTEMPTS: usize = 1 + RETRY_DELAYS.len();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +114,10 @@ mod tests {
 
     #[test]
     fn retries_rate_limits_but_not_quota() {
-        let rate = ProviderError::Api { status: 429, body: "rate limit".into() };
+        let rate = ProviderError::Api {
+            status: 429,
+            body: "rate limit".into(),
+        };
         assert!(plan(&rate, 0).is_some());
 
         for body in [
@@ -123,23 +126,39 @@ mod tests {
             r#"{"error":{"type":"quota_auth"}}"#,
             "exceeded your current quota",
         ] {
-            let quota = ProviderError::Api { status: 429, body: body.into() };
+            let quota = ProviderError::Api {
+                status: 429,
+                body: body.into(),
+            };
             assert!(plan(&quota, 0).is_none(), "quota body retried: {body}");
         }
 
-        let nonquota = ProviderError::Api { status: 429, body: "rate limit: try later".into() };
+        let nonquota = ProviderError::Api {
+            status: 429,
+            body: "rate limit: try later".into(),
+        };
         assert_eq!(plan(&nonquota, 0).unwrap().deadline, Duration::from_secs(5));
-        assert_eq!(plan(&nonquota, 1).unwrap().deadline, Duration::from_secs(30));
-        assert_eq!(plan(&nonquota, 2).unwrap().deadline, Duration::from_secs(60));
-        assert!(plan(&nonquota, 3).is_none());
+        assert_eq!(
+            plan(&nonquota, 1).unwrap().deadline,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            plan(&nonquota, 2).unwrap().deadline,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            plan(&nonquota, 3).unwrap().deadline,
+            Duration::from_secs(60)
+        );
+        assert!(plan(&nonquota, 4).is_none());
+        assert!(plan(&nonquota, 3).is_some());
     }
 
     #[tokio::test(start_paused = true)]
     async fn abort_interrupts_backoff() {
         let (tx, mut rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
-            sleep_or_abort(Duration::from_secs(30), &mut rx).await
-        });
+        let task =
+            tokio::spawn(async move { sleep_or_abort(Duration::from_secs(30), &mut rx).await });
         tx.send(true).unwrap();
         assert!(matches!(task.await.unwrap(), Err(ProviderError::Aborted)));
     }
@@ -147,12 +166,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn false_abort_notification_does_not_end_backoff() {
         let (tx, mut rx) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
-            sleep_or_abort(Duration::from_secs(30), &mut rx).await
-        });
+        let task =
+            tokio::spawn(async move { sleep_or_abort(Duration::from_secs(30), &mut rx).await });
         tx.send_replace(false);
         tokio::task::yield_now().await;
-        assert!(!task.is_finished(), "false watch update ended retry backoff early");
+        assert!(
+            !task.is_finished(),
+            "false watch update ended retry backoff early"
+        );
         tokio::time::advance(Duration::from_secs(30)).await;
         assert!(task.await.unwrap().is_ok());
     }
@@ -164,17 +185,29 @@ mod tests {
         let first = plan(&err, 0).unwrap();
         let second = plan(&err, 1).unwrap();
         let third = plan(&err, 2).unwrap();
+        let fourth = plan(&err, 3).unwrap();
 
-        // From the initial error each retry is due at +5, +30 and +60 seconds.
+        // From the initial error each retry is due at +5, +10, +30 and +60 seconds.
         assert_eq!(delay_until(&first, t0, t0), Duration::from_secs(5));
-        assert_eq!(delay_until(&second, t0, t0), Duration::from_secs(30));
-        assert_eq!(delay_until(&third, t0, t0), Duration::from_secs(60));
+        assert_eq!(delay_until(&second, t0, t0), Duration::from_secs(10));
+        assert_eq!(delay_until(&third, t0, t0), Duration::from_secs(30));
+        assert_eq!(delay_until(&fourth, t0, t0), Duration::from_secs(60));
 
-        // Once the first wait elapses only the remaining 25s is owed for the
+        // Once the first wait elapses only the remaining 5s is owed for the
         // second retry (30 - 5), not a fresh 30s sleep.
         let after_first = t0 + Duration::from_secs(5);
-        assert_eq!(delay_until(&second, t0, after_first), Duration::from_secs(25));
-        assert_eq!(delay_until(&third, t0, after_first), Duration::from_secs(55));
+        assert_eq!(
+            delay_until(&second, t0, after_first),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            delay_until(&third, t0, after_first),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            delay_until(&fourth, t0, after_first),
+            Duration::from_secs(55)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -182,7 +215,7 @@ mod tests {
         let err = ProviderError::Http("transient".into());
         let t0 = Instant::now();
         let first = plan(&err, 0).unwrap();
-        let third = plan(&err, 2).unwrap();
+        let fourth = plan(&err, 3).unwrap();
 
         // A slow request that already burned past +5s owes no further wait.
         let elapsed = t0 + Duration::from_secs(8);
@@ -190,13 +223,17 @@ mod tests {
         // Even far past +60s the wait saturates at zero instead of going negative.
         let way_late = t0 + Duration::from_secs(120);
         assert_eq!(delay_until(&first, t0, way_late), Duration::ZERO);
-        assert_eq!(delay_until(&third, t0, way_late), Duration::ZERO);
+        assert_eq!(delay_until(&fourth, t0, way_late), Duration::ZERO);
 
         // A zero wait completes without advancing the clock.
         let before = Instant::now();
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
         assert!(sleep_or_abort(Duration::ZERO, &mut rx).await.is_ok());
-        assert_eq!(Instant::now(), before, "a zero wait must not advance the clock");
+        assert_eq!(
+            Instant::now(),
+            before,
+            "a zero wait must not advance the clock"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -183,11 +183,19 @@ impl Message {
 
     /// The usual single text block can be borrowed. Multiple blocks keep the
     /// legacy newline joining semantics; only that case needs an allocation.
-    pub fn text_cow(&self) -> std::borrow::Cow<'_,str> {
-        let mut blocks=self.content.iter().filter_map(|block|match block{ContentBlock::Text{text}=>Some(text.as_str()),_=>None});
-        let Some(first)=blocks.next() else{return std::borrow::Cow::Borrowed("");};
-        if blocks.next().is_none(){std::borrow::Cow::Borrowed(first)}
-        else{std::borrow::Cow::Owned(self.text())}
+    pub fn text_cow(&self) -> std::borrow::Cow<'_, str> {
+        let mut blocks = self.content.iter().filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        let Some(first) = blocks.next() else {
+            return std::borrow::Cow::Borrowed("");
+        };
+        if blocks.next().is_none() {
+            std::borrow::Cow::Borrowed(first)
+        } else {
+            std::borrow::Cow::Owned(self.text())
+        }
     }
     pub fn text(&self) -> String {
         let mut out = String::new();
@@ -202,8 +210,11 @@ impl Message {
         out
     }
 
-    pub fn iter_tool_calls(&self) -> impl Iterator<Item=&ToolCall> {
-        self.content.iter().filter_map(|block|match block{ContentBlock::ToolCall(call)=>Some(call),_=>None})
+    pub fn iter_tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.content.iter().filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call),
+            _ => None,
+        })
     }
     pub fn tool_calls(&self) -> Vec<&ToolCall> {
         self.content
@@ -281,23 +292,34 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Hash canonical JSON directly into FNV rather than allocating a temporary
 /// serialized copy. Used only for stable cache generations, not cryptography.
-pub fn json_hash(value:&impl Serialize)->Result<u64,serde_json::Error> {
+pub fn json_hash(value: &impl Serialize) -> Result<u64, serde_json::Error> {
     struct HashWriter(u64);
     impl std::io::Write for HashWriter {
-        fn write(&mut self,bytes:&[u8])->std::io::Result<usize>{
-            for &byte in bytes {self.0^=byte as u64;self.0=self.0.wrapping_mul(0x100000001b3);}
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            for &byte in bytes {
+                self.0 ^= byte as u64;
+                self.0 = self.0.wrapping_mul(0x100000001b3);
+            }
             Ok(bytes.len())
         }
-        fn flush(&mut self)->std::io::Result<()>{Ok(())}
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    let mut writer=HashWriter(0xcbf29ce484222325);
-    serde_json::to_writer(&mut writer,value)?;Ok(writer.0)
+    let mut writer = HashWriter(0xcbf29ce484222325);
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.0)
 }
-#[cfg(test)]mod hash_tests{
+#[cfg(test)]
+mod hash_tests {
     use super::*;
-    #[test]fn streamed_json_hash_matches_original_bytes(){
-        let message=Message::user_text("quotes \" / 羽毛\n");
-        assert_eq!(json_hash(&message).unwrap(),fnv1a(&serde_json::to_vec(&message).unwrap()));
+    #[test]
+    fn streamed_json_hash_matches_original_bytes() {
+        let message = Message::user_text("quotes \" / 羽毛\n");
+        assert_eq!(
+            json_hash(&message).unwrap(),
+            fnv1a(&serde_json::to_vec(&message).unwrap())
+        );
     }
 }
 pub fn json_to_pretty(v: &serde_json::Value) -> String {

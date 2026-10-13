@@ -1,6 +1,3 @@
-[README.md](https://github.com/user-attachments/files/33283215/README.md)
-# Feather
-A full Rust rewrite of personal Pi + extensions
 <p align="center">
   <img src="crates/feather-gui/assets/feather-logo.png" alt="Feather" width="120" />
 </p>
@@ -14,7 +11,7 @@ Feather is a standalone coding assistant for your workspace. It combines a nativ
 parallel subtasks, recoverable history and anchor-verified file editing. No browser
 shell, Electron, Node.js runtime or dynamically loaded plugin engine is required.
 
-**Version 1.0.0** · Windows x64 is the release-tested platform. Rust sources contain
+**Version 1.0.5** · Windows x64 is the release-tested platform. Rust sources contain
 other-platform support, but those builds are not claimed to be release-validated.
 
 ## Why Feather?
@@ -40,7 +37,7 @@ other-platform support, but those builds are not claimed to be release-validated
 
 ## Install on Windows
 
-Use `Feather-1.0.0-Setup-x64.exe` from the project's published release assets, or
+Use `Feather-1.0.5-Setup-x64.exe` from the project's published release assets, or
 build it locally following the instructions below. The per-user installer needs
 no administrator privileges. It installs the two executables, adds Feather to
 your user PATH, and provides an **Open Feather here** Explorer menu.
@@ -224,7 +221,7 @@ Build the Windows installer with **Inno Setup 6**:
 ISCC installer/Feather.iss
 ```
 
-Output: `dist/Feather-1.0.0-Setup-x64.exe`. See
+Output: `dist/Feather-1.0.5-Setup-x64.exe`. See
 [installer instructions](installer/README.md) for local deployment details.
 Native Windows smoke tests are in `scripts/cpu-smoke.ps1` and
 `scripts/renderer-restart-smoke.ps1`; they control isolated synthetic preview
@@ -262,7 +259,7 @@ and the reproducible synthetic `performance_audit` example.
 - Agent tools can execute commands and edit files. Use a disposable workspace or
   suitable OS isolation for untrusted tasks; tool policy is not a complete
   sandbox. Review diffs, test changes and retain independent backups.
-- Retry policy targets +5/+30/+60 seconds after the initial non-quota failure;
+- Retry policy targets +5/+10/+30/+60 seconds after the initial non-quota failure;
   cancellation interrupts waits. Quota exhaustion is not blindly retried.
 
 ## Contributing

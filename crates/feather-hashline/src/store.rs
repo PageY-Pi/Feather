@@ -17,7 +17,7 @@ pub struct AnchorStore {
     home: PathBuf,
     records: Mutex<Option<feather_core::records::Records>>,
     snapshots: Option<feather_core::file_snapshots::FileSnapshots>,
-    workspace: Option<PathBuf>,
+
     /// Most recent touch time per path — tiebreaker when an anchor exists in
     /// several mapped files (anchor-only resolution).
     last_touched: Mutex<HashMap<PathBuf, u64>>,
@@ -30,37 +30,41 @@ impl AnchorStore {
             home: home.to_path_buf(),
             records: Mutex::new(None),
             snapshots: None,
-            workspace: None,
+
             last_touched: Mutex::new(HashMap::new()),
         }
     }
 
-    fn records(&self) -> Result<feather_core::records::Records,String> {
-        let mut records=self.records.lock().unwrap_or_else(|e|e.into_inner());
-        if let Some(store)=records.as_ref(){return Ok(store.clone());}
-        let store=feather_core::records::Records::open(&self.home.join("anchors.redb"))?;
-        *records=Some(store.clone());Ok(store)
+    fn records(&self) -> Result<feather_core::records::Records, String> {
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = records.as_ref() {
+            return Ok(store.clone());
+        }
+        let store = feather_core::records::Records::open(&self.home.join("anchors.redb"))?;
+        *records = Some(store.clone());
+        Ok(store)
     }
-    /// Track external edits in the parent session's redb file history.
-    pub fn with_snapshots(mut self, session_dir: &Path, workspace: &Path) -> Self {
-        self.snapshots = Some(feather_core::file_snapshots::FileSnapshots::new(session_dir));
-        self.workspace = Some(norm_key(workspace));
+    /// Track every anchor edit in the parent session's redb file history.
+    pub fn with_snapshots(mut self, session_dir: &Path, _workspace: &Path) -> Self {
+        self.snapshots = Some(feather_core::file_snapshots::FileSnapshots::new(
+            session_dir,
+        ));
         self
     }
-    fn external(&self, path: &Path) -> bool {
-        let path = norm_key(path);
-        self.workspace.as_ref().map(|root| !path.starts_with(root)).unwrap_or(false)
-    }
     fn before_edit(&self, path: &Path) -> Result<(), EngineError> {
-        if self.external(path) {
-            if let Some(s) = &self.snapshots { s.before_edit(path).map_err(|e| EngineError::Io(format!("file snapshot: {e}")))?; }
+        if let Some(s) = &self.snapshots {
+            s.before_edit(path)
+                .map_err(|e| EngineError::Io(format!("file snapshot: {e}")))?;
         }
+
         Ok(())
     }
     fn after_edit(&self, path: &Path) -> Result<(), EngineError> {
-        if self.external(path) {
-            if let Some(s) = &self.snapshots { s.after_edit(path).map_err(|e| EngineError::Io(format!("file snapshot: {e}")))?; }
+        if let Some(s) = &self.snapshots {
+            s.after_edit(path)
+                .map_err(|e| EngineError::Io(format!("file snapshot: {e}")))?;
         }
+
         Ok(())
     }
     fn sidecar_path(&self, path: &Path) -> PathBuf {
@@ -127,8 +131,7 @@ impl AnchorStore {
             .map_err(|_| EngineError::Encode(format!("{} is not valid UTF-8", path.display())))?;
         let seed = Self::seed_for(path, &content);
         let mut map = AnchorMap::new(path.to_path_buf(), content, seed);
-        let store = self.records()
-            .map_err(EngineError::Io)?;
+        let store = self.records().map_err(EngineError::Io)?;
         let key = norm_key(path).display().to_string();
         let rec = store.get::<PersistRecord>(&key).map_err(EngineError::Io)?;
         if let Some(rec) = rec {
@@ -498,11 +501,19 @@ impl AnchorStore {
 /// (`./a.rs`, `A.RS`, relative vs absolute) must share ONE map and ONE
 /// sidecar, or edits through one spelling silently miss the other's.
 pub(crate) fn norm_key(path: &Path) -> PathBuf {
-    let cand = std::fs::canonicalize(path)
+    let input = feather_core::workspace_path::normalize_input(path);
+    let cand = std::fs::canonicalize(&input)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| {
-            if path.is_absolute() { path.to_string_lossy().into_owned() }
-            else { std::env::current_dir().unwrap_or_default().join(path).to_string_lossy().into_owned() }
+            if input.is_absolute() {
+                input.to_string_lossy().into_owned()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(&input)
+                    .to_string_lossy()
+                    .into_owned()
+            }
         });
     #[cfg(windows)]
     {
@@ -543,22 +554,32 @@ mod tests {
 
     #[test]
     fn anchor_edits_outside_workspace_rewind_through_session() {
-        use feather_core::{Session,Message};
-        let h=home("external-history");let cwd=h.join("workspace");std::fs::create_dir_all(&cwd).unwrap();
-        let mut session=Session::new(&h,&cwd).unwrap();
-        let external=h.join("outside.txt");std::fs::write(&external,"before\n").unwrap();
-        let created=h.join("new-dir/new.txt");
-        let store=AnchorStore::new(&session.dir().join("anchors")).with_snapshots(session.dir(),&cwd);
-        session.push(Message::user_text("baseline")).unwrap();session.commit_turn().unwrap();
-        store.read(&external,None,None).unwrap();
-        let anchor=store.build_map(&external).unwrap().anchor_at(0).unwrap();
-        store.replace(&external,anchor,anchor,"after").unwrap();
-        store.write(&created,"created").unwrap();
-        session.push(Message::user_text("external edit")).unwrap();session.commit_turn().unwrap();
+        use feather_core::{Message, Session};
+        let h = home("external-history");
+        let cwd = h.join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut session = Session::new(&h, &cwd).unwrap();
+        let external = h.join("outside.txt");
+        std::fs::write(&external, "before\n").unwrap();
+        let created = h.join("new-dir/new.txt");
+        let store =
+            AnchorStore::new(&session.dir().join("anchors")).with_snapshots(session.dir(), &cwd);
+        session.push(Message::user_text("baseline")).unwrap();
+        session.commit_turn().unwrap();
+        store.read(&external, None, None).unwrap();
+        let anchor = store.build_map(&external).unwrap().anchor_at(0).unwrap();
+        store.replace(&external, anchor, anchor, "after").unwrap();
+        store.write(&created, "created").unwrap();
+        session.push(Message::user_text("external edit")).unwrap();
+        session.commit_turn().unwrap();
         session.rewind_to(1).unwrap();
-        assert_eq!(std::fs::read_to_string(&external).unwrap(),"before\n");assert!(!created.exists());
-        session.rewind_to(2).unwrap();assert_eq!(std::fs::read_to_string(&external).unwrap(),"after\n");assert!(created.exists());
-        drop(session);std::fs::remove_dir_all(h).unwrap();
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "before\n");
+        assert!(!created.exists());
+        session.rewind_to(2).unwrap();
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "after\n");
+        assert!(created.exists());
+        drop(session);
+        std::fs::remove_dir_all(h).unwrap();
     }
     #[test]
     fn mapping_survives_restart_via_sidecar() {

@@ -22,17 +22,19 @@ pub fn estimate_message_tokens(m: &crate::message::Message) -> u64 {
     estimate_message_tokens_filtered(m, true)
 }
 
-pub fn estimate_message_tokens_without_thinking(m:&crate::message::Message)->u64 {
+pub fn estimate_message_tokens_without_thinking(m: &crate::message::Message) -> u64 {
     estimate_message_tokens_filtered(m, false)
 }
-fn estimate_message_tokens_filtered(m:&crate::message::Message, include_thinking:bool)->u64 {
+fn estimate_message_tokens_filtered(m: &crate::message::Message, include_thinking: bool) -> u64 {
     use crate::message::ContentBlock;
     let mut total = 4; // role overhead
     for b in &m.content {
         match b {
             ContentBlock::Text { text } => total += estimate_tokens(text) + 3,
-            ContentBlock::Thinking { text, .. } if include_thinking => total += estimate_tokens(text) + 3,
-            ContentBlock::Thinking { .. } => {},
+            ContentBlock::Thinking { text, .. } if include_thinking => {
+                total += estimate_tokens(text) + 3
+            }
+            ContentBlock::Thinking { .. } => {}
             ContentBlock::ToolCall(c) => {
                 // Estimate without re-serializing the arguments value — a full
                 // serde pass per tool call per turn is pure waste for a rough
@@ -47,15 +49,28 @@ fn estimate_message_tokens_filtered(m:&crate::message::Message, include_thinking
                     let mut words = 0u64;
                     let mut in_word = false;
                     for (index, key) in object.keys().enumerate() {
-                        if index > 0 { chars += 1; in_word = false; }
+                        if index > 0 {
+                            chars += 1;
+                            in_word = false;
+                        }
                         for ch in key.chars() {
                             chars += 1;
-                            if ch.is_whitespace() { in_word = false; }
-                            else if !in_word { words += 1; in_word = true; }
+                            if ch.is_whitespace() {
+                                in_word = false;
+                            } else if !in_word {
+                                words += 1;
+                                in_word = true;
+                            }
                         }
                     }
-                    if chars == 0 { 0 } else { ((chars.div_ceil(4) * 3 + words) / 4).max(1) }
-                } else { 0 };
+                    if chars == 0 {
+                        0
+                    } else {
+                        ((chars.div_ceil(4) * 3 + words) / 4).max(1)
+                    }
+                } else {
+                    0
+                };
                 total += estimate_tokens(&c.name) + arguments + 8;
             }
             // images: rough fixed cost per block (real cost depends on the
@@ -75,11 +90,45 @@ pub fn estimate_context_tokens(msgs: &[crate::message::Message]) -> u64 {
 mod tests {
     #[test]
     fn argument_key_estimate_matches_previous_join_without_allocations() {
-        use crate::message::{Message,ContentBlock,ToolCall,Api,Usage,StopReason};
-        for arguments in [serde_json::json!({}),serde_json::json!({"":1," whitespace \t key":2,"羽毛":3}),serde_json::json!("words 羽毛"),serde_json::json!([1,2])] {
-            let expected=match arguments.as_str(){Some(s)=>estimate_tokens(s),None=>arguments.as_object().map_or(0,|object|estimate_tokens(&object.keys().map(String::as_str).collect::<Vec<_>>().join(" ")))};
-            let msg=Message::assistant(vec![ContentBlock::ToolCall(ToolCall{id:"t".into(),name:"read".into(),arguments}),ContentBlock::Text{text:"tail".into()}],"m",Api::Faux,Usage::default(),StopReason::ToolUse);
-            assert_eq!(estimate_message_tokens(&msg),4+estimate_tokens("read")+expected+8+estimate_tokens("tail")+3);
+        use crate::message::{Api, ContentBlock, Message, StopReason, ToolCall, Usage};
+        for arguments in [
+            serde_json::json!({}),
+            serde_json::json!({"":1," whitespace \t key":2,"羽毛":3}),
+            serde_json::json!("words 羽毛"),
+            serde_json::json!([1, 2]),
+        ] {
+            let expected = match arguments.as_str() {
+                Some(s) => estimate_tokens(s),
+                None => arguments.as_object().map_or(0, |object| {
+                    estimate_tokens(
+                        &object
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    )
+                }),
+            };
+            let msg = Message::assistant(
+                vec![
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "t".into(),
+                        name: "read".into(),
+                        arguments,
+                    }),
+                    ContentBlock::Text {
+                        text: "tail".into(),
+                    },
+                ],
+                "m",
+                Api::Faux,
+                Usage::default(),
+                StopReason::ToolUse,
+            );
+            assert_eq!(
+                estimate_message_tokens(&msg),
+                4 + estimate_tokens("read") + expected + 8 + estimate_tokens("tail") + 3
+            );
         }
     }
     use super::*;

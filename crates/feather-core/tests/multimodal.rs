@@ -83,14 +83,18 @@ fn thinking_matches_pi_default_budgets_and_preserves_openai_effort() {
 #[test]
 fn multimodal_blocks_keep_order_and_image_only_has_no_empty_text_block() {
     let mut req = request();
-    std::sync::Arc::make_mut(&mut req.messages)[0].content.push(ContentBlock::Text {
-        text: "after".into(),
-    });
+    std::sync::Arc::make_mut(&mut req.messages)[0]
+        .content
+        .push(ContentBlock::Text {
+            text: "after".into(),
+        });
     let a = AnthropicProvider::build_body(&req);
     let o = OpenAiProvider::build_body(&req);
     assert_eq!(a["messages"][0]["content"][2]["text"], "after");
     assert_eq!(o["messages"][1]["content"][2]["text"], "after");
-    std::sync::Arc::make_mut(&mut req.messages)[0].content.remove(0);
+    std::sync::Arc::make_mut(&mut req.messages)[0]
+        .content
+        .remove(0);
     std::sync::Arc::make_mut(&mut req.messages)[0].content.pop();
     assert_eq!(
         AnthropicProvider::build_body(&req)["messages"][0]["content"]

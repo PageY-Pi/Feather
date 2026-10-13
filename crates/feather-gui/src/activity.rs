@@ -14,7 +14,6 @@ fn orbit_points(center: egui::Pos2, radius: f32, now: f64) -> [egui::Pos2; 8] {
     })
 }
 
-
 pub fn orbit(ui: &mut egui::Ui, size: f32, now: f64) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     let radius = size * 0.34;
@@ -49,7 +48,6 @@ pub fn waiting_card(ui: &mut egui::Ui, now: f64) {
                 orbit(ui, 36.0, now);
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
-
                     ui.label(
                         egui::RichText::new("Feather is working")
                             .size(15.0)

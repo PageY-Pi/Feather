@@ -10,7 +10,9 @@ static DBS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Database>>>> = OnceLock::new()
 #[derive(Clone)]
 pub struct Records(Arc<Database>);
 impl Records {
-    pub(crate) fn database(&self) -> &Database { &self.0 }
+    pub(crate) fn database(&self) -> &Database {
+        &self.0
+    }
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

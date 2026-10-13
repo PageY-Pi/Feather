@@ -20,7 +20,10 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::Path,
-    sync::{atomic::{AtomicUsize, Ordering}, mpsc, Arc},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -75,7 +78,13 @@ fn config(api: Api, thinking: Option<ThinkingLevel>, window: u64, keep: u64) -> 
     }
 }
 
-fn agent(provider: ProviderRef, api: Api, thinking: Option<ThinkingLevel>, window: u64, keep: u64) -> Agent {
+fn agent(
+    provider: ProviderRef,
+    api: Api,
+    thinking: Option<ThinkingLevel>,
+    window: u64,
+    keep: u64,
+) -> Agent {
     Agent::new(
         config(api, thinking, window, keep),
         seeded(),
@@ -85,7 +94,13 @@ fn agent(provider: ProviderRef, api: Api, thinking: Option<ThinkingLevel>, windo
     )
 }
 
-fn openai_agent(base: &str, compat: Value, thinking: Option<ThinkingLevel>, window: u64, keep: u64) -> Agent {
+fn openai_agent(
+    base: &str,
+    compat: Value,
+    thinking: Option<ThinkingLevel>,
+    window: u64,
+    keep: u64,
+) -> Agent {
     let provider = OpenAiProvider::new("unused", Some(base.into())).with_compat(compat);
     agent(
         ProviderRef::OpenAi(Arc::new(provider)),
@@ -149,7 +164,10 @@ fn start_server(replies: Vec<&'static str>) -> (String, mpsc::Receiver<Capture>)
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => return,
@@ -158,7 +176,10 @@ fn start_server(replies: Vec<&'static str>) -> (String, mpsc::Receiver<Capture>)
             let raw = read_http_request(&mut stream).unwrap_or_default();
             let path = request_path(&raw);
             let body = request_body(&raw);
-            let _ = tx.send(Capture { path: path.clone(), body });
+            let _ = tx.send(Capture {
+                path: path.clone(),
+                body,
+            });
             let sse = sse_for(&path, reply);
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -231,7 +252,8 @@ fn sse_for(path: &str, text: &str) -> String {
         .to_string();
         format!("data: {delta}\n\ndata: {done}\n\n")
     } else {
-        let delta = json!({"type":"response.output_text.delta","output_index":0,"delta":text}).to_string();
+        let delta =
+            json!({"type":"response.output_text.delta","output_index":0,"delta":text}).to_string();
         let done = json!({
             "type":"response.completed",
             "response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}
@@ -283,7 +305,11 @@ async fn completions_manual_compaction_uses_low_for_reasoning_metadata_regardles
         Some(ThinkingLevel::Max),
     ] {
         let body = openai_compact_body(reasoning_compat(), thinking).await;
-        assert_eq!(body["reasoning_effort"], json!("low"), "{thinking:?}: {body}");
+        assert_eq!(
+            body["reasoning_effort"],
+            json!("low"),
+            "{thinking:?}: {body}"
+        );
     }
 }
 
@@ -308,13 +334,29 @@ async fn automatic_compaction_is_low_then_live_turn_keeps_high_and_summary_is_pr
     let first = recv_capture(&rx);
     let second = recv_capture(&rx);
     assert!(first.path.contains("/chat/completions"));
-    assert_eq!(first.body["reasoning_effort"], json!("low"), "summary request: {}", first.body);
-    assert_eq!(second.body["reasoning_effort"], json!("high"), "live request: {}", second.body);
+    assert_eq!(
+        first.body["reasoning_effort"],
+        json!("low"),
+        "summary request: {}",
+        first.body
+    );
+    assert_eq!(
+        second.body["reasoning_effort"],
+        json!("high"),
+        "live request: {}",
+        second.body
+    );
 
     let events = drain(&mut events);
     let deltas: Vec<_> = events
         .iter()
-        .filter_map(|e| if let AgentEvent::TextDelta(t) = e { Some(t.as_str()) } else { None })
+        .filter_map(|e| {
+            if let AgentEvent::TextDelta(t) = e {
+                Some(t.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
     assert_eq!(deltas, vec!["NEW FINAL PURE TEXT"]);
 }
@@ -331,7 +373,11 @@ async fn explicit_reasoning_false_omits_reasoning_params_for_all_http_apis() {
     no_openai_reasoning(&body);
 
     let (base, rx) = start_server(vec!["SHORT SUMMARY"]);
-    let body = compact_body(responses_agent(&base, compat.clone(), Some(ThinkingLevel::High)), rx).await;
+    let body = compact_body(
+        responses_agent(&base, compat.clone(), Some(ThinkingLevel::High)),
+        rx,
+    )
+    .await;
     assert!(body.get("reasoning").is_none(), "{body}");
 
     let (base, rx) = start_server(vec!["SHORT SUMMARY"]);
@@ -344,7 +390,11 @@ async fn responses_and_pi_reasoning_true_compaction_use_low() {
     let compat = reasoning_compat();
 
     let (base, rx) = start_server(vec!["SHORT SUMMARY"]);
-    let body = compact_body(responses_agent(&base, compat.clone(), Some(ThinkingLevel::Max)), rx).await;
+    let body = compact_body(
+        responses_agent(&base, compat.clone(), Some(ThinkingLevel::Max)),
+        rx,
+    )
+    .await;
     assert_eq!(body["reasoning"]["effort"], json!("low"), "{body}");
 
     let (base, rx) = start_server(vec!["SHORT SUMMARY"]);
@@ -366,7 +416,11 @@ async fn custom_map_clamps_compaction_low_to_high() {
 #[tokio::test]
 async fn completions_without_metadata_uses_low_only_when_active_thinking_is_some() {
     let body = openai_compact_body(Value::Null, Some(ThinkingLevel::High)).await;
-    assert_eq!(body["reasoning_effort"], json!("low"), "active thinking should imply reasoning: {body}");
+    assert_eq!(
+        body["reasoning_effort"],
+        json!("low"),
+        "active thinking should imply reasoning: {body}"
+    );
 
     let body = openai_compact_body(Value::Null, None).await;
     no_openai_reasoning(&body);

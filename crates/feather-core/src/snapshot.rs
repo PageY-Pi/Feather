@@ -108,7 +108,6 @@ impl SnapshotStore {
         &self.path
     }
 
-
     /// Persist a snapshot for `turn`. Idempotent: re-snapshotting the same
     /// content is a no-op; divergent content for the same turn overwrites.
     pub fn snapshot(&self, turn: u64, messages: &[Message]) -> Result<(), SnapshotError> {
@@ -129,9 +128,7 @@ impl SnapshotStore {
                 let mut probe: u64 = 0;
                 loop {
                     // read first, drop the guard, then insert (redb borrows)
-                    let hit = chunks
-                        .get(key)?
-                        .map(|g| g.value() == bytes);
+                    let hit = chunks.get(key)?.map(|g| g.value() == bytes);
                     match hit {
                         None => {
                             chunks.insert(key, bytes.as_slice())?;
@@ -179,7 +176,8 @@ impl SnapshotStore {
     pub fn history_hash(messages: &[Message]) -> u64 {
         let mut h = crate::message::fnv1a(b"feather-history-v1");
         for m in messages {
-            let message_hash = crate::message::json_hash(m).unwrap_or_else(|_|crate::message::fnv1a(&[]));
+            let message_hash =
+                crate::message::json_hash(m).unwrap_or_else(|_| crate::message::fnv1a(&[]));
             h = h.rotate_left(1) ^ message_hash;
         }
         h
@@ -210,15 +208,35 @@ impl SnapshotStore {
 
     /// Bounded lightweight rewind labels. Decode only the newest real user
     /// request in each snapshot, never load whole snapshot message vectors.
-    pub fn turn_labels(&self,limit:usize)->Result<Vec<(u64,String)>,SnapshotError>{
-        let tx=self.db.begin_read()?;let snaps=tx.open_table(SNAPSHOTS)?;let chunks=tx.open_table(CHUNKS)?;let mut labels=Vec::new();
-        for entry in snaps.range::<u64>(..)?.rev().take(limit.min(256)){
-            let(turn,bytes)=entry?;let rec:SnapshotRecord=serde_json::from_slice(bytes.value())?;let mut label=None;
-            for key in rec.chunk_keys.iter().rev(){if let Some(raw)=chunks.get(*key)?{let message:Message=serde_json::from_slice(raw.value())?;
-                if message.role==crate::message::Role::User {let text=message.text();if !text.starts_with("<feather-runtime-diagnostic>")&&!text.starts_with("## Conversation summary"){label=Some(text.chars().take(180).collect::<String>());break;}}
-            }}
-            labels.push((turn.value(),label.unwrap_or_else(||"Context checkpoint".into())));
-        }Ok(labels)
+    pub fn turn_labels(&self, limit: usize) -> Result<Vec<(u64, String)>, SnapshotError> {
+        let tx = self.db.begin_read()?;
+        let snaps = tx.open_table(SNAPSHOTS)?;
+        let chunks = tx.open_table(CHUNKS)?;
+        let mut labels = Vec::new();
+        for entry in snaps.range::<u64>(..)?.rev().take(limit.min(256)) {
+            let (turn, bytes) = entry?;
+            let rec: SnapshotRecord = serde_json::from_slice(bytes.value())?;
+            let mut label = None;
+            for key in rec.chunk_keys.iter().rev() {
+                if let Some(raw) = chunks.get(*key)? {
+                    let message: Message = serde_json::from_slice(raw.value())?;
+                    if message.role == crate::message::Role::User {
+                        let text = message.text();
+                        if !text.starts_with("<feather-runtime-diagnostic>")
+                            && !text.starts_with("## Conversation summary")
+                        {
+                            label = Some(text.chars().take(180).collect::<String>());
+                            break;
+                        }
+                    }
+                }
+            }
+            labels.push((
+                turn.value(),
+                label.unwrap_or_else(|| "Context checkpoint".into()),
+            ));
+        }
+        Ok(labels)
     }
     /// Highest turn number with a snapshot (0 when fresh).
     pub fn latest_turn(&self) -> Result<u64, SnapshotError> {
@@ -257,6 +275,15 @@ impl SnapshotStore {
     /// (forward snapshots stay available until a divergent commit truncates
     /// them).
     pub fn set_current(&self, turn: u64) -> Result<(), SnapshotError> {
+        self.set_current_with_context(turn, true)
+    }
+    /// Move the context pointer without deleting forward snapshots. A new
+    /// prompt will truncate divergent future snapshots when it is committed.
+    pub fn set_current_with_context(
+        &self,
+        turn: u64,
+        _preserve_future: bool,
+    ) -> Result<(), SnapshotError> {
         let txn = self.db.begin_write()?;
         {
             let snaps = txn.open_table(SNAPSHOTS)?;

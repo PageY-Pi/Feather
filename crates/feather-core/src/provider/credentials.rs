@@ -17,13 +17,26 @@ pub struct ResolvedCredential {
 impl ResolvedCredential {
     pub fn request_headers(&self, req: &super::ChatRequest) -> Vec<(String, String)> {
         let mut headers = self.headers.clone();
-        if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("copilot-integration-id")) {
-            let initiator = if req.messages.last().is_some_and(|m| m.role != crate::message::Role::User) {
+        if headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("copilot-integration-id"))
+        {
+            let initiator = if req
+                .messages
+                .last()
+                .is_some_and(|m| m.role != crate::message::Role::User)
+            {
                 "agent"
-            } else { "user" };
+            } else {
+                "user"
+            };
             headers.push(("X-Initiator".into(), initiator.into()));
             headers.push(("Openai-Intent".into(), "conversation-edits".into()));
-            if req.messages.iter().any(|m| m.content.iter().any(|b| matches!(b, crate::message::ContentBlock::Image { .. }))) {
+            if req.messages.iter().any(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, crate::message::ContentBlock::Image { .. }))
+            }) {
                 headers.push(("Copilot-Vision-Request".into(), "true".into()));
             }
         }
@@ -48,7 +61,10 @@ pub struct CredentialSource {
 
 impl CredentialSource {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self { static_key: api_key.into(), resolver: None }
+        Self {
+            static_key: api_key.into(),
+            resolver: None,
+        }
     }
 
     pub fn with_resolver(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
@@ -61,7 +77,10 @@ impl CredentialSource {
             // Do not turn refresh errors into a fallback to another account.
             resolver.resolve().await
         } else {
-            Ok(ResolvedCredential { api_key: self.static_key.clone(), ..Default::default() })
+            Ok(ResolvedCredential {
+                api_key: self.static_key.clone(),
+                ..Default::default()
+            })
         }
     }
 }

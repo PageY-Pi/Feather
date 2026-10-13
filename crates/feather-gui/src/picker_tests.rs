@@ -3,12 +3,43 @@ use crate::*;
 
 #[test]
 fn slash_help_executes_locally_and_menu_lists_descriptions() {
-    let mut app=fixture();app.input="/".into();
-    let _=app.egui_ctx.clone().run(egui::RawInput {screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1160.0,820.0))),..Default::default()},|ctx|app.frame_ui(ctx));
-    let ctx=app.egui_ctx.clone();let output=ctx.run(egui::RawInput {screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1160.0,820.0))),..Default::default()},|ctx|app.frame_ui(ctx));
-    let texts:Vec<&str>=output.shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.job.text.as_str()),_=>None}).collect();
-    assert!(texts.iter().any(|s|s.contains("Commands")));assert!(texts.contains(&"/new"));
-    app.input="/help".into();app.submit();assert!(!app.running);assert!(app.agent.is_none());
+    let mut app = fixture();
+    app.input = "/".into();
+    let _ = app.egui_ctx.clone().run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1160.0, 820.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.frame_ui(ctx),
+    );
+    let ctx = app.egui_ctx.clone();
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1160.0, 820.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.frame_ui(ctx),
+    );
+    let texts: Vec<&str> = output
+        .shapes
+        .iter()
+        .filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(texts.iter().any(|s| s.contains("Commands")));
+    assert!(texts.contains(&"/new"));
+    app.input = "/help".into();
+    app.submit();
+    assert!(!app.running);
+    assert!(app.agent.is_none());
     assert!(app.rows.last().unwrap().text.contains("/rewind"));
 }
 
@@ -83,7 +114,10 @@ fn effort_options_follow_selected_model() {
         .unwrap(),
     );
     app.settings.model = "local/reasoner".into();
-    assert_eq!(app.effort_levels(), vec!["off", "low", "medium", "high", "xhigh", "max"]);
+    assert_eq!(
+        app.effort_levels(),
+        vec!["off", "low", "medium", "high", "xhigh", "max"]
+    );
     app.settings.model = "local/plain".into();
     assert_eq!(app.effort_levels(), vec!["off"]);
 }
@@ -160,15 +194,44 @@ fn session_info(id: &str, prompt: &str) -> feather_core::session_catalog::Sessio
 
 #[test]
 fn session_pointer_hover_moves_highlight_without_resuming() {
-    let ctx=egui::Context::default();let mut open=true;
-    let mut picker=sessions::SessionChooser::new(vec![session_info("s1","first"),session_info("s2","second")]);
-    let input=|events|egui::RawInput {screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1160.0,820.0))),events,..Default::default()};
-    let mut pick=None;
-    let _=ctx.run(input(vec![]),|ctx|pick=sessions::picker_window(ctx,&mut picker,&mut open));
-    let output=ctx.run(input(vec![]),|ctx|pick=sessions::picker_window(ctx,&mut picker,&mut open));
-    let pos=output.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()=="second"=>Some(t.pos+t.galley.mesh_bounds.center().to_vec2()),_=>None}).unwrap();
-    for _ in 0..2 {let _=ctx.run(input(vec![egui::Event::PointerMoved(pos)]),|ctx|pick=sessions::picker_window(ctx,&mut picker,&mut open));}
-    assert_eq!(picker.active_row(),2);assert!(pick.is_none());
+    let ctx = egui::Context::default();
+    let mut open = true;
+    let mut picker = sessions::SessionChooser::new(vec![
+        session_info("s1", "first"),
+        session_info("s2", "second"),
+    ]);
+    let input = |events| egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1160.0, 820.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    let mut pick = None;
+    let _ = ctx.run(input(vec![]), |ctx| {
+        pick = sessions::picker_window(ctx, &mut picker, &mut open)
+    });
+    let output = ctx.run(input(vec![]), |ctx| {
+        pick = sessions::picker_window(ctx, &mut picker, &mut open)
+    });
+    let pos = output
+        .shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.text() == "second" => {
+                Some(t.pos + t.galley.mesh_bounds.center().to_vec2())
+            }
+            _ => None,
+        })
+        .unwrap();
+    for _ in 0..2 {
+        let _ = ctx.run(input(vec![egui::Event::PointerMoved(pos)]), |ctx| {
+            pick = sessions::picker_window(ctx, &mut picker, &mut open)
+        });
+    }
+    assert_eq!(picker.active_row(), 2);
+    assert!(pick.is_none());
 }
 
 #[test]

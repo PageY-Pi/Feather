@@ -12,8 +12,8 @@ pub mod file_snapshots;
 pub mod gitckpt;
 pub mod message;
 pub mod process;
-pub mod records;
 pub mod provider;
+pub mod records;
 pub mod session;
 pub mod session_catalog;
 pub mod session_store;
@@ -21,6 +21,7 @@ pub mod snapshot;
 pub mod substore;
 pub mod tokenizer;
 pub mod tool;
+pub mod workspace_path;
 
 pub use agent::{Agent, AgentConfig, AgentEvent, RunResult};
 pub use message::{ContentBlock, Message, Role, StopReason, ToolCall, Usage};

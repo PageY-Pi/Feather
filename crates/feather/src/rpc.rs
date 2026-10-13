@@ -86,7 +86,10 @@ fn available_thinking_levels(agent: &Agent) -> Vec<String> {
             return models::thinking_levels(m, p);
         }
     }
-    models::DEFAULT_EFFORTS.iter().map(|s|s.to_string()).collect()
+    models::DEFAULT_EFFORTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 /// Thinking levels from a cached model object; used while a run owns the agent.
 fn levels_for_model(model: &Value) -> Vec<String> {
@@ -101,7 +104,12 @@ fn levels_for_model(model: &Value) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| models::DEFAULT_EFFORTS.iter().map(|s|s.to_string()).collect())
+        .unwrap_or_else(|| {
+            models::DEFAULT_EFFORTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
 }
 fn clamp_level(agent: &Agent, level: ThinkingLevel) -> ThinkingLevel {
     if let Some(cat) = models::load() {
@@ -593,7 +601,7 @@ impl EventMapper {
                     json!({"type":"message_end","message":message}),
                 ]
             }
-            AgentEvent::AuditCommitted{..}=>Vec::new(),
+            AgentEvent::AuditCommitted { .. } => Vec::new(),
             AgentEvent::TurnEnd(_) => vec![
                 json!({"type":"turn_end","message":self.last_message,"toolResults":self.tool_results}),
             ],
@@ -910,8 +918,9 @@ async fn execute_bash(
     tx: tokio::sync::mpsc::UnboundedSender<BashMsg>,
     mut abort: tokio::sync::watch::Receiver<bool>,
 ) {
-    if let Err(error)=crate::command_policy::check(&command) {
-        let _=tx.send(BashMsg::Done(json!({"output":error,"exitCode":126,"cancelled":false,"truncated":false,"illegal":true})));return;
+    if let Err(error) = crate::command_policy::check(&command) {
+        let _=tx.send(BashMsg::Done(json!({"output":error,"exitCode":126,"cancelled":false,"truncated":false,"illegal":true})));
+        return;
     }
     let runtime = match crate::shell::BashRuntime::discover() {
         Ok(runtime) => runtime,

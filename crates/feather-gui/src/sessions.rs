@@ -122,10 +122,12 @@ impl SessionChooser {
             error: None,
         }
     }
-    pub fn request_delete(&mut self,row:usize) {
-        if let Some(index)=self.session_at_row(row) {self.pending_delete=Some(self.sessions[index].dir.clone());}
+    pub fn request_delete(&mut self, row: usize) {
+        if let Some(index) = self.session_at_row(row) {
+            self.pending_delete = Some(self.sessions[index].dir.clone());
+        }
     }
-    pub fn confirm_delete(&mut self)->Option<Pick> {
+    pub fn confirm_delete(&mut self) -> Option<Pick> {
         self.pending_delete.take().map(Pick::Delete)
     }
 
@@ -227,11 +229,15 @@ pub fn picker_window(
         .default_width(520.0)
         .show(ctx, |ui| {
             ui.label(
-                egui::RichText::new("Type to search · ↑ / ↓ choose · Enter opens · Del deletes · Esc closes")
-                    .size(12.5)
-                    .color(MUTED),
+                egui::RichText::new(
+                    "Type to search · ↑ / ↓ choose · Enter opens · Del deletes · Esc closes",
+                )
+                .size(12.5)
+                .color(MUTED),
             );
-            if chooser.pending_delete.is_none() && ui.input_mut(|i|i.consume_key(egui::Modifiers::NONE,egui::Key::Delete)) {
+            if chooser.pending_delete.is_none()
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+            {
                 chooser.request_delete(chooser.active_row());
             }
             ui.add_sized(
@@ -253,7 +259,9 @@ pub fn picker_window(
                 if up {
                     chooser.move_cursor(-1);
                 }
-                if chooser.pending_delete.is_none() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                if chooser.pending_delete.is_none()
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                {
                     pick = Some(chooser.selected_pick());
                 }
             }
@@ -293,10 +301,23 @@ pub fn picker_window(
                         if selected && (down || up) {
                             response.scroll_to_me(Some(egui::Align::Center));
                         }
-                        let hit=ui.interact(response.rect, ui.id().with(row), egui::Sense::click());
+                        let hit =
+                            ui.interact(response.rect, ui.id().with(row), egui::Sense::click());
                         if chooser.pending_delete.is_none() && hit.hovered() {
-                            if ui.input(|i|i.events.iter().any(|e|matches!(e,egui::Event::PointerMoved(_)))){chooser.cursor=row;}
-                            if !selected {ui.painter().rect_stroke(response.rect,12.0,egui::Stroke::new(1.5_f32,crate::theme::TEAL));}
+                            if ui.input(|i| {
+                                i.events
+                                    .iter()
+                                    .any(|e| matches!(e, egui::Event::PointerMoved(_)))
+                            }) {
+                                chooser.cursor = row;
+                            }
+                            if !selected {
+                                ui.painter().rect_stroke(
+                                    response.rect,
+                                    12.0,
+                                    egui::Stroke::new(1.5_f32, crate::theme::TEAL),
+                                );
+                            }
                         }
                         if chooser.pending_delete.is_none() && hit.clicked() {
                             chooser.cursor = row;
@@ -306,13 +327,22 @@ pub fn picker_window(
                 });
             if chooser.pending_delete.is_some() {
                 ui.separator();
-                ui.colored_label(crate::theme::RED,"Permanently delete this session and its history?");
+                ui.colored_label(
+                    crate::theme::RED,
+                    "Permanently delete this session and its history?",
+                );
                 ui.horizontal(|ui| {
-                    if ui.button("Confirm delete").clicked(){pick=chooser.confirm_delete();}
-                    if ui.button("Cancel").clicked(){chooser.pending_delete=None;}
+                    if ui.button("Confirm delete").clicked() {
+                        pick = chooser.confirm_delete();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        chooser.pending_delete = None;
+                    }
                 });
             }
-            if let Some(e)=&chooser.error {ui.colored_label(crate::theme::RED,e);}
+            if let Some(e) = &chooser.error {
+                ui.colored_label(crate::theme::RED, e);
+            }
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("Clicking a row resumes it; closing keeps the welcome fresh.")
@@ -330,15 +360,23 @@ mod tests {
 
     #[test]
     fn deletion_requires_request_and_confirmation_and_respects_filter() {
-        let mut chooser=chooser();
+        let mut chooser = chooser();
         assert!(chooser.confirm_delete().is_none());
-        chooser.request_delete(NEW_ROW);assert!(chooser.pending_delete.is_none());
-        chooser.set_filter("docs");chooser.request_delete(1);
-        assert_eq!(chooser.pending_delete,Some(PathBuf::from("sessions/s-middle")));
-        assert_eq!(chooser.confirm_delete(),Some(Pick::Delete(PathBuf::from("sessions/s-middle"))));
+        chooser.request_delete(NEW_ROW);
+        assert!(chooser.pending_delete.is_none());
+        chooser.set_filter("docs");
+        chooser.request_delete(1);
+        assert_eq!(
+            chooser.pending_delete,
+            Some(PathBuf::from("sessions/s-middle"))
+        );
+        assert_eq!(
+            chooser.confirm_delete(),
+            Some(Pick::Delete(PathBuf::from("sessions/s-middle")))
+        );
         assert!(chooser.confirm_delete().is_none());
         // Request is an intent only: nothing removed before the app confirms IO.
-        assert_eq!(chooser.sessions.len(),3);
+        assert_eq!(chooser.sessions.len(), 3);
     }
     fn info(id: &str, prompt: &str, modified_ms: u128) -> SessionInfo {
         SessionInfo {

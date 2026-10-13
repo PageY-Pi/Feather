@@ -83,7 +83,10 @@ pub fn serialize_conversation(messages: &[Message], budget: usize) -> String {
 }
 
 /// Borrowed serializer shared by callers that filter without cloning messages.
-pub fn serialize_messages<'a>(messages: impl IntoIterator<Item = &'a Message>, budget: usize) -> String {
+pub fn serialize_messages<'a>(
+    messages: impl IntoIterator<Item = &'a Message>,
+    budget: usize,
+) -> String {
     let mut out = String::new();
     for m in messages {
         match m.role {
@@ -130,15 +133,28 @@ pub fn serialize_messages<'a>(messages: impl IntoIterator<Item = &'a Message>, b
 
 /// Strip model reasoning from compacted model context only. Never mutate the
 /// durable raw audit messages, which power visible thinking cards and rewind.
-pub fn without_thinking(messages:&[Message])->Vec<Message> {
-    messages.iter().map(|m|Message {
-        role: m.role,
-        content: m.content.iter().filter(|b|!matches!(b,ContentBlock::Thinking{..})).cloned().collect(),
-        tool_call_id: m.tool_call_id.clone(), tool_name: m.tool_name.clone(),
-        is_error: m.is_error, model: m.model.clone(), api: m.api,
-        usage: m.usage, stop_reason: m.stop_reason, timestamp: m.timestamp,
-        shrink: m.shrink.clone(),
-    }).collect()
+pub fn without_thinking(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| Message {
+            role: m.role,
+            content: m
+                .content
+                .iter()
+                .filter(|b| !matches!(b, ContentBlock::Thinking { .. }))
+                .cloned()
+                .collect(),
+            tool_call_id: m.tool_call_id.clone(),
+            tool_name: m.tool_name.clone(),
+            is_error: m.is_error,
+            model: m.model.clone(),
+            api: m.api,
+            usage: m.usage,
+            stop_reason: m.stop_reason,
+            timestamp: m.timestamp,
+            shrink: m.shrink.clone(),
+        })
+        .collect()
 }
 /// Find the cut point: the index of the first message of the kept span.
 ///
@@ -147,12 +163,24 @@ pub fn without_thinking(messages:&[Message])->Vec<Message> {
 /// span) so tool results are never separated from their calls, and whole
 /// turns stay intact (线性上下文 turn 粒度).
 pub fn plan_cut(messages: &[Message], keep_recent_tokens: u64) -> usize {
-    plan_cut_with(messages, keep_recent_tokens, tokenizer::estimate_message_tokens)
+    plan_cut_with(
+        messages,
+        keep_recent_tokens,
+        tokenizer::estimate_message_tokens,
+    )
 }
-pub fn plan_cut_without_thinking(messages:&[Message],keep_recent_tokens:u64)->usize {
-    plan_cut_with(messages,keep_recent_tokens,tokenizer::estimate_message_tokens_without_thinking)
+pub fn plan_cut_without_thinking(messages: &[Message], keep_recent_tokens: u64) -> usize {
+    plan_cut_with(
+        messages,
+        keep_recent_tokens,
+        tokenizer::estimate_message_tokens_without_thinking,
+    )
 }
-fn plan_cut_with(messages:&[Message],keep_recent_tokens:u64,estimate:fn(&Message)->u64)->usize {
+fn plan_cut_with(
+    messages: &[Message],
+    keep_recent_tokens: u64,
+    estimate: fn(&Message) -> u64,
+) -> usize {
     if messages.is_empty() {
         return 0;
     }
@@ -182,11 +210,14 @@ fn plan_cut_with(messages:&[Message],keep_recent_tokens:u64,estimate:fn(&Message
     // A newly appended user prompt can consume the entire recent-token budget.
     // Do not summarize away the latest completed answer (and its whole user/tool
     // span), which callers still need to display/reopen while that prompt runs.
-    if let Some(last_answer) = messages.iter().rposition(|m| {
-        m.role == Role::Assistant && m.iter_tool_calls().next().is_none()
-    }) {
-        let span_start = messages[..=last_answer].iter()
-            .rposition(|m| m.role == Role::User).unwrap_or(0);
+    if let Some(last_answer) = messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && m.iter_tool_calls().next().is_none())
+    {
+        let span_start = messages[..=last_answer]
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .unwrap_or(0);
         cut = cut.min(span_start);
     }
     cut
@@ -195,11 +226,19 @@ fn plan_cut_with(messages:&[Message],keep_recent_tokens:u64,estimate:fn(&Message
 /// Actual character count of model-context payloads (not UTF-8 bytes). Images
 /// are not shortened by compaction and are excluded from character savings.
 pub fn context_characters(messages: &[Message]) -> usize {
-    messages.iter().flat_map(|m| &m.content).map(|block| match block {
-        ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => text.chars().count(),
-        ContentBlock::ToolCall(call) => call.name.chars().count() + call.arguments.to_string().chars().count(),
-        ContentBlock::Image { .. } => 0,
-    }).sum()
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .map(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => {
+                text.chars().count()
+            }
+            ContentBlock::ToolCall(call) => {
+                call.name.chars().count() + call.arguments.to_string().chars().count()
+            }
+            ContentBlock::Image { .. } => 0,
+        })
+        .sum()
 }
 /// Apply kept-span shrinking in place: tool results outside the newest
 /// `keep_last_turns_unshrunk` turns and over budget are replaced by their
@@ -313,22 +352,63 @@ pub fn summary_message(summary: &str, reads: &[String], writes: &[String]) -> Me
 mod tests {
     #[test]
     fn borrowed_cut_without_reasoning_matches_sanitized_cut() {
-        let mut messages=Vec::new();
+        let mut messages = Vec::new();
         for n in 0..12 {
             messages.push(Message::user_text(format!("request {n}")));
-            messages.push(Message::assistant(vec![ContentBlock::Thinking{text:"private reasoning".repeat(1000),signature:None},ContentBlock::Text{text:"answer".into()}],"m",crate::message::Api::Faux,crate::message::Usage::default(),crate::message::StopReason::Stop));
+            messages.push(Message::assistant(
+                vec![
+                    ContentBlock::Thinking {
+                        text: "private reasoning".repeat(1000),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                ],
+                "m",
+                crate::message::Api::Faux,
+                crate::message::Usage::default(),
+                crate::message::StopReason::Stop,
+            ));
         }
-        let clean=without_thinking(&messages);
-        for budget in [0,10,100,10000] {assert_eq!(plan_cut_without_thinking(&messages,budget),plan_cut(&clean,budget));}
-        assert_eq!(serialize_messages(messages.iter(),2000),serialize_conversation(&clean,2000));
+        let clean = without_thinking(&messages);
+        for budget in [0, 10, 100, 10000] {
+            assert_eq!(
+                plan_cut_without_thinking(&messages, budget),
+                plan_cut(&clean, budget)
+            );
+        }
+        assert_eq!(
+            serialize_messages(messages.iter(), 2000),
+            serialize_conversation(&clean, 2000)
+        );
     }
 
     #[test]
-    fn summary_and_kept_context_exclude_reasoning_but_raw_is_unchanged(){
-        let mut answer=Message::assistant(Vec::new(),"synthetic",crate::message::Api::Faux,crate::message::Usage::default(),crate::message::StopReason::Stop);answer.content.push(ContentBlock::Thinking{text:"PRIVATE MODEL REASONING".into(),signature:None});answer.content.push(ContentBlock::Text{text:"final answer".into()});
-        let raw=vec![Message::user_text("request"),answer];let input=serialize_conversation(&raw,2000);
-        assert!(!input.contains("PRIVATE MODEL REASONING"));assert!(input.contains("final answer"));
-        let kept=without_thinking(&raw);assert!(kept[1].thinking().is_empty());assert_eq!(kept[1].text(),"final answer");assert_eq!(raw[1].thinking(),"PRIVATE MODEL REASONING");assert_eq!(kept[1].timestamp,raw[1].timestamp);
+    fn summary_and_kept_context_exclude_reasoning_but_raw_is_unchanged() {
+        let mut answer = Message::assistant(
+            Vec::new(),
+            "synthetic",
+            crate::message::Api::Faux,
+            crate::message::Usage::default(),
+            crate::message::StopReason::Stop,
+        );
+        answer.content.push(ContentBlock::Thinking {
+            text: "PRIVATE MODEL REASONING".into(),
+            signature: None,
+        });
+        answer.content.push(ContentBlock::Text {
+            text: "final answer".into(),
+        });
+        let raw = vec![Message::user_text("request"), answer];
+        let input = serialize_conversation(&raw, 2000);
+        assert!(!input.contains("PRIVATE MODEL REASONING"));
+        assert!(input.contains("final answer"));
+        let kept = without_thinking(&raw);
+        assert!(kept[1].thinking().is_empty());
+        assert_eq!(kept[1].text(), "final answer");
+        assert_eq!(raw[1].thinking(), "PRIVATE MODEL REASONING");
+        assert_eq!(kept[1].timestamp, raw[1].timestamp);
     }
     use super::*;
     use crate::message::{Api, StopReason, Usage};

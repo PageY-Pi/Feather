@@ -138,7 +138,11 @@ fn long_thinking_scroll_and_cache_eviction_preserve_measured_geometry() {
     assert!(!geometry(&a).is_empty());
     cards::clear_layout_ring_for_test(&h.ctx);
     let c = h.idle();
-    assert_eq!(geometry(&a),geometry(&c),"eviction cannot move already visible text");
+    assert_eq!(
+        geometry(&a),
+        geometry(&c),
+        "eviction cannot move already visible text"
+    );
     let d = h.idle();
     assert_eq!(
         geometry(&c),

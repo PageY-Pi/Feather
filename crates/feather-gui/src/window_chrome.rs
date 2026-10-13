@@ -28,10 +28,21 @@ pub fn control(ui: &mut egui::Ui, rect: egui::Rect, control: Control) -> egui::R
         Control::Close => "Close",
     };
     let response = ui.interact(rect, control_id(ui, control), egui::Sense::click());
-    if std::env::var("FEATHER_UI_PREVIEW").ok().as_deref()==Some("1") {
-        if let Ok(dir)=std::env::var("FEATHER_UI_PREVIEW_RENDERER_HITS") {
-            let _=std::fs::create_dir_all(&dir);
-            let _=std::fs::write(std::path::Path::new(&dir).join(format!("{label}.txt")),format!("{} {} ppp={} pointer={:?} hover={} clicked={}",rect.center().x,rect.center().y,ui.ctx().pixels_per_point(),ui.input(|i|i.pointer.latest_pos()),response.hovered(),response.clicked()));
+    if std::env::var("FEATHER_UI_PREVIEW").ok().as_deref() == Some("1") {
+        if let Ok(dir) = std::env::var("FEATHER_UI_PREVIEW_RENDERER_HITS") {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("{label}.txt")),
+                format!(
+                    "{} {} ppp={} pointer={:?} hover={} clicked={}",
+                    rect.center().x,
+                    rect.center().y,
+                    ui.ctx().pixels_per_point(),
+                    ui.input(|i| i.pointer.latest_pos()),
+                    response.hovered(),
+                    response.clicked()
+                ),
+            );
         }
     }
     if response.hovered() && ui.input(|i| i.pointer.time_since_last_movement() > 0.5) {
@@ -145,7 +156,7 @@ pub fn add_api(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
     };
     let p = ui.painter();
     p.rect_filled(rect, 11.0, fill);
-    p.rect_stroke(rect,11.0,egui::Stroke::new(1.0_f32,crate::theme::BORDER));
+    p.rect_stroke(rect, 11.0, egui::Stroke::new(1.0_f32, crate::theme::BORDER));
     if response.has_focus() {
         p.rect_stroke(rect, 11.0, egui::Stroke::new(1.0_f32, crate::theme::TEAL));
     }
@@ -165,7 +176,7 @@ pub fn add_api(ui: &mut egui::Ui, rect: egui::Rect) -> egui::Response {
 pub fn round_native_window(window: &impl raw_window_handle::HasWindowHandle) {
     #[cfg(windows)]
     {
-        use raw_window_handle::{RawWindowHandle};
+        use raw_window_handle::RawWindowHandle;
         if let Ok(handle) = window.window_handle() {
             if let RawWindowHandle::Win32(win) = handle.as_raw() {
                 let preference = 2u32; // DWMWCP_ROUND

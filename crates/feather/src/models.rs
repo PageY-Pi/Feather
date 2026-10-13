@@ -120,7 +120,10 @@ pub const COMPACTION_DOC: &str = "compaction-model";
 /// Feather reads its own model configuration; importing another agent's catalog is explicit.
 pub fn load_compaction_model() -> Option<CompactionModel> {
     let home = config::feather_home();
-    crate::config_store::read(&home,COMPACTION_DOC).ok().flatten().and_then(|value|serde_json::from_value(value).ok())
+    crate::config_store::read(&home, COMPACTION_DOC)
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 /// Persist the compaction-model choice as a redb document (no JSON at runtime).
@@ -132,20 +135,47 @@ fn write_compaction_model(home: &std::path::Path, cm: &CompactionModel) -> std::
     )
 }
 
-pub const DEFAULT_EFFORTS: [&str;6] = ["off","low","medium","high","xhigh","max"];
+pub const DEFAULT_EFFORTS: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
 pub fn thinking_levels(model: &ModelEntry, _provider: &ProviderEntry) -> Vec<String> {
-    if model.reasoning_not_supported {vec!["off".into()]}
-    else {DEFAULT_EFFORTS.iter().map(|s|s.to_string()).collect()}
+    if model.reasoning_not_supported {
+        vec!["off".into()]
+    } else {
+        DEFAULT_EFFORTS.iter().map(|s| s.to_string()).collect()
+    }
 }
-fn apply_manual_effort(catalog:&mut ModelsFile) {
+fn apply_manual_effort(catalog: &mut ModelsFile) {
     for p in catalog.providers.values_mut() {
-        if let Some(v)=p.compat.as_mut(){crate::config_store::strip_effort_presets(v);}
+        if let Some(v) = p.compat.as_mut() {
+            crate::config_store::strip_effort_presets(v);
+        }
         for m in &mut p.models {
-            if let Some(v)=m.compat.as_mut(){crate::config_store::strip_effort_presets(v);}
-            m.reasoning=!m.reasoning_not_supported;
-            let levels=if m.reasoning_not_supported {vec!["off".into()]} else {DEFAULT_EFFORTS.iter().map(|s|s.to_string()).collect::<Vec<_>>()};
-            let map=feather_core::provider::compat::THINKING_LEVELS.iter().map(|l|((*l).to_string(),if levels.iter().any(|v|v==l){serde_json::json!(l)}else{serde_json::Value::Null})).collect::<serde_json::Map<_,_>>();
-            m.thinking_levels=Some(levels);m.thinking_level_map=Some(serde_json::Value::Object(map));
+            if let Some(v) = m.compat.as_mut() {
+                crate::config_store::strip_effort_presets(v);
+            }
+            m.reasoning = !m.reasoning_not_supported;
+            let levels = if m.reasoning_not_supported {
+                vec!["off".into()]
+            } else {
+                DEFAULT_EFFORTS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            };
+            let map = feather_core::provider::compat::THINKING_LEVELS
+                .iter()
+                .map(|l| {
+                    (
+                        (*l).to_string(),
+                        if levels.iter().any(|v| v == l) {
+                            serde_json::json!(l)
+                        } else {
+                            serde_json::Value::Null
+                        },
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            m.thinking_levels = Some(levels);
+            m.thinking_level_map = Some(serde_json::Value::Object(map));
         }
     }
 }
@@ -181,9 +211,14 @@ fn builtin_catalog() -> Option<&'static ModelsFile> {
 }
 
 fn merge_catalogs(builtin: &ModelsFile, user: ModelsFile) -> ModelsFile {
-    let mut merged = ModelsFile { providers: builtin.providers.iter()
-        .filter(|(id,_)|!user.providers.contains_key(*id))
-        .map(|(id,p)|(id.clone(),p.clone())).collect() };
+    let mut merged = ModelsFile {
+        providers: builtin
+            .providers
+            .iter()
+            .filter(|(id, _)| !user.providers.contains_key(*id))
+            .map(|(id, p)| (id.clone(), p.clone()))
+            .collect(),
+    };
     for (id, mut user_provider) in user.providers {
         if let Some(builtin_provider) = builtin.providers.get(&id) {
             if user_provider.base_url.is_none() {
@@ -213,7 +248,10 @@ pub fn load() -> Option<ModelsFile> {
 }
 pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
     let mut value = crate::config_store::read(home, "models").ok().flatten()?;
-    let deleted = value.get_mut("deletedModels").map(serde_json::Value::take).unwrap_or_default();
+    let deleted = value
+        .get_mut("deletedModels")
+        .map(serde_json::Value::take)
+        .unwrap_or_default();
     let user = serde_json::from_value::<ModelsFile>(value).ok();
     let mut catalog = match (builtin_catalog(), user) {
         (Some(b), Some(u)) => merge_catalogs(b, u),
@@ -224,7 +262,9 @@ pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
     if let Some(deleted) = deleted.as_array() {
         for item in deleted.iter().filter_map(|v| v.as_str()) {
             if let Some((pid, id)) = item.split_once('/') {
-                if let Some(p) = catalog.providers.get_mut(pid) { p.models.retain(|m| m.id != id); }
+                if let Some(p) = catalog.providers.get_mut(pid) {
+                    p.models.retain(|m| m.id != id);
+                }
             }
         }
     }
@@ -234,20 +274,28 @@ pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
 
 /// Persisted models only, with routing defaults resolved. Do not fetch the
 /// thousands of bundled models merely because a provider credential exists.
-pub fn saved_for(home:&std::path::Path)->std::io::Result<ModelsFile> {
-    let value=crate::config_store::read(home,"models")?.unwrap_or_else(||serde_json::json!({}));
-    let all=load_for(home).ok_or_else(||std::io::Error::other("model catalog unavailable"))?;
-    let mut providers=BTreeMap::new();
-    if let Some(saved)=value["providers"].as_object() {
-        for (pid,entry) in saved {
-            if let Some(p)=all.providers.get(pid) {
-                let ids:std::collections::BTreeSet<&str>=entry["models"].as_array().into_iter().flatten().filter_map(|m|m["id"].as_str()).collect();
-                let mut p=p.clone();p.models.retain(|m|ids.contains(m.id.as_str()));
-                if !p.models.is_empty(){providers.insert(pid.clone(),p);}
+pub fn saved_for(home: &std::path::Path) -> std::io::Result<ModelsFile> {
+    let value = crate::config_store::read(home, "models")?.unwrap_or_else(|| serde_json::json!({}));
+    let all = load_for(home).ok_or_else(|| std::io::Error::other("model catalog unavailable"))?;
+    let mut providers = BTreeMap::new();
+    if let Some(saved) = value["providers"].as_object() {
+        for (pid, entry) in saved {
+            if let Some(p) = all.providers.get(pid) {
+                let ids: std::collections::BTreeSet<&str> = entry["models"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| m["id"].as_str())
+                    .collect();
+                let mut p = p.clone();
+                p.models.retain(|m| ids.contains(m.id.as_str()));
+                if !p.models.is_empty() {
+                    providers.insert(pid.clone(), p);
+                }
             }
         }
     }
-    Ok(ModelsFile{providers})
+    Ok(ModelsFile { providers })
 }
 pub fn save(catalog: &ModelsFile) -> std::io::Result<()> {
     let value = serde_json::to_value(catalog).map_err(std::io::Error::other)?;
@@ -259,29 +307,48 @@ pub fn upsert_model(pid: &str, provider: ProviderEntry, model: ModelEntry) -> st
     let pv = serde_json::to_value(&provider).map_err(std::io::Error::other)?;
     let mv = serde_json::to_value(&model).map_err(std::io::Error::other)?;
     crate::config_store::update(&config::feather_home(), "models", |v| {
-        if !v["providers"].is_object() { v["providers"] = serde_json::json!({}); }
-        if !v["providers"][pid].is_object() { v["providers"][pid] = pv.clone(); }
+        if !v["providers"].is_object() {
+            v["providers"] = serde_json::json!({});
+        }
+        if !v["providers"][pid].is_object() {
+            v["providers"][pid] = pv.clone();
+        }
         let p = &mut v["providers"][pid];
         p["api"] = pv["api"].clone();
         p["baseUrl"] = pv["baseUrl"].clone();
         p["apiKey"] = pv["apiKey"].clone();
-        if !p["models"].is_array() { p["models"] = serde_json::json!([]); }
+        if !p["models"].is_array() {
+            p["models"] = serde_json::json!([]);
+        }
         let list = p["models"].as_array_mut().unwrap();
         list.retain(|m| m["id"].as_str() != Some(&model.id));
         list.push(mv);
-        if let Some(d) = v["deletedModels"].as_array_mut() { d.retain(|i| i.as_str() != Some(&format!("{pid}/{}", model.id))); }
+        if let Some(d) = v["deletedModels"].as_array_mut() {
+            d.retain(|i| i.as_str() != Some(&format!("{pid}/{}", model.id)));
+        }
     })
 }
 pub fn delete_model(pid: &str, id: &str) -> std::io::Result<()> {
-    delete_model_for(&config::feather_home(),pid,id)
+    delete_model_for(&config::feather_home(), pid, id)
 }
-pub fn delete_model_for(home:&std::path::Path,pid:&str,id:&str)->std::io::Result<()> {
+pub fn delete_model_for(home: &std::path::Path, pid: &str, id: &str) -> std::io::Result<()> {
     crate::config_store::update(home, "models", |v| {
-        if let Some(list) = v.get_mut("providers").and_then(|p|p.get_mut(pid)).and_then(|p|p.get_mut("models")).and_then(serde_json::Value::as_array_mut) { list.retain(|m| m["id"].as_str() != Some(id)); }
-        if !v["deletedModels"].is_array() { v["deletedModels"] = serde_json::json!([]); }
+        if let Some(list) = v
+            .get_mut("providers")
+            .and_then(|p| p.get_mut(pid))
+            .and_then(|p| p.get_mut("models"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            list.retain(|m| m["id"].as_str() != Some(id));
+        }
+        if !v["deletedModels"].is_array() {
+            v["deletedModels"] = serde_json::json!([]);
+        }
         let key = serde_json::json!(format!("{pid}/{id}"));
         let d = v["deletedModels"].as_array_mut().unwrap();
-        if !d.contains(&key) { d.push(key); }
+        if !d.contains(&key) {
+            d.push(key);
+        }
     })
 }
 /// Look a model up: `"provider/id"` form wins, otherwise the first provider
@@ -310,7 +377,9 @@ pub fn sync_from_pi() -> Option<CompactionModel> {
     let src = pi.join("models.json");
     if src.exists() {
         if let Ok(text) = std::fs::read_to_string(&src) {
-            if let Ok(catalog) = serde_json::from_str::<ModelsFile>(&text) { let _ = save(&catalog); }
+            if let Ok(catalog) = serde_json::from_str::<ModelsFile>(&text) {
+                let _ = save(&catalog);
+            }
         }
     }
     let cm = std::fs::read_to_string(pi.join("compaction-model.json")).ok()?;
@@ -326,18 +395,35 @@ mod tests {
 
     #[test]
     fn persisted_model_deletions_survive_reload_including_builtins() {
-        let home=std::env::temp_dir().join(feather_core::provider::gen_id("model-delete"));
-        let builtin=builtin_catalog().unwrap();
-        let (pid,p)=builtin.providers.iter().find(|(_,p)|!p.models.is_empty()).unwrap();
-        let id=&p.models[0].id;
-        assert!(load_for(&home).unwrap().providers[pid].models.iter().any(|m|&m.id==id));
-        delete_model_for(&home,pid,id).unwrap();
-        for _ in 0..2 { assert!(!load_for(&home).unwrap().providers[pid].models.iter().any(|m|&m.id==id)); }
-        crate::config_store::write(&home,"models",&serde_json::json!({"providers":{"custom":{"models":[{"id":"one"},{"id":"two"}]}}})).unwrap();
-        delete_model_for(&home,"custom","one").unwrap();
-        let cat=load_for(&home).unwrap();
-        assert_eq!(cat.providers["custom"].models.len(),1);
-        assert_eq!(cat.providers["custom"].models[0].id,"two");
+        let home = std::env::temp_dir().join(feather_core::provider::gen_id("model-delete"));
+        let builtin = builtin_catalog().unwrap();
+        let (pid, p) = builtin
+            .providers
+            .iter()
+            .find(|(_, p)| !p.models.is_empty())
+            .unwrap();
+        let id = &p.models[0].id;
+        assert!(load_for(&home).unwrap().providers[pid]
+            .models
+            .iter()
+            .any(|m| &m.id == id));
+        delete_model_for(&home, pid, id).unwrap();
+        for _ in 0..2 {
+            assert!(!load_for(&home).unwrap().providers[pid]
+                .models
+                .iter()
+                .any(|m| &m.id == id));
+        }
+        crate::config_store::write(
+            &home,
+            "models",
+            &serde_json::json!({"providers":{"custom":{"models":[{"id":"one"},{"id":"two"}]}}}),
+        )
+        .unwrap();
+        delete_model_for(&home, "custom", "one").unwrap();
+        let cat = load_for(&home).unwrap();
+        assert_eq!(cat.providers["custom"].models.len(), 1);
+        assert_eq!(cat.providers["custom"].models[0].id, "two");
         std::fs::remove_dir_all(home).unwrap();
     }
     #[test]
@@ -384,7 +470,10 @@ mod tests {
 
         let codex = cat.providers.get("openai-codex").unwrap();
         assert_eq!(codex.api.as_deref(), Some("openai-codex-responses"));
-        assert!(codex.models.iter().any(|m| m.api.as_deref() == Some("openai-codex-responses")));
+        assert!(codex
+            .models
+            .iter()
+            .any(|m| m.api.as_deref() == Some("openai-codex-responses")));
     }
 
     #[test]
@@ -398,7 +487,10 @@ mod tests {
             .collect();
         apis.sort_unstable();
         apis.dedup();
-        assert!(apis.len() > 1, "copilot catalog should carry per-model APIs");
+        assert!(
+            apis.len() > 1,
+            "copilot catalog should carry per-model APIs"
+        );
         assert!(apis.contains(&"anthropic-messages"));
         assert!(apis.contains(&"openai-responses"));
     }
@@ -407,26 +499,36 @@ mod tests {
     fn builtin_openrouter_preserves_per_model_base_urls() {
         let cat = builtin_catalog().unwrap();
         let openrouter = cat.providers.get("openrouter").unwrap();
-        assert_eq!(openrouter.base_url.as_deref(), Some("https://openrouter.ai/api"));
+        assert_eq!(
+            openrouter.base_url.as_deref(),
+            Some("https://openrouter.ai/api")
+        );
 
         let anthropic = openrouter
             .models
             .iter()
             .find(|m| m.api.as_deref() == Some("anthropic-messages"))
             .unwrap();
-        assert_eq!(anthropic.base_url.as_deref(), Some("https://openrouter.ai/api"));
+        assert_eq!(
+            anthropic.base_url.as_deref(),
+            Some("https://openrouter.ai/api")
+        );
 
         let completions = openrouter
             .models
             .iter()
             .find(|m| m.api.as_deref() == Some("openai-completions"))
             .unwrap();
-        assert_eq!(completions.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(
+            completions.base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
     }
 
     #[test]
     fn merge_preserves_custom_provider_and_fills_builtin_defaults() {
-        let builtin: ModelsFile = serde_json::from_str(r#"{
+        let builtin: ModelsFile = serde_json::from_str(
+            r#"{
           "providers": {
             "zai": {
               "baseUrl": "https://api.z.ai/api/coding/paas/v4",
@@ -435,7 +537,9 @@ mod tests {
               "models": [{ "id": "glm-5.3", "api": "openai-completions" }]
             }
           }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let user: ModelsFile = serde_json::from_str(r#"{
           "providers": {
             "zai": { "models": [{ "id": "custom-glm", "api": "anthropic-messages" }] },
@@ -445,7 +549,10 @@ mod tests {
 
         let merged = merge_catalogs(&builtin, user);
         let zai = merged.providers.get("zai").unwrap();
-        assert_eq!(zai.base_url.as_deref(), Some("https://api.z.ai/api/coding/paas/v4"));
+        assert_eq!(
+            zai.base_url.as_deref(),
+            Some("https://api.z.ai/api/coding/paas/v4")
+        );
         assert_eq!(zai.api.as_deref(), Some("openai-completions"));
         assert_eq!(zai.api_key.as_deref(), Some("$ZAI_API_KEY"));
         assert_eq!(zai.models.len(), 1);

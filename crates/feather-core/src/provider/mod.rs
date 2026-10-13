@@ -9,8 +9,8 @@ pub mod compat;
 pub mod credentials;
 pub mod faux;
 pub mod openai;
-pub mod responses;
 pub mod pi;
+pub mod responses;
 pub mod retry;
 pub mod transport;
 
@@ -197,7 +197,9 @@ impl ResponseStream {
     /// queue: earlier events stay deliverable, the error surfaces as Err
     /// once they drain.
     fn run_handler(&mut self, payload: &str) {
-        if self.pending_err.is_some() { return; }
+        if self.pending_err.is_some() {
+            return;
+        }
         (self.handler)(payload, &mut self.handler_events);
         for event in self.handler_events.drain(..) {
             match event {
@@ -214,7 +216,11 @@ impl ResponseStream {
         loop {
             // drain buffered events first
             if !self.parser.queue.is_empty() {
-                return Some(Ok(self.parser.queue.pop_front().expect("queue is nonempty")));
+                return Some(Ok(self
+                    .parser
+                    .queue
+                    .pop_front()
+                    .expect("queue is nonempty")));
             }
             if let Some(err) = self.pending_err.take() {
                 return Some(Err(err));
@@ -303,13 +309,17 @@ impl SseParser {
                 }
             } else if let Some(rest) = line.strip_prefix("data:") {
                 let rest = rest.strip_prefix(' ').unwrap_or(rest);
-                if !self.data.is_empty() { self.data.push('\n'); }
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
                 self.data.push_str(rest);
             }
             start = end + 1;
             search = start;
         }
-        if start > 0 { self.buf.drain(..start); }
+        if start > 0 {
+            self.buf.drain(..start);
+        }
         self.scanned = self.buf.len(); // don't rescan an unfinished long line
         out
     }
@@ -348,34 +358,56 @@ pub fn gen_id(prefix: &str) -> String {
     format!("{prefix}{:012x}{:04x}", t, c & 0xffff)
 }
 
-
 #[cfg(test)]
 mod tests {
     #[test]
     fn fragmented_utf8_crlf_and_many_lines_preserve_payload_order() {
-        let text="data: 羽毛\r\ndata: next\r\n\r\n";let bytes=text.as_bytes();
+        let text = "data: 羽毛\r\ndata: next\r\n\r\n";
+        let bytes = text.as_bytes();
         for cut in 0..=bytes.len() {
-            let mut parser=SseParser::new();let mut out=parser.feed(&bytes[..cut]);out.extend(parser.feed(&bytes[cut..]));out.extend(parser.finish());
-            assert_eq!(out,vec!["羽毛\nnext"]);
+            let mut parser = SseParser::new();
+            let mut out = parser.feed(&bytes[..cut]);
+            out.extend(parser.feed(&bytes[cut..]));
+            out.extend(parser.finish());
+            assert_eq!(out, vec!["羽毛\nnext"]);
         }
-        let mut parser=SseParser::new();let chunk=(0..10_000).map(|n|format!("data: {n}\n\n")).collect::<String>();
-        let out=parser.feed(chunk.as_bytes());assert_eq!(out.len(),10_000);
-        for (n,payload) in out.iter().enumerate(){assert_eq!(payload,&n.to_string());}
+        let mut parser = SseParser::new();
+        let chunk = (0..10_000)
+            .map(|n| format!("data: {n}\n\n"))
+            .collect::<String>();
+        let out = parser.feed(chunk.as_bytes());
+        assert_eq!(out.len(), 10_000);
+        for (n, payload) in out.iter().enumerate() {
+            assert_eq!(payload, &n.to_string());
+        }
         assert!(parser.finish().is_empty());
-        let mut parser=SseParser::new();let long=format!("data: {}","x".repeat(65536));
-        for chunk in long.as_bytes().chunks(7){assert!(parser.feed(chunk).is_empty());}
-        assert_eq!(parser.feed(b"\n\n"),vec!["x".repeat(65536)]);
+        let mut parser = SseParser::new();
+        let long = format!("data: {}", "x".repeat(65536));
+        for chunk in long.as_bytes().chunks(7) {
+            assert!(parser.feed(chunk).is_empty());
+        }
+        assert_eq!(parser.feed(b"\n\n"), vec!["x".repeat(65536)]);
     }
     #[tokio::test]
     async fn event_queue_is_fifo_and_fatal_ends_after_prior_events() {
-        let input=futures_util::stream::iter(vec![Ok(bytes::Bytes::from_static(b"data: first\n\ndata: fatal\n\ndata: ignored\n\n"))]);
-        let handler:EventHandler=Box::new(|payload,out|{
-            if payload=="fatal" {out.push(StreamEvent::FatalError("synthetic".into()));out.push(StreamEvent::TextDelta("also ignored".into()));}
-            else {out.push(StreamEvent::TextDelta(payload.into()));}
+        let input = futures_util::stream::iter(vec![Ok(bytes::Bytes::from_static(
+            b"data: first\n\ndata: fatal\n\ndata: ignored\n\n",
+        ))]);
+        let handler: EventHandler = Box::new(|payload, out| {
+            if payload == "fatal" {
+                out.push(StreamEvent::FatalError("synthetic".into()));
+                out.push(StreamEvent::TextDelta("also ignored".into()));
+            } else {
+                out.push(StreamEvent::TextDelta(payload.into()));
+            }
         });
-        let mut stream=ResponseStream::new(Box::pin(input),handler);
-        assert!(matches!(stream.next().await,Some(Ok(StreamEvent::TextDelta(ref text))) if text=="first"));
-        assert!(matches!(stream.next().await,Some(Err(ProviderError::Stream(ref text))) if text=="synthetic"));
+        let mut stream = ResponseStream::new(Box::pin(input), handler);
+        assert!(
+            matches!(stream.next().await,Some(Ok(StreamEvent::TextDelta(ref text))) if text=="first")
+        );
+        assert!(
+            matches!(stream.next().await,Some(Err(ProviderError::Stream(ref text))) if text=="synthetic")
+        );
         assert!(stream.next().await.is_none());
     }
     use super::*;

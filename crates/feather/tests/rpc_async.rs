@@ -327,9 +327,7 @@ async fn compact_same_length_replacement_refreshes_busy_snapshot() {
             "x".repeat(4_000)
         )))
         .unwrap();
-    session
-        .push(Message::user_text("kept next user"))
-        .unwrap();
+    session.push(Message::user_text("kept next user")).unwrap();
     session
         .push(Message::assistant(
             vec![ContentBlock::Text {
@@ -401,8 +399,9 @@ async fn compact_same_length_replacement_refreshes_busy_snapshot() {
         }
         assert!(records.iter().any(|r| r["type"] == "compaction_start"));
         assert!(records.iter().any(|r| r["type"] == "compaction_end"));
-        assert!(records.iter().any(|r| r["id"] == "c" && r["success"] == true));
-
+        assert!(records
+            .iter()
+            .any(|r| r["id"] == "c" && r["success"] == true));
 
         let end = records
             .iter()
@@ -497,13 +496,7 @@ fn leaked_summary_records(records: &[Value], marker: &str) -> Vec<Value> {
         .filter(|r| {
             matches!(
                 r["type"].as_str(),
-                Some(
-                    "message_start"
-                        | "message_update"
-                        | "message_end"
-                        | "turn_end"
-                        | "agent_end"
-                )
+                Some("message_start" | "message_update" | "message_end" | "turn_end" | "agent_end")
             )
         })
         .filter(|r| r.to_string().contains(marker))
@@ -617,7 +610,10 @@ async fn manual_compaction_replaces_prefix_with_summary_without_stream_leak() {
 
         // the summarization turn is not chat traffic
         let leaked = leaked_summary_records(&records, "summary text");
-        assert!(leaked.is_empty(), "summary leaked as message events: {leaked:?}");
+        assert!(
+            leaked.is_empty(),
+            "summary leaked as message events: {leaked:?}"
+        );
         assert!(
             !records.iter().any(|r| matches!(
                 r["type"].as_str(),

@@ -20,7 +20,9 @@ use thiserror::Error;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
 const PROBE_IO_TIMEOUT: Duration = Duration::from_millis(200);
-const DISCOVERY_PORTS: [u16; 10] = [12334, 7890, 7891, 7897, 1080, 10808, 10809, 8080, 8118, 8888];
+const DISCOVERY_PORTS: [u16; 10] = [
+    12334, 7890, 7891, 7897, 1080, 10808, 10809, 8080, 8118, 8888,
+];
 
 /// Process-local provider transport route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -142,13 +144,25 @@ pub fn discover() -> Vec<Endpoint> {
 }
 /// Probe explicitly supplied localhost listener ports (saved custom endpoints).
 /// Never scans LAN/remote addresses, and caps work to 128 distinct ports.
-pub fn discover_ports(ports:impl IntoIterator<Item=u16>)->Vec<Endpoint> {
-    let ports:Vec<_>=ports.into_iter().filter(|p|*p!=0).collect::<HashSet<_>>().into_iter().take(128).collect();
+pub fn discover_ports(ports: impl IntoIterator<Item = u16>) -> Vec<Endpoint> {
+    let ports: Vec<_> = ports
+        .into_iter()
+        .filter(|p| *p != 0)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .take(128)
+        .collect();
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
     for port in ports {
         if probe_socks5("127.0.0.1", port) {
-            push_endpoint(&mut endpoints, &mut seen, ProxyProtocol::Socks5, "127.0.0.1", port);
+            push_endpoint(
+                &mut endpoints,
+                &mut seen,
+                ProxyProtocol::Socks5,
+                "127.0.0.1",
+                port,
+            );
         }
         if probe_http_connect("127.0.0.1", port) {
             push_endpoint(
@@ -175,7 +189,6 @@ pub fn set_route(route: Route) {
         *current = route;
     }
 }
-
 
 pub fn set_direct() {
     set_route(Route::Direct);
@@ -252,9 +265,10 @@ pub(crate) async fn http_post_sse(
             body,
         });
     }
-    let inner: super::BoxStream = Box::pin(resp.bytes_stream().map(|r| {
-        r.map_err(|e| ProviderError::Http(e.to_string()))
-    }));
+    let inner: super::BoxStream = Box::pin(
+        resp.bytes_stream()
+            .map(|r| r.map_err(|e| ProviderError::Http(e.to_string()))),
+    );
     Ok(ResponseStream::new(inner, handler))
 }
 
@@ -361,7 +375,10 @@ fn probe_http_connect(host: &str, port: u16) -> bool {
     if !version.starts_with("HTTP/") {
         return false;
     }
-    let status = parts.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+    let status = parts
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
     matches!(status, 200 | 407 | 502 | 503)
 }
 
@@ -409,7 +426,9 @@ mod tests {
             let mut buf = [0_u8; 128];
             let _ = socket.read(&mut buf);
             socket
-                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
                 .unwrap();
         });
         assert!(probe_http_connect("127.0.0.1", http_port));

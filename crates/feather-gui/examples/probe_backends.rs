@@ -16,7 +16,10 @@ fn main() {
             println!("{name}: {} adapter(s)", adapters.len());
             for a in adapters {
                 let info = a.get_info();
-                println!("   backend={:?} name={} device={:?}", info.backend, info.name, info.device_type);
+                println!(
+                    "   backend={:?} name={} device={:?}",
+                    info.backend, info.name, info.device_type
+                );
             }
         }
     });

@@ -98,10 +98,15 @@ fn header_buttons_send_correct_commands_and_add_opens_model_editor() {
         let pos = egui::pos2(width - 30.0 - offset, 30.0);
         header_frame(&mut app, &ctx, width, maximized, click(pos, true));
         let out = header_frame(&mut app, &ctx, width, maximized, click(pos, false));
-        let out=if expected==egui::ViewportCommand::Close {
-            assert!(app.exit.is_some(),"header close must use the shared cancellation lifecycle");
-            ctx.run(Default::default(),|ctx|app.poll_exit(ctx))
-        }else{out};
+        let out = if expected == egui::ViewportCommand::Close {
+            assert!(
+                app.exit.is_some(),
+                "header close must use the shared cancellation lifecycle"
+            );
+            ctx.run(Default::default(), |ctx| app.poll_exit(ctx))
+        } else {
+            out
+        };
         assert!(
             out.viewport_output[&egui::ViewportId::ROOT]
                 .commands
@@ -283,8 +288,11 @@ fn header_focus_order_matches_visual_order_and_keyboard_activation_works() {
             egui::TopBottomPanel::top("focus-header").show(ctx, |ui| app.top_bar(ui));
         },
     );
-    assert!(app.exit.is_some(),"keyboard close must request cooperative cancellation");
-    let out=ctx.run(Default::default(),|ctx|app.poll_exit(ctx));
+    assert!(
+        app.exit.is_some(),
+        "keyboard close must request cooperative cancellation"
+    );
+    let out = ctx.run(Default::default(), |ctx| app.poll_exit(ctx));
     assert!(out.viewport_output[&egui::ViewportId::ROOT]
         .commands
         .contains(&egui::ViewportCommand::Close));

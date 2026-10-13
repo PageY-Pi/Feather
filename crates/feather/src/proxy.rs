@@ -56,9 +56,11 @@ impl Default for Catalog {
 
 // Data-only unit tests manipulate multiple synthetic homes concurrently with
 // OAuth HTTP fixtures. They must not change the process-wide real transport.
-fn apply_runtime_route(route:Route) {
-    #[cfg(not(test))] transport::set_route(route);
-    #[cfg(test)] let _=route;
+fn apply_runtime_route(route: Route) {
+    #[cfg(not(test))]
+    transport::set_route(route);
+    #[cfg(test)]
+    let _ = route;
 }
 
 /// Load the persisted proxy catalog. This does not scan ports or contact the
@@ -81,10 +83,17 @@ pub fn discover_now() -> Vec<Endpoint> {
 }
 /// Include saved custom local ports such as Hiddify's mixed listener. Only
 /// protocol-verified endpoints are persisted, never the REALITY remote config.
-pub fn discover_for(home:&Path)->Vec<Endpoint> {
-    let mut endpoints=discover_now();
-    let ports=load(home).entries.into_iter().filter(|e|matches!(e.endpoint.host.as_str(),"127.0.0.1"|"localhost"|"::1")).map(|e|e.endpoint.port);
-    endpoints.extend(transport::discover_ports(ports));endpoints.sort_by_key(|e|e.route.to_string());endpoints.dedup_by(|a,b|a.route==b.route);endpoints
+pub fn discover_for(home: &Path) -> Vec<Endpoint> {
+    let mut endpoints = discover_now();
+    let ports = load(home)
+        .entries
+        .into_iter()
+        .filter(|e| matches!(e.endpoint.host.as_str(), "127.0.0.1" | "localhost" | "::1"))
+        .map(|e| e.endpoint.port);
+    endpoints.extend(transport::discover_ports(ports));
+    endpoints.sort_by_key(|e| e.route.to_string());
+    endpoints.dedup_by(|a, b| a.route == b.route);
+    endpoints
 }
 
 /// Merge one scan's discovered endpoints into the persisted catalog.
@@ -197,7 +206,9 @@ pub fn remove(home: &Path, route: Route) -> Result<Catalog, String> {
     config_store::update(home, DOC_KEY, |doc| {
         ensure_object(doc);
         let mut catalog = catalog_from_value(doc);
-        catalog.entries.retain(|entry| entry.endpoint.route != route);
+        catalog
+            .entries
+            .retain(|entry| entry.endpoint.route != route);
         if catalog.selected == route {
             catalog.selected = Route::Direct;
         }
@@ -238,7 +249,9 @@ fn catalog_from_value(value: &Value) -> Catalog {
     if let Some(selected) = object.get("selected") {
         match route_from_value(selected) {
             Ok(route) => catalog.selected = route,
-            Err(e) => catalog.error = Some(format!("invalid stored proxy selection: {e}; using Direct")),
+            Err(e) => {
+                catalog.error = Some(format!("invalid stored proxy selection: {e}; using Direct"))
+            }
         }
     }
 
@@ -246,7 +259,10 @@ fn catalog_from_value(value: &Value) -> Catalog {
         for value in entries.iter().take(MAX_ENTRIES.saturating_mul(2)) {
             match entry_from_value(value) {
                 Ok(entry) => upsert_entry(&mut catalog.entries, entry),
-                Err(e) => append_errors(&mut catalog, vec![format!("ignored invalid proxy entry: {e}")]),
+                Err(e) => append_errors(
+                    &mut catalog,
+                    vec![format!("ignored invalid proxy entry: {e}")],
+                ),
             }
         }
     }
@@ -265,8 +281,14 @@ fn entry_from_value(value: &Value) -> Result<CatalogEntry, String> {
         .or_else(|| object.get("last_seen"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let active = object.get("active").and_then(Value::as_bool).unwrap_or(false);
-    let manual = object.get("manual").and_then(Value::as_bool).unwrap_or(false);
+    let active = object
+        .get("active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let manual = object
+        .get("manual")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok(CatalogEntry {
         endpoint,
         last_seen,
@@ -293,7 +315,8 @@ fn endpoint_from_value(value: &Value) -> Result<Endpoint, String> {
         endpoint.host = host.to_string();
     }
     if let Some(port) = object.get("port").and_then(Value::as_u64) {
-        endpoint.port = u16::try_from(port).map_err(|_| "endpoint port out of range".to_string())?;
+        endpoint.port =
+            u16::try_from(port).map_err(|_| "endpoint port out of range".to_string())?;
     }
     Ok(endpoint)
 }
@@ -401,14 +424,25 @@ fn compare_entries(a: &CatalogEntry, b: &CatalogEntry, selected: &Route) -> Orde
         .cmp(&a_selected)
         .then_with(|| b.active.cmp(&a.active))
         .then_with(|| b.last_seen.cmp(&a.last_seen))
-        .then_with(|| a.endpoint.route.to_string().cmp(&b.endpoint.route.to_string()))
+        .then_with(|| {
+            a.endpoint
+                .route
+                .to_string()
+                .cmp(&b.endpoint.route.to_string())
+        })
 }
 
-fn selected_local_missing(selected: &Route, entries: &[CatalogEntry], discovered: &[Route]) -> bool {
+fn selected_local_missing(
+    selected: &Route,
+    entries: &[CatalogEntry],
+    discovered: &[Route],
+) -> bool {
     if !route_is_loopback(selected) {
         return false;
     }
-    let known = entries.iter().any(|entry| entry.endpoint.route == *selected && !entry.manual);
+    let known = entries
+        .iter()
+        .any(|entry| entry.endpoint.route == *selected && !entry.manual);
     known && !discovered.iter().any(|route| route == selected)
 }
 
@@ -420,7 +454,10 @@ fn route_is_loopback(route: &Route) -> bool {
         return false;
     };
     parsed.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]" || host == "::1"
+        host.eq_ignore_ascii_case("localhost")
+            || host == "127.0.0.1"
+            || host == "[::1]"
+            || host == "::1"
     })
 }
 
@@ -502,8 +539,15 @@ mod tests {
         save_selection(&home, route).unwrap();
         merge_discovered(&home, Vec::<Endpoint>::new());
         assert_eq!(load(&home).selected, Route::Direct);
-        let manual=Route::proxy("socks5h://127.0.0.1:32001").unwrap();add_manual_route(&home,manual.clone()).unwrap();save_selection(&home,manual.clone()).unwrap();
-        merge_discovered(&home,Vec::<Endpoint>::new());assert_eq!(load(&home).selected,manual,"a scan of common ports must not clear a manually entered noncommon endpoint");
+        let manual = Route::proxy("socks5h://127.0.0.1:32001").unwrap();
+        add_manual_route(&home, manual.clone()).unwrap();
+        save_selection(&home, manual.clone()).unwrap();
+        merge_discovered(&home, Vec::<Endpoint>::new());
+        assert_eq!(
+            load(&home).selected,
+            manual,
+            "a scan of common ports must not clear a manually entered noncommon endpoint"
+        );
         fs::remove_dir_all(home).unwrap();
     }
 }

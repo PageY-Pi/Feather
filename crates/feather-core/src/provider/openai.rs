@@ -46,7 +46,10 @@ impl OpenAiProvider {
         self
     }
 
-    pub(crate) fn compaction_thinking(&self, active: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
+    pub(crate) fn compaction_thinking(
+        &self,
+        active: Option<ThinkingLevel>,
+    ) -> Option<ThinkingLevel> {
         super::compat::compaction_thinking(&self.compat, active)
     }
 
@@ -70,22 +73,22 @@ impl OpenAiProvider {
                     {
                         out.push(json!({ "role": "user", "content": m.text() }));
                     } else {
-                    let content: Vec<Value> = m
-                        .content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } if !text.is_empty() => {
-                                Some(json!({ "type": "text", "text": text }))
-                            }
-                            ContentBlock::Image { media_type, data } => Some(json!({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": format!("data:{media_type};base64,{data}"),
-                                },
-                            })),
-                            _ => None,
-                        })
-                        .collect();
+                        let content: Vec<Value> = m
+                            .content
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::Text { text } if !text.is_empty() => {
+                                    Some(json!({ "type": "text", "text": text }))
+                                }
+                                ContentBlock::Image { media_type, data } => Some(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{media_type};base64,{data}"),
+                                    },
+                                })),
+                                _ => None,
+                            })
+                            .collect();
                         out.push(json!({ "role": "user", "content": content }));
                     }
                 }

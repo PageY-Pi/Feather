@@ -6,12 +6,11 @@ use feather::wiring;
 use feather::{config, models};
 
 use config::Settings;
-use wiring::*;
 use feather_core::agent::{AgentEvent, RunResult};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
+use wiring::*;
 
 struct Cli {
     prompt: Option<String>,
@@ -92,32 +91,36 @@ fn retry_delay_label(ms: u64) -> String {
 #[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let cli = parse_cli();
-    let root=std::env::current_dir()?;
-    if cli.prompt.is_none()&&cli.mode!="rpc" {
-    // ---------------- interactive (sibling feather-gui) ------------------
-    // The interactive experience is a separate binary next to this one; hand
-    // it the working directory and wait for it to exit.
-    let gui = std::env::current_exe()?
-        .parent()
-        .map(|dir| {
-            dir.join(if cfg!(windows) {
-                "feather-gui.exe"
-            } else {
-                "feather-gui"
+    let root = std::env::current_dir()?;
+    if cli.prompt.is_none() && cli.mode != "rpc" {
+        // ---------------- interactive (sibling feather-gui) ------------------
+        // The interactive experience is a separate binary next to this one; hand
+        // it the working directory and wait for it to exit.
+        let gui = std::env::current_exe()?
+            .parent()
+            .map(|dir| {
+                dir.join(if cfg!(windows) {
+                    "feather-gui.exe"
+                } else {
+                    "feather-gui"
+                })
             })
-        })
-        .ok_or_else(|| anyhow::anyhow!("cannot locate feather-gui next to feather"))?;
-    let mut child = std::process::Command::new(gui).arg(&root).spawn()?;
-    let status = child.wait()?;
-    if !status.success() {
-        anyhow::bail!("feather-gui exited with {status}");
+            .ok_or_else(|| anyhow::anyhow!("cannot locate feather-gui next to feather"))?;
+        let mut child = std::process::Command::new(gui).arg(&root).spawn()?;
+        let status = child.wait()?;
+        if !status.success() {
+            anyhow::bail!("feather-gui exited with {status}");
+        }
+        return Ok(());
     }
-    return Ok(());
-    }
-    let proxy_home=config::feather_home();
+    let proxy_home = config::feather_home();
     feather::proxy::initialize(&proxy_home);
-    let proxy_scan_home=proxy_home.clone();
-    std::thread::spawn(move||{let found=feather::proxy::discover_for(&proxy_scan_home);let catalog=feather::proxy::merge_discovered(&proxy_scan_home,found);feather_core::provider::transport::set_route(catalog.selected);});
+    let proxy_scan_home = proxy_home.clone();
+    std::thread::spawn(move || {
+        let found = feather::proxy::discover_for(&proxy_scan_home);
+        let catalog = feather::proxy::merge_discovered(&proxy_scan_home, found);
+        feather_core::provider::transport::set_route(catalog.selected);
+    });
     let mut settings = Settings::load();
     settings.save_default_if_missing();
     // pull pi's model catalog + compaction-model choice (a missing pi install

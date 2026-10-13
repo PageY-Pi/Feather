@@ -16,41 +16,78 @@ pub struct ModelManager {
     pub context: String,
     pub tokens: String,
     pub error: Option<String>,
-    pub confirm_delete: Option<(String,String)>,
+    pub confirm_delete: Option<(String, String)>,
     cached_models: Option<models::ModelsFile>,
     cached_home: Option<std::path::PathBuf>,
     loaded_at: Option<std::time::Instant>,
 }
 pub enum Action {
-    Save(String,ProviderEntry,ModelEntry),
-    Delete(String,String),
+    Save(String, ProviderEntry, ModelEntry),
+    Delete(String, String),
 }
 impl ModelManager {
-    pub fn invalidate_catalog(&mut self) { self.loaded_at=None; }
-    fn refresh_catalog(&mut self,home:&std::path::Path) {
-        if self.cached_home.as_deref()!=Some(home) || self.loaded_at.map_or(true,|at|at.elapsed()>std::time::Duration::from_secs(5)) {
-            self.cached_models=models::saved_for(home).ok();
-            self.cached_home=Some(home.to_path_buf());
-            self.loaded_at=Some(std::time::Instant::now());
+    pub fn invalidate_catalog(&mut self) {
+        self.loaded_at = None;
+    }
+    fn refresh_catalog(&mut self, home: &std::path::Path) {
+        if self.cached_home.as_deref() != Some(home)
+            || self
+                .loaded_at
+                .map_or(true, |at| at.elapsed() > std::time::Duration::from_secs(5))
+        {
+            self.cached_models = models::saved_for(home).ok();
+            self.cached_home = Some(home.to_path_buf());
+            self.loaded_at = Some(std::time::Instant::now());
         }
     }
-    fn draft(&self) -> Result<Action,String> {
+    fn draft(&self) -> Result<Action, String> {
         let pid = self.provider.trim();
-        if pid.is_empty() || pid.contains('/') || !pid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c,'-'|'_')) { return Err("Provider ID must contain letters, digits, - or _, without slashes.".into()); }
+        if pid.is_empty()
+            || pid.contains('/')
+            || !pid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return Err(
+                "Provider ID must contain letters, digits, - or _, without slashes.".into(),
+            );
+        }
         let model = self.model.trim();
-        if model.is_empty() { return Err("Model ID is required (use the exact server model ID).".into()); }
-        let url = reqwest::Url::parse(self.base_url.trim()).map_err(|_| "Enter a valid base URL including /v1 if needed.".to_string())?;
-        if !matches!(url.scheme(),"http"|"https") || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() { return Err("Use an HTTP(S) base URL without embedded credentials, query or fragment.".into()); }
-        let number = |s:&str, default:u64| -> Result<u64,String> {
-            if s.trim().is_empty() { return Ok(default); }
-            s.trim().parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| "Token limits must be positive integers.".into())
+        if model.is_empty() {
+            return Err("Model ID is required (use the exact server model ID).".into());
+        }
+        let url = reqwest::Url::parse(self.base_url.trim())
+            .map_err(|_| "Enter a valid base URL including /v1 if needed.".to_string())?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(
+                "Use an HTTP(S) base URL without embedded credentials, query or fragment.".into(),
+            );
+        }
+        let number = |s: &str, default: u64| -> Result<u64, String> {
+            if s.trim().is_empty() {
+                return Ok(default);
+            }
+            s.trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| "Token limits must be positive integers.".into())
         };
-        let context = number(&self.context,200_000)?;
-        let tokens = number(&self.tokens,8192)?;
-        let api = if self.anthropic { "anthropic-messages" } else { "openai-completions" };
+        let context = number(&self.context, 200_000)?;
+        let tokens = number(&self.tokens, 8192)?;
+        let api = if self.anthropic {
+            "anthropic-messages"
+        } else {
+            "openai-completions"
+        };
         let p = serde_json::from_value(json!({"baseUrl":self.base_url.trim().trim_end_matches('/'),"api":api,"apiKey":self.api_key.trim(),"models":[]})).map_err(|e|e.to_string())?;
         let m = serde_json::from_value(json!({"id":model,"name":if self.name.trim().is_empty(){model}else{self.name.trim()},"reasoningNotSupported":self.reasoning_not_supported,"contextWindow":context,"maxTokens":tokens,"input":["text"]})).map_err(|e|e.to_string())?;
-        Ok(Action::Save(pid.into(),p,m))
+        Ok(Action::Save(pid.into(), p, m))
     }
     pub fn show(
         &mut self,
@@ -281,10 +318,13 @@ mod tests {
     use super::*;
     #[test]
     fn compatible_form_validation() {
-        let mut form=ModelManager::default();
+        let mut form = ModelManager::default();
         assert!(form.draft().is_err());
-        form.provider="my-proxy".into();form.base_url="https://example.test/v1".into();form.model="vendor/model".into();
-        assert!(matches!(form.draft(),Ok(Action::Save(_,_,_))));
-        form.base_url="file:///tmp/api".into();assert!(form.draft().is_err());
+        form.provider = "my-proxy".into();
+        form.base_url = "https://example.test/v1".into();
+        form.model = "vendor/model".into();
+        assert!(matches!(form.draft(), Ok(Action::Save(_, _, _))));
+        form.base_url = "file:///tmp/api".into();
+        assert!(form.draft().is_err());
     }
 }

@@ -233,7 +233,9 @@ pub fn build_registry(
     .add(Arc::new(MoveTool {
         store: store.clone(),
     }))
-    .add(Arc::new(UndoTool { store: store.clone() }))
+    .add(Arc::new(UndoTool {
+        store: store.clone(),
+    }))
     .add(Arc::new(AnchorGrepTool {
         root: root.to_path_buf(),
         store,
@@ -245,7 +247,10 @@ pub fn build_registry(
         }));
     }
     reg.add(Arc::new(crate::web::WebFetchTool))
-        .add(Arc::new(crate::web::WebSearchTool { model: settings.model.clone(), base_url: settings.base_url.clone() }));
+        .add(Arc::new(crate::web::WebSearchTool {
+            model: settings.model.clone(),
+            base_url: settings.base_url.clone(),
+        }));
     reg.add(Arc::new(tasks::TaskCreateTool(tasks.clone())))
         .add(Arc::new(tasks::TaskUpdateTool(tasks.clone())))
         .add(Arc::new(tasks::TaskListTool(tasks.clone())))
@@ -379,7 +384,11 @@ Project-specific instructions and guidelines:
         level = feather_core::provider::ThinkingLevel::parse(&want);
     }
     if let Some((_, p, m)) = entry {
-        level = if m.thinking_levels.is_some() { level.map(|want| models::clamp_thinking(m, p, want)) } else { None };
+        level = if m.thinking_levels.is_some() {
+            level.map(|want| models::clamp_thinking(m, p, want))
+        } else {
+            None
+        };
     }
     let config = AgentConfig {
         model: wire_model,
