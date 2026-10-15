@@ -24,6 +24,9 @@ sha2 = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 getrandom = "0.2"
+# Read-only font mappings: file-backed pages are reclaimable, unlike the heap
+# copies they replace. Already in the tree via winit's Linux backends.
+memmap2 = "0.9"
 raw-window-handle = "0.6"
 winit = "0.30"
 egui-winit = "0.29"

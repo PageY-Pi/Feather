@@ -1274,6 +1274,7 @@ dependencies = [
  "feather-core",
  "getrandom 0.2.17",
  "image",
+ "memmap2",
  "raw-window-handle",
  "reqwest",
  "serde",
