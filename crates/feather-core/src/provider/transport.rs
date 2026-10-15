@@ -245,6 +245,20 @@ pub(crate) async fn http_post_sse(
             .map_err(|_| ProviderError::Auth("invalid HTTP credential/header value".into()))?;
         header_map.insert(name, value);
     }
+    // Serialize once and send the bytes: this both avoids reqwest serializing
+    // the body a second time and gives the traffic limiter the exact size to
+    // account for. Providers that pass their own content-type keep it.
+    let body = serde_json::to_vec(&body)
+        .map_err(|e| ProviderError::Decode(format!("request body is not JSON: {e}")))?;
+    if !header_map.contains_key(reqwest::header::CONTENT_TYPE) {
+        header_map.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+    }
+    // Uploads count against the limit too: a large context is the single
+    // biggest burst feather sends.
+    throttle(body.len() as u64).await;
 
     // Ignore provider structs' construction-time client and use the current
     // route at request time, so GUI/catalog route changes take effect without
@@ -253,7 +267,7 @@ pub(crate) async fn http_post_sse(
     let resp = client
         .post(url)
         .headers(header_map)
-        .json(&body)
+        .body(body)
         .send()
         .await
         .map_err(|e| ProviderError::Http(e.to_string()))?;
@@ -267,9 +281,114 @@ pub(crate) async fn http_post_sse(
     }
     let inner: super::BoxStream = Box::pin(
         resp.bytes_stream()
-            .map(|r| r.map_err(|e| ProviderError::Http(e.to_string()))),
+            // Shape the download as it arrives. `then` keeps chunks strictly in
+            // order, so the reservation timeline matches the bytes on the wire.
+            .then(|chunk| async move {
+                if let Ok(bytes) = &chunk {
+                    throttle(bytes.len() as u64).await;
+                }
+                chunk.map_err(|e| ProviderError::Http(e.to_string()))
+            }),
     );
     Ok(ResponseStream::new(inner, handler))
+}
+
+// ---------------------------------------------------------------------------
+// Provider traffic shaping.
+//
+// A reservation shaper, not a token bucket: each acquisition reserves a finish
+// time on a single shared timeline, so concurrent streams (a provider response
+// plus a parallel subagent) share the configured rate instead of each getting
+// the full limit. `next_free` is the earliest instant the link may next carry
+// another byte, which bounds *aggregate* throughput to the configured value.
+//
+// The limiter deliberately throttles only request bodies and response streams
+// through `http_post_sse`, i.e. model traffic. Small, infrequent control
+// requests (OAuth token exchange) are not shaped, so signing in never hangs.
+// ---------------------------------------------------------------------------
+
+/// Lowest accepted limit; below this a single stream would stall for minutes.
+pub const MIN_RATE_LIMIT: u64 = 4 * 1024;
+/// Highest accepted limit (1 GiB/s), effectively "no meaningful limit".
+pub const MAX_RATE_LIMIT: u64 = 1024 * 1024 * 1024;
+
+static RATE_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct Shaper {
+    /// Instant the link is next free for the bytes already reserved.
+    next_free: std::time::Instant,
+    /// Limit the reservations were computed with; a change resets the timeline
+    /// so raising or clearing the limit takes effect immediately.
+    limit: u64,
+}
+
+fn shaper() -> &'static Mutex<Shaper> {
+    static SHAPER: OnceLock<Mutex<Shaper>> = OnceLock::new();
+    SHAPER.get_or_init(|| {
+        Mutex::new(Shaper {
+            next_free: std::time::Instant::now(),
+            limit: 0,
+        })
+    })
+}
+
+/// Current provider traffic limit in bytes per second; 0 means unlimited.
+pub fn rate_limit() -> u64 {
+    RATE_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the provider traffic limit in bytes per second. `0` disables shaping.
+/// Out-of-range non-zero values are clamped to [`MIN_RATE_LIMIT`] /
+/// [`MAX_RATE_LIMIT`] so a typo cannot wedge every request.
+pub fn set_rate_limit(bytes_per_second: u64) {
+    let limit = if bytes_per_second == 0 {
+        0
+    } else {
+        bytes_per_second.clamp(MIN_RATE_LIMIT, MAX_RATE_LIMIT)
+    };
+    RATE_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut shaper) = shaper().lock() {
+        // Reset the timeline so a new limit applies to the *next* byte rather
+        // than to work already queued under the old one.
+        shaper.limit = limit;
+        shaper.next_free = std::time::Instant::now();
+    }
+}
+
+/// Reserve `bytes` of link time and sleep until the reservation comes due.
+/// Returns immediately when shaping is off, so the hot path stays a single
+/// atomic load.
+pub async fn throttle(bytes: u64) {
+    if let Some(wait) = reserve(bytes) {
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Reserve link time and return how long the caller must wait before sending.
+/// `None` means "send now" (no limit, nothing to reserve, or already due).
+fn reserve(bytes: u64) -> Option<Duration> {
+    let limit = rate_limit();
+    if limit == 0 || bytes == 0 {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let due = {
+        let mut shaper = shaper().lock().ok()?;
+        if shaper.limit != limit {
+            shaper.limit = limit;
+            shaper.next_free = now;
+        }
+        // Bytes queued behind an earlier reservation must not delay this one
+        // past the point where it is due.
+        let start = shaper.next_free.max(now);
+        // Integer math on microseconds keeps the timeline drift-free without
+        // relying on floating point; round up so the rate is never exceeded.
+        let micros = bytes.saturating_mul(1_000_000).div_ceil(limit);
+        let finish = start + Duration::from_micros(micros);
+        shaper.next_free = finish;
+        finish
+    };
+    due.checked_duration_since(now).filter(|d| !d.is_zero())
 }
 
 fn route_cell() -> &'static RwLock<Route> {
@@ -473,6 +592,91 @@ mod tests {
         let body = client.get(url).send().unwrap().text().unwrap();
         assert_eq!(body, "ok");
         thread.join().unwrap();
+    }
+
+    /// The limiter is process-global, so its tests must not run concurrently
+    /// with each other. Every case restores "unlimited" before releasing this.
+    fn limit_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_rate_limit(0);
+        guard
+    }
+
+    #[test]
+    fn rate_limit_clamps_and_zero_disables_shaping() {
+        let _guard = limit_test_guard();
+        assert_eq!(rate_limit(), 0, "shaping is off by default");
+        assert!(reserve(1_000_000).is_none(), "no limit means no wait");
+
+        set_rate_limit(1);
+        assert_eq!(rate_limit(), MIN_RATE_LIMIT, "absurdly low values clamp up");
+        set_rate_limit(u64::MAX);
+        assert_eq!(
+            rate_limit(),
+            MAX_RATE_LIMIT,
+            "absurdly high values clamp down"
+        );
+
+        set_rate_limit(0);
+        assert_eq!(rate_limit(), 0);
+        assert!(reserve(1_000_000).is_none(), "clearing restores no-wait");
+    }
+
+    #[test]
+    fn reservations_queue_on_one_timeline() {
+        let _guard = limit_test_guard();
+        // 100 KB/s: 10 KB takes ~100 ms, and the second reservation must queue
+        // behind the first rather than also completing in 100 ms.
+        set_rate_limit(100_000);
+        let first = reserve(10_000).expect("first reservation waits");
+        let second = reserve(10_000).expect("second reservation waits");
+        assert!(
+            first >= Duration::from_millis(80) && first <= Duration::from_millis(200),
+            "10 KB at 100 KB/s should be ~100 ms, got {first:?}"
+        );
+        assert!(
+            second > first,
+            "concurrent reservations must share the rate, got {first:?} then {second:?}"
+        );
+        assert!(
+            second <= Duration::from_millis(300),
+            "two 10 KB chunks at 100 KB/s should finish within ~200 ms, got {second:?}"
+        );
+        set_rate_limit(0);
+    }
+
+    #[test]
+    fn changing_the_limit_resets_the_timeline() {
+        let _guard = limit_test_guard();
+        // Saturate a slow limit so a queued reservation exists, then raise it:
+        // the next acquisition must reflect the new rate, not the old backlog.
+        set_rate_limit(MIN_RATE_LIMIT);
+        let backlog = reserve(1024 * 1024).expect("reservation at the floor");
+        assert!(backlog > Duration::from_secs(10), "1 MiB at 4 KB/s is slow");
+
+        set_rate_limit(1024 * 1024);
+        let after = reserve(1024 * 1024).expect("reservation at 1 MiB/s");
+        assert!(
+            after <= Duration::from_secs(2),
+            "raising the limit must clear the old backlog, got {after:?}"
+        );
+        set_rate_limit(0);
+    }
+
+    #[tokio::test]
+    async fn throttle_returns_immediately_when_unlimited() {
+        let _guard = limit_test_guard();
+        let started = std::time::Instant::now();
+        throttle(512 * 1024).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "unlimited traffic must not be delayed, waited {:?}",
+            started.elapsed()
+        );
     }
 
     fn restore_env(key: &str, old: Option<std::ffi::OsString>) {

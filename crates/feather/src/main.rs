@@ -91,6 +91,9 @@ fn retry_delay_label(ms: u64) -> String {
 #[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let cli = parse_cli();
+    // Apply the persisted traffic limit before any provider request so RPC,
+    // one-shot and subagent runs honour the same ceiling as the GUI.
+    feather::netlimit::load(&config::feather_home()).apply();
     let root = std::env::current_dir()?;
     if cli.prompt.is_none() && cli.mode != "rpc" {
         // ---------------- interactive (sibling feather-gui) ------------------

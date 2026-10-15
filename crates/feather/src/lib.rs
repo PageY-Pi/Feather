@@ -8,6 +8,7 @@ pub mod config;
 pub mod config_store;
 pub mod mentions;
 pub mod models;
+pub mod netlimit;
 pub mod oauth;
 pub mod preferences;
 pub mod proxy;

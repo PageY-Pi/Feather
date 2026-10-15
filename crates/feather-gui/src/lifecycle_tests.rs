@@ -368,6 +368,134 @@ fn retry_resets_only_live_assistant_and_never_duplicates_a_finished_tool() {
     assert!(!app.rows.iter().any(|r| r.text.contains("failed partial")));
 }
 
+/// The footer must expose the traffic limit next to the proxy, and the popup
+/// must be reachable and closable like the proxy picker.
+#[test]
+fn footer_shows_the_rate_limit_control_near_the_proxy() {
+    let mut app = tests::fixture();
+    let ctx = app.egui_ctx.clone();
+    theme::apply_theme(&ctx);
+    let mut rows = Vec::new();
+    let out = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(950.0, 150.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.status_bar(ui));
+        },
+    );
+    for job in &out.shapes {
+        texts(&job.shape, &mut rows);
+    }
+    let find = |needle: &str| {
+        rows.iter()
+            .find(|(label, _)| label.contains(needle))
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("footer is missing {needle:?}: {:?}", labels(&rows)))
+    };
+    let limit = find("Limit:");
+    let proxy = find("Proxy:");
+    assert!(
+        limit.left() < proxy.left(),
+        "the limit sits immediately left of the proxy at the bottom right"
+    );
+    // Only a separator may sit between them.
+    let between = rows
+        .iter()
+        .filter(|(_, rect)| rect.left() > limit.right() && rect.right() < proxy.left())
+        .count();
+    assert!(between <= 1, "unexpected items between limit and proxy");
+
+    // Clicking it opens the picker, and Escape closes it without applying.
+    app.open_rate_limit_picker();
+    assert!(matches!(
+        app.request_picker,
+        Some(request_choices::Picker::RateLimit { .. })
+    ));
+    let _ = ctx.run(
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ctx| app.requests_window(ctx),
+    );
+    assert!(
+        app.request_picker.is_none(),
+        "Escape must dismiss the limit popup"
+    );
+    assert_eq!(
+        app.limits.limit.bytes_per_second, 0,
+        "dismissing must not change the stored limit"
+    );
+}
+
+/// A typed limit must reach the shaper, persist, and clear again, while bad
+/// input leaves the previous limit alone and reports why.
+#[test]
+fn rate_limit_choice_applies_persists_and_reports_bad_input() {
+    let home = std::env::temp_dir().join(feather_core::provider::gen_id("gui-limit"));
+    std::fs::create_dir_all(&home).unwrap();
+    let mut app = tests::fixture();
+    app.home = home.clone();
+    app.limits = request_choices::Limits::new(&home);
+    // The shared fixture is read-only preview mode; this test inspects a real
+    // (temporary) home, so writes must actually happen.
+    app.preview = false;
+    let ctx = app.egui_ctx.clone();
+    feather_core::provider::transport::set_rate_limit(0);
+
+    app.open_rate_limit_picker();
+    let picked = Some(request_choices::Choice::RateLimit(512 * 1024));
+    app.apply_request_choice(picked, &ctx);
+    assert_eq!(app.limits.limit.bytes_per_second, 512 * 1024);
+    assert_eq!(
+        feather_core::provider::transport::rate_limit(),
+        512 * 1024,
+        "the shaper must enforce the stored value"
+    );
+    assert_eq!(app.limits.label(), "Limit: 512 KB/s");
+    assert_eq!(
+        feather::netlimit::load(&home).bytes_per_second,
+        512 * 1024,
+        "the limit must survive a reload"
+    );
+
+    // Bad input: reported, and the active limit is untouched.
+    app.open_rate_limit_picker();
+    app.apply_request_choice(
+        Some(request_choices::Choice::Error("Unknown unit 'TB'".into())),
+        &ctx,
+    );
+    assert_eq!(app.limits.limit.bytes_per_second, 512 * 1024);
+    assert!(app
+        .limits
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("Unknown unit")));
+
+    // Back to unlimited.
+    app.open_rate_limit_picker();
+    app.apply_request_choice(Some(request_choices::Choice::RateLimit(0)), &ctx);
+    assert_eq!(app.limits.limit.bytes_per_second, 0);
+    assert_eq!(app.limits.label(), "Limit: Off");
+    assert_eq!(feather_core::provider::transport::rate_limit(), 0);
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+fn labels(rows: &[(String, egui::Rect)]) -> Vec<String> {
+    rows.iter().map(|(label, _)| label.clone()).collect()
+}
+
 #[test]
 fn render_label_opens_a_modal_and_escape_does_not_submit_the_draft() {
     let mut app = tests::fixture();

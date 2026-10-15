@@ -55,6 +55,7 @@ pub(crate) fn fixture() -> FeatherApp {
         renderer_picker: None,
         request_picker: None,
         proxies: Default::default(),
+        limits: Default::default(),
         exit: None,
         exit_ready: false,
     }

@@ -35,6 +35,14 @@ This version:
   Volcano model routes to the Ark coding endpoint.
 - 1.1.0 memoizes the resolved model catalog and the session-name lookup, so RPC
   transcript encoding no longer rebuilds the catalog per message.
+- 1.1.0 adds a network rate limit next to the proxy indicator. Feather's model
+  traffic (context upload plus streamed reply) is capped to a byte-per-second
+  ceiling the user sets — typed as `512 KB/s`, `2 MB` or `Off`, or picked from
+  presets. One reservation shaper covers all provider streams, so parallel
+  subagents share the limit instead of each getting the full rate; a new limit
+  applies from the next request. The CLI, RPC bridge and one-shot runs honour the
+  same persisted value as the GUI. Control requests (OAuth sign-in) are never
+  shaped, so authenticating cannot hang.
 - Ordinary Backspace remains unchanged when no IME-owned key is reported.
 - 1.0.0 efficiency review: shared request ownership (no deep history/tool-schema
   clone), cached token/hash/prefix planning, linear SSE/FIFO, combined audit/meta

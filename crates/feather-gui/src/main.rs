@@ -197,6 +197,7 @@ struct FeatherApp {
     renderer_picker: Option<renderer_choice::Picker>,
     request_picker: Option<request_choices::Picker>,
     proxies: request_choices::Proxies,
+    limits: request_choices::Limits,
     exit: Option<lifecycle::Exit>,
     exit_ready: bool,
 }
@@ -347,6 +348,11 @@ impl FeatherApp {
                 Default::default()
             } else {
                 request_choices::Proxies::new(&config::feather_home())
+            },
+            limits: if preview {
+                Default::default()
+            } else {
+                request_choices::Limits::new(&config::feather_home())
             },
             exit: None,
             exit_ready: false,
@@ -1029,12 +1035,50 @@ impl FeatherApp {
         self.egui_ctx
             .memory_mut(|m| m.surrender_focus(egui::Id::new("feather-composer")));
     }
+    /// Open the traffic-limit popup, pre-filled with the current value.
+    fn open_rate_limit_picker(&mut self) {
+        if self.exit.is_some() {
+            return;
+        }
+        self.show_models = false;
+        self.show_settings = false;
+        self.show_login = false;
+        self.show_thinking_picker = false;
+        self.renderer_picker = None;
+        self.picker = None;
+        // Highlight the preset matching the active limit, if any.
+        let current = self.limits.limit.bytes_per_second;
+        let selected = feather::netlimit::SUGGESTED
+            .iter()
+            .position(|(_, value)| {
+                feather::netlimit::parse(value).is_ok_and(|bytes| bytes == current)
+            })
+            .unwrap_or(usize::MAX);
+        self.request_picker = Some(request_choices::Picker::RateLimit {
+            input: self.limits.limit.value_text(),
+            selected,
+        });
+        self.egui_ctx
+            .memory_mut(|m| m.surrender_focus(egui::Id::new("feather-composer")));
+    }
     fn requests_window(&mut self, ctx: &egui::Context) {
         let Some(picker) = &mut self.request_picker else {
             return;
         };
         let mut open = true;
-        let choice = request_choices::window(ctx, picker, &self.proxies, &mut open);
+        let choice = request_choices::window(ctx, picker, &self.proxies, &self.limits, &mut open);
+        self.apply_request_choice(choice, ctx);
+        if !open {
+            self.request_picker = None;
+        }
+    }
+    /// Act on one picker result. Split out of `requests_window` so the choices
+    /// can be tested without driving a frame.
+    fn apply_request_choice(
+        &mut self,
+        choice: Option<request_choices::Choice>,
+        ctx: &egui::Context,
+    ) {
         match choice {
             Some(request_choices::Choice::Skill(name)) => {
                 self.input = format!("/skill:{name} ");
@@ -1080,7 +1124,26 @@ impl FeatherApp {
                     Err(error) => self.proxies.error = Some(error),
                 }
             }
-            Some(request_choices::Choice::Error(error)) => self.proxies.error = Some(error),
+            Some(request_choices::Choice::RateLimit(bytes)) => {
+                if self.preview {
+                    self.limits.error =
+                        Some("Preview mode is read-only; the limit was not saved.".into());
+                    return;
+                }
+                self.limits.save(&self.home, bytes);
+            }
+            Some(request_choices::Choice::Error(error)) => {
+                // The same popup slot reports both proxy and limit problems, so
+                // the message belongs with whichever picker is open.
+                if matches!(
+                    self.request_picker,
+                    Some(request_choices::Picker::RateLimit { .. })
+                ) {
+                    self.limits.error = Some(error);
+                } else {
+                    self.proxies.error = Some(error);
+                }
+            }
             Some(request_choices::Choice::Scan) if !self.preview => {
                 self.proxies.scan(self.home.clone(), ctx.clone())
             }
@@ -1088,9 +1151,6 @@ impl FeatherApp {
                 self.proxies.error = Some("Preview mode is read-only; no scan was started.".into())
             }
             None => {}
-        }
-        if !open {
-            self.request_picker = None;
         }
     }
 
@@ -2422,6 +2482,7 @@ impl FeatherApp {
         };
         let tps_text = format!("TPS {throughput}");
         let proxy_text = self.proxies.label();
+        let limit_text = self.limits.label();
         // Widths may only be reduced for overflow; never expanded beyond the
         // measured text, otherwise short values regain the old dead-air gaps.
         let session_natural = Self::measure_status(ui, &session_text);
@@ -2429,13 +2490,28 @@ impl FeatherApp {
         let mut session_w = session_natural.min(if tight { 150.0 } else { 300.0 });
         let mut model_w = model_natural.min(if tight { 150.0 } else { 220.0 });
         let effort_w = Self::measure_status(ui, &effort_text).min(128.0);
-        let tps_w = Self::measure_status(ui, &tps_text).min(120.0);
+        // Telemetry is the only purely informational footer item, so at narrow
+        // widths it yields its space to keep every control visible and
+        // un-truncated (truncation also breaks the uniform separator rhythm).
+        let show_tps = !tight;
+        let tps_w = if show_tps {
+            Self::measure_status(ui, &tps_text).min(120.0)
+        } else {
+            0.0
+        };
         let render_w = Self::measure_status(ui, self.renderer.status());
         let proxy_w = Self::measure_status(ui, &proxy_text).min(190.0);
-        let right_width = proxy_w + render_w + dot + 2.0 * GAP;
+        let limit_w = Self::measure_status(ui, &limit_text).min(150.0);
+        let right_width = proxy_w + limit_w + render_w + dot * 2.0 + 3.0 * GAP;
         let gutter = 24.0;
         let left_width = (available - right_width - gutter).max(100.0);
-        let natural = session_w + model_w + effort_w + tps_w + 3.0 * dot + 6.0 * GAP;
+        // The natural width follows what is actually rendered: without TPS
+        // there is one fewer separator and two fewer gaps.
+        let natural = if show_tps {
+            session_w + model_w + effort_w + tps_w + 3.0 * dot + 6.0 * GAP
+        } else {
+            session_w + model_w + effort_w + 2.0 * dot + 4.0 * GAP
+        };
         if natural > left_width {
             let identities = (session_w + model_w).max(1.0);
             let needed = (natural - left_width).min((identities - 40.0).max(0.0));
@@ -2459,15 +2535,28 @@ impl FeatherApp {
                 ui.label(egui::RichText::new("·").size(12.0).color(MUTED));
                 if ui.add_sized([effort_w,22.0],egui::Label::new(egui::RichText::new(&effort_text).size(12.0).color(TEAL)).halign(egui::Align::Min).truncate().sense(egui::Sense::click()))
                     .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click to adjust effort · Ctrl+Shift+T · Shift+Tab cycles").clicked(){self.open_thinking_picker();}
-                ui.label(egui::RichText::new("·").size(12.0).color(MUTED));
-                ui.add_sized([tps_w,22.0],egui::Label::new(egui::RichText::new(&tps_text).size(12.0).color(INK)).halign(egui::Align::Min).truncate())
-                    .on_hover_text("While streaming: ~ is an estimate. At completion: provider output tokens / generation time.");
+                if show_tps {
+                    ui.label(egui::RichText::new("·").size(12.0).color(MUTED));
+                    ui.add_sized([tps_w,22.0],egui::Label::new(egui::RichText::new(&tps_text).size(12.0).color(INK)).halign(egui::Align::Min).truncate())
+                        .on_hover_text("While streaming: ~ is an estimate. At completion: provider output tokens / generation time.");
+                }
             });
             ui.add_space(gutter);
             ui.allocate_ui_with_layout(egui::vec2(right_width,28.0),egui::Layout::right_to_left(egui::Align::Center),|ui| {
                 ui.spacing_mut().item_spacing.x=GAP;
                 if ui.add_sized([proxy_w,22.0],egui::Label::new(egui::RichText::new(&proxy_text).size(12.0).color(TEAL)).halign(egui::Align::Min).truncate().sense(egui::Sense::click()))
                     .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Choose or turn off proxy for Feather requests · applies to next request, no restart").clicked(){self.open_request_picker(false);}
+                ui.label(egui::RichText::new("·").size(12.0).color(MUTED));
+                let limit_hint = if self.limits.limit.bytes_per_second == 0 {
+                    "Cap how much bandwidth Feather uses · currently unlimited".to_string()
+                } else {
+                    format!(
+                        "Feather is limited to {}/s for model traffic\nClick to change or remove the limit",
+                        feather::netlimit::human(self.limits.limit.bytes_per_second)
+                    )
+                };
+                if ui.add_sized([limit_w,22.0],egui::Label::new(egui::RichText::new(&limit_text).size(12.0).color(if self.limits.limit.bytes_per_second==0{MUTED}else{TEAL})).halign(egui::Align::Min).truncate().sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(limit_hint).clicked(){self.open_rate_limit_picker();}
                 ui.label(egui::RichText::new("·").size(12.0).color(MUTED));
                 if renderer_choice::trigger(ui,self.renderer){self.open_renderer_picker();}
             });

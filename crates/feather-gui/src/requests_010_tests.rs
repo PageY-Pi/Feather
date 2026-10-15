@@ -386,10 +386,11 @@ fn delete_removes_highlighted_proxy_but_not_while_typing_address() {
         cursor: 1,
         changed: false,
     };
+    let limits = request_choices::Limits::default();
     let mut open = true;
     for _ in 0..3 {
         let _ = ctx.run(Default::default(), |ctx| {
-            request_choices::window(ctx, &mut picker, &proxies, &mut open);
+            request_choices::window(ctx, &mut picker, &proxies, &limits, &mut open);
         });
     }
     ctx.memory_mut(|m| {
@@ -410,7 +411,7 @@ fn delete_removes_highlighted_proxy_but_not_while_typing_address() {
             ..Default::default()
         },
         |ctx| {
-            choice = request_choices::window(ctx, &mut picker, &proxies, &mut open);
+            choice = request_choices::window(ctx, &mut picker, &proxies, &limits, &mut open);
         },
     );
     assert!(matches!(choice,Some(request_choices::Choice::Remove(ref found)) if found==&route));
