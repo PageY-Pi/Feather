@@ -35,6 +35,76 @@ fn request(
     }
 }
 
+#[test]
+fn volcengine_compat_uses_native_thinking_toggle_and_off_map() {
+    // GLM-5.3 family: forced thinking, so `off` is unmapped and never sent as a
+    // disable request; low..max are the real efforts.
+    let glm = json!({
+        "reasoning": true,
+        "thinkingFormat": "deepseek",
+        "supportsReasoningEffort": true,
+        "maxTokensField": "max_tokens",
+        "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+        }
+    });
+    let off = openai("glm-5.3-flash", Some(ThinkingLevel::Off), &glm);
+    assert!(off.get("thinking").is_none(), "{off}");
+    assert!(off.get("reasoning_effort").is_none(), "{off}");
+
+    let high = openai("glm-5.3-flash", Some(ThinkingLevel::High), &glm);
+    assert_eq!(high["thinking"]["type"], json!("enabled"));
+    assert_eq!(high["reasoning_effort"], json!("high"));
+    assert_eq!(high["max_tokens"], json!(4096));
+
+    let max = openai("glm-5.3-flash", Some(ThinkingLevel::Max), &glm);
+    assert_eq!(max["reasoning_effort"], json!("max"));
+
+    // Every other coding-plan model keeps the disable toggle.
+    let convertible = json!({
+        "reasoning": true,
+        "thinkingFormat": "deepseek",
+        "supportsReasoningEffort": true,
+        "maxTokensField": "max_tokens",
+        "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+        }
+    });
+    let off = openai("deepseek-v4-pro", Some(ThinkingLevel::Off), &convertible);
+    assert_eq!(off["thinking"]["type"], json!("disabled"));
+    assert!(off.get("reasoning_effort").is_none(), "{off}");
+
+    let xhigh = openai("deepseek-v4-pro", Some(ThinkingLevel::Xhigh), &convertible);
+    assert_eq!(xhigh["thinking"]["type"], json!("enabled"));
+    assert_eq!(xhigh["reasoning_effort"], json!("xhigh"));
+
+    // `minimal` is unmapped on purpose: Ark normalises it to `none`, which the
+    // models reject, so it clamps up to the lowest real effort instead.
+    let minimal = openai(
+        "deepseek-v4-pro",
+        Some(ThinkingLevel::Minimal),
+        &convertible,
+    );
+    assert_eq!(minimal["thinking"]["type"], json!("enabled"));
+    assert_eq!(minimal["reasoning_effort"], json!("low"));
+
+    // GLM has no real `minimal` either, and no `off` at all.
+    let minimal = openai("glm-5.3-flash", Some(ThinkingLevel::Minimal), &glm);
+    assert_eq!(minimal["thinking"]["type"], json!("enabled"));
+    assert_eq!(minimal["reasoning_effort"], json!("low"));
+}
 fn anthropic(model: &str, thinking: ThinkingLevel, compat: &Value) -> Value {
     AnthropicProvider::build_body_with_compat(
         &request(model, 8192, Some(1.0), Some(thinking)),

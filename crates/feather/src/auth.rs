@@ -1,4 +1,5 @@
-//! Shared request-time auth.json resolution and automatic token renewal.
+//! Shared request-time credential resolution (`auth` document in `config.redb`)
+//! and automatic token renewal.
 
 use crate::oauth::{self, AuthStore, OAuthAccount};
 use feather_core::provider::credentials::{
@@ -41,7 +42,7 @@ impl StoredCredentialResolver {
             })
         })?;
         let key = match &account {
-            Some(account) if account.kind == "api_key" => resolve_fallback(account.key.as_deref())?,
+            Some(account) if account.kind == "api_key" => account.credential().map(str::to_string),
             Some(account) => account.credential().map(str::to_string),
             None => resolve_fallback(self.fallback.as_deref())?,
         }

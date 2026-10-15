@@ -13,23 +13,22 @@ pub struct ModelManager {
     pub name: String,
     pub anthropic: bool,
     pub reasoning_not_supported: bool,
-    pub context: String,
     pub tokens: String,
-    pub reserve: String,
     pub error: Option<String>,
-    pub preserved: String,
     pub confirm_delete: Option<(String, String)>,
     cached_models: Option<models::ModelsFile>,
     cached_home: Option<std::path::PathBuf>,
     loaded_at: Option<std::time::Instant>,
-    limits_model: Option<String>,
-    pub limits_context: String,
-    pub limits_reserve: String,
-    pub limits_preserved: String,
+    /// Global context drafts, shared by every model. Seeded once from settings.
+    pub context: String,
+    pub reserve: String,
+    pub preserved: String,
+    context_seeded: bool,
 }
 pub enum Action {
     Save(String, ProviderEntry, ModelEntry),
-    SaveLimits(String, String, u64, u64, u64),
+    /// Global context/compaction budget for every model.
+    SaveContext(u64, u64, u64),
     Delete(String, String),
 }
 impl ModelManager {
@@ -47,101 +46,91 @@ impl ModelManager {
             self.loaded_at = Some(std::time::Instant::now());
         }
     }
-    /// Render compaction limits for the currently selected model, including
-    /// built-in and OAuth-backed entries that are not part of the custom editor.
-    pub fn show_limits(
+    /// Global context budget: one row of settings drives every model. The agent
+    /// runs with `min(global context, model window)`, so selecting a smaller model
+    /// never sends more tokens than that model accepts.
+    pub fn show_context_settings(
         &mut self,
         ui: &mut egui::Ui,
         catalog: Option<&models::ModelsFile>,
         active: &str,
+        global: (u64, u64, u64),
         running: bool,
     ) -> Option<Action> {
-        let Some(catalog) = catalog else {
-            return None;
-        };
-        let Some((provider, _provider_entry, model)) = models::find(catalog, active) else {
-            return None;
-        };
-        let key = format!("{provider}/{}", model.id);
-        if self.limits_model.as_deref() != Some(key.as_str()) {
-            let defaults = feather_core::compaction::CompactionSettings::default();
-            self.limits_model = Some(key);
-            self.limits_context = model.context_window.unwrap_or(200_000).to_string();
-            self.limits_reserve = model
-                .reserve_tokens
-                .unwrap_or(defaults.reserve_tokens)
-                .to_string();
-            self.limits_preserved = model
-                .keep_recent_tokens
-                .unwrap_or(defaults.keep_recent_tokens)
-                .to_string();
+        if !self.context_seeded {
+            self.context_seeded = true;
+            self.context = global.0.to_string();
+            self.reserve = global.1.to_string();
+            self.preserved = global.2.to_string();
         }
-
         let mut action = None;
         egui::CollapsingHeader::new(
-            egui::RichText::new("Compaction limits")
+            egui::RichText::new("Context settings (all models)")
                 .size(13.5)
                 .color(crate::theme::TEAL),
         )
-        .id_salt("selected-model-compaction-limits")
+        .id_salt("global-context-settings")
         .default_open(false)
         .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("Selected: {provider}/{}", model.id))
-                    .size(12.0)
-                    .color(crate::theme::MUTED),
-            );
-            egui::Grid::new("selected-model-compaction-limits-grid")
+            egui::Grid::new("global-context-settings-grid")
                 .num_columns(2)
                 .spacing(egui::vec2(18.0, 8.0))
                 .show(ui, |ui| {
                     ui.label("Context tokens");
-                    ui.text_edit_singleline(&mut self.limits_context);
+                    ui.text_edit_singleline(&mut self.context);
                     ui.end_row();
                     ui.label("Compaction reserve tokens");
-                    ui.text_edit_singleline(&mut self.limits_reserve);
+                    ui.text_edit_singleline(&mut self.reserve);
                     ui.end_row();
                     ui.label("Preserved recent tokens");
-                    ui.text_edit_singleline(&mut self.limits_preserved);
+                    ui.text_edit_singleline(&mut self.preserved);
                     ui.end_row();
                 });
 
             let parse = |value: &str| value.trim().parse::<u64>().ok().filter(|n| *n > 0);
-            if let (Some(context), Some(reserve)) =
-                (parse(&self.limits_context), parse(&self.limits_reserve))
-            {
-                let trigger = context.saturating_sub(reserve);
-                ui.small(format!(
-                    "Automatic compaction starts above {trigger} tokens (context − reserve). Max output is not reserved."
-                ));
-            } else {
-                ui.small("Enter positive integer token limits.");
+            let parsed = parse(&self.context)
+                .zip(parse(&self.reserve))
+                .zip(parse(&self.preserved));
+            match parsed {
+                Some(((context, reserve), _)) => {
+                    let model = catalog
+                        .and_then(|cat| models::find(cat, active))
+                        .map(|(_, _, m)| m);
+                    let cap = model.and_then(|m| m.context_window);
+                    let effective = models::effective_context_window(context, model);
+                    match cap {
+                        Some(cap) if cap > effective => ui.small(format!(
+                            "{active} accepts {cap} tokens: running with {effective} (context − reserve = {} triggers compaction).",
+                            effective.saturating_sub(reserve)
+                        )),
+                        _ => ui.small(format!(
+                            "Running with {effective} tokens (context − reserve = {} triggers compaction). Max output is not reserved.",
+                            effective.saturating_sub(reserve)
+                        )),
+                    };
+                }
+                None => {
+                    ui.small("Enter positive integer token limits.");
+                }
             }
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!running, egui::Button::new("Save limits"))
+                    .add_enabled(!running, egui::Button::new("Save context"))
                     .clicked()
                 {
-                    let parsed = parse(&self.limits_context)
-                        .zip(parse(&self.limits_reserve))
-                        .zip(parse(&self.limits_preserved));
                     match parsed {
                         Some(((context, reserve), preserved)) => {
-                            match models::validate_model_limits(context, reserve, preserved) {
+                            match models::validate_context_limits(context, reserve, preserved) {
                                 Ok(()) => {
                                     self.error = None;
-                                    action = Some(Action::SaveLimits(
-                                        provider.to_string(),
-                                        model.id.clone(),
-                                        context,
-                                        reserve,
-                                        preserved,
-                                    ));
+                                    action = Some(Action::SaveContext(context, reserve, preserved));
                                 }
                                 Err(error) => self.error = Some(error.to_string()),
                             }
                         }
-                        None => self.error = Some("Token limits must be positive integers.".into()),
+                        None => {
+                            self.error = Some("Token limits must be positive integers.".into());
+                        }
                     }
                 }
                 if running {
@@ -179,30 +168,25 @@ impl ModelManager {
                 "Use an HTTP(S) base URL without embedded credentials, query or fragment.".into(),
             );
         }
-        let number = |s: &str, default: u64| -> Result<u64, String> {
-            if s.trim().is_empty() {
-                return Ok(default);
-            }
-            s.trim()
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| "Token limits must be positive integers.".into())
-        };
-        let defaults = feather_core::compaction::CompactionSettings::default();
-        let context = number(&self.context, 200_000)?;
-        let tokens = number(&self.tokens, 8192)?;
-        let reserve = number(&self.reserve, defaults.reserve_tokens)?;
-        let preserved = number(&self.preserved, defaults.keep_recent_tokens)?;
-        feather::models::validate_model_limits(context, reserve, preserved)
-            .map_err(|e| e.to_string())?;
+        let tokens = self
+            .tokens
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(8192);
+        if models::is_managed_provider(pid) {
+            return Err(format!(
+                "{pid} is a built-in provider; its models are read-only. Pick another provider id."
+            ));
+        }
         let api = if self.anthropic {
             "anthropic-messages"
         } else {
             "openai-completions"
         };
         let p = serde_json::from_value(json!({"baseUrl":self.base_url.trim().trim_end_matches('/'),"api":api,"apiKey":self.api_key.trim(),"models":[]})).map_err(|e|e.to_string())?;
-        let m = serde_json::from_value(json!({"id":model,"name":if self.name.trim().is_empty(){model}else{self.name.trim()},"reasoningNotSupported":self.reasoning_not_supported,"contextWindow":context,"maxTokens":tokens,"reserveTokens":reserve,"keepRecentTokens":preserved,"input":["text"]})).map_err(|e|e.to_string())?;
+        let m = serde_json::from_value(json!({"id":model,"name":if self.name.trim().is_empty(){model}else{self.name.trim()},"reasoningNotSupported":self.reasoning_not_supported,"maxTokens":tokens,"input":["text"]})).map_err(|e|e.to_string())?;
         Ok(Action::Save(pid.into(), p, m))
     }
     pub fn show(
@@ -277,15 +261,6 @@ impl ModelManager {
                             ui.label("Display name");
                             ui.text_edit_singleline(&mut self.name);
                             ui.end_row();
-                            ui.label("Context tokens");
-                            ui.text_edit_singleline(&mut self.context);
-                            ui.end_row();
-                            ui.label("Compaction reserve tokens");
-                            ui.text_edit_singleline(&mut self.reserve);
-                            ui.end_row();
-                            ui.label("Preserved recent tokens");
-                            ui.text_edit_singleline(&mut self.preserved);
-                            ui.end_row();
                             ui.label("Max output tokens");
                             ui.text_edit_singleline(&mut self.tokens);
                             ui.end_row();
@@ -329,6 +304,11 @@ impl ModelManager {
                     .show(ui, |ui| {
                         if let Some(cat) = &custom {
                             for (pid, p) in &cat.providers {
+                                // Built-in/OAuth providers own their model list; only
+                                // credentials are user-managed, so nothing here is editable.
+                                if models::is_managed_provider(pid) {
+                                    continue;
+                                }
                                 for m in &p.models {
                                     let current = format!("{pid}/{}", m.id) == active;
                                     ui.horizontal(|ui| {
@@ -350,22 +330,10 @@ impl ModelManager {
                                                 p.api.as_deref() == Some("anthropic-messages");
                                             self.reasoning_not_supported =
                                                 m.reasoning_not_supported;
-                                            self.context = m
-                                                .context_window
-                                                .map(|v| v.to_string())
-                                                .unwrap_or_default();
                                             self.tokens = m
                                                 .max_tokens
                                                 .map(|v| v.to_string())
                                                 .unwrap_or_default();
-                                            self.preserved = m
-                                                .keep_recent_tokens
-                                                .map(|v| v.to_string())
-                                                .unwrap_or_else(|| feather_core::compaction::CompactionSettings::default().keep_recent_tokens.to_string());
-                                            self.reserve = m
-                                                .reserve_tokens
-                                                .map(|v| v.to_string())
-                                                .unwrap_or_else(|| feather_core::compaction::CompactionSettings::default().reserve_tokens.to_string());
                                         }
                                         if ui
                                             .add_enabled(!running, egui::Button::new("Delete"))
@@ -380,6 +348,14 @@ impl ModelManager {
                                         "off · low · med · high · xhigh · max"
                                     });
                                 }
+                            }
+                            if custom
+                                .as_ref()
+                                .is_some_and(|c| c.providers.keys().any(|pid| models::is_managed_provider(pid)))
+                            {
+                                ui.small(
+                                    "Built-in providers (OAuth sign-in and bundled API-key plans) keep their own model lists — connect them in 'OAuth / built-in providers'.",
+                                );
                             }
                         }
                     });
@@ -456,5 +432,19 @@ mod tests {
         assert!(matches!(form.draft(), Ok(Action::Save(_, _, _))));
         form.base_url = "file:///tmp/api".into();
         assert!(form.draft().is_err());
+    }
+
+    #[test]
+    fn builtin_providers_cannot_be_saved_from_the_form() {
+        // Saving into a bundled provider id would overwrite its wire API and
+        // hide its bundled models, so the form refuses it up front.
+        let mut form = ModelManager::default();
+        form.provider = "volcengine-plan".into();
+        form.base_url = "https://ark.cn-beijing.volces.com/api/coding/v3".into();
+        form.model = "deepseek-v4.1-flash".into();
+        let Err(err) = form.draft() else {
+            panic!("built-in provider ids must be refused");
+        };
+        assert!(err.contains("read-only"), "{err}");
     }
 }

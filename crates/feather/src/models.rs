@@ -1,10 +1,16 @@
-//! Feather model catalog compatible with common provider metadata.
+//! Feather model catalog: bundled defaults merged with user state.
 //!
-//! `~/.feather/config.redb` stores provider and model metadata. The catalog supplies
-//! contextWindow, maxTokens, pricing, reasoning support, provider baseUrl/apiKey,
-//! and the optional compaction-model choice.
-//! Builtin metadata is generated from `@earendil-works/pi-ai` 1.0.4 static
-//! chat model catalog; it intentionally excludes user auth/settings/secrets.
+//! Two sources are resolved on every load:
+//! * **Bundled** defaults compiled into the binary from `builtin-models.json`
+//!   (`include_str!`), generated from the `@earendil-works/pi-ai` 1.0.4 static
+//!   chat model catalog. They supply contextWindow, maxTokens, pricing,
+//!   reasoning support and the provider baseUrl/api.
+//! * **User** state in the `models` document of `~/.feather/config.redb`:
+//!   credentials, custom providers, and per-model overrides.
+//!
+//! Built-in providers are Feather-owned, so their routing always comes from the
+//! bundle and only the credential is user-supplied. The resolved catalog is
+//! memoized (see `with_catalog`) because it is read per wire message.
 
 use crate::config;
 use serde::Deserialize;
@@ -67,26 +73,13 @@ pub struct ModelEntry {
     pub base_url: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Model capability advertised by the provider: the largest context the
+    /// server accepts. The *effective* window is the smaller of this and the
+    /// global context setting (see [`effective_context_window`]).
     #[serde(default)]
     pub context_window: Option<u64>,
-    /// Per-model compaction headroom before the context limit triggers compression.
-    #[serde(
-        rename = "reserveTokens",
-        alias = "reserve_tokens",
-        alias = "compactionReserveTokens",
-        default
-    )]
-    pub reserve_tokens: Option<u64>,
-    /// Per-model recent context preserved after compaction. `None` uses the global setting.
-    #[serde(
-        rename = "keepRecentTokens",
-        alias = "preservedTokens",
-        alias = "keep_recent_tokens",
-        alias = "preserved_tokens",
-        default
-    )]
-    pub keep_recent_tokens: Option<u64>,
-    #[serde(default)]
+    /// Maximum output tokens the model accepts for one assistant turn.
+    #[serde(rename = "maxTokens", alias = "max_tokens", default)]
     pub max_tokens: Option<u64>,
     #[serde(default)]
     pub reasoning: bool,
@@ -151,33 +144,146 @@ fn write_compaction_model(home: &std::path::Path, cm: &CompactionModel) -> std::
         &serde_json::json!({"provider": cm.provider, "id": cm.id}),
     )
 }
+/// Volcengine/Volcano account ids. `volcengine-plan` is the bundled Coding Plan
+/// (API-key) provider; `volcano` and `volcengine` remain here because a config
+/// written by an earlier build may still select them — they no longer ship a
+/// bundled provider entry, so the compat overrides must follow the id alone.
+pub fn is_volcengine_provider(provider: &str) -> bool {
+    matches!(provider, "volcano" | "volcengine" | "volcengine-plan")
+}
 
+/// Providers whose model list ships with Feather: OAuth sign-in providers and
+/// built-in API-key/Coding-Plan providers. Their models are owned by the
+/// bundled catalog, so the custom editor must not add, edit or delete them -
+/// only the credential (API key / OAuth token) is user-owned.
+pub fn is_managed_provider(provider: &str) -> bool {
+    builtin_catalog().is_some_and(|c| c.providers.contains_key(provider))
+}
+
+/// Reject mutations of a managed provider's models with a readable error.
+fn guard_managed(provider: &str) -> std::io::Result<()> {
+    if is_managed_provider(provider) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{provider} is a built-in provider; its models are read-only. \
+                 Connect it in 'OAuth / built-in providers' or add a provider with a different id."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Volcengine Coding Plan uses DeepSeek-style controls on its OpenAI endpoint:
+/// a top-level `thinking` toggle plus `reasoning_effort` (`low`..`max`, verified
+/// against Ark's coding endpoint).
+///
+/// The GLM-5.3 family is forced-thinking: Ark answers 400
+/// `thinking.type 'disabled' is not supported by this model`, so its `off` maps
+/// to `null` (unsupported) and is never sent. Every other coding-plan model is a
+/// convertible reasoner and keeps the disable toggle.
+pub fn volcengine_thinking_map(provider: &str, model: &str) -> Option<serde_json::Value> {
+    if !is_volcengine_provider(provider) {
+        return None;
+    }
+    // GLM-5.3/GLM-5.3-Flash: no `off`, and `minimal` is rejected as `none`.
+    if model.starts_with("glm-5.3") {
+        return Some(serde_json::json!({
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+        }));
+    }
+    // Convertible reasoners: `off` sends `thinking.type: "disabled"` (the mapped
+    // string is only a "supported" marker for that level), and `minimal` stays
+    // unmapped because Ark normalises it to `none`, which is not a real effort.
+    Some(serde_json::json!({
+        "off": "none",
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": "xhigh",
+        "max": "max"
+    }))
+}
+fn model_effort_levels(model: &ModelEntry) -> Option<Vec<String>> {
+    if let Some(levels) = &model.thinking_levels {
+        if !levels.is_empty() {
+            return Some(levels.clone());
+        }
+    }
+    let map = model
+        .thinking_level_map
+        .as_ref()
+        .and_then(serde_json::Value::as_object)?;
+    let map = map
+        .iter()
+        .map(|(level, value)| (level.clone(), value.clone()))
+        .collect();
+    let levels = feather_core::provider::compat::supported_levels(&map)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!levels.is_empty()).then_some(levels)
+}
 pub const DEFAULT_EFFORTS: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
 pub fn thinking_levels(model: &ModelEntry, _provider: &ProviderEntry) -> Vec<String> {
     if model.reasoning_not_supported {
-        vec!["off".into()]
-    } else {
-        DEFAULT_EFFORTS.iter().map(|s| s.to_string()).collect()
+        return vec!["off".into()];
     }
+    if let Some(levels) = model_effort_levels(model) {
+        return levels;
+    }
+    DEFAULT_EFFORTS.iter().map(|s| s.to_string()).collect()
 }
 fn apply_manual_effort(catalog: &mut ModelsFile) {
-    for p in catalog.providers.values_mut() {
+    for (pid, p) in catalog.providers.iter_mut() {
         if let Some(v) = p.compat.as_mut() {
             crate::config_store::strip_effort_presets(v);
         }
         for m in &mut p.models {
+            // Volcano Coding Plan models have no per-model map in the bundled
+            // catalog; derive it here unless the entry already carries one.
+            if m.thinking_level_map.is_none() {
+                if let Some(map) = volcengine_thinking_map(pid, &m.id) {
+                    m.thinking_level_map = Some(map);
+                }
+            }
             if let Some(v) = m.compat.as_mut() {
                 crate::config_store::strip_effort_presets(v);
             }
-            m.reasoning = !m.reasoning_not_supported;
-            let levels = if m.reasoning_not_supported {
-                vec!["off".into()]
-            } else {
-                DEFAULT_EFFORTS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            };
+            if m.reasoning_not_supported {
+                m.reasoning = false;
+                m.thinking_levels = Some(vec!["off".into()]);
+                m.thinking_level_map = Some(serde_json::json!({
+                    "off": "off",
+                    "minimal": null,
+                    "low": null,
+                    "medium": null,
+                    "high": null,
+                    "xhigh": null,
+                    "max": null
+                }));
+                continue;
+            }
+            // Preserve explicit built-in model maps. They encode provider-specific
+            // limits such as Volcano's xhigh -> high mapping and fixed-thinking
+            // models whose `off` level is deliberately unsupported.
+            if m.thinking_level_map.is_some() {
+                m.reasoning = true;
+                m.thinking_levels = model_effort_levels(m);
+                continue;
+            }
+            m.reasoning = true;
+            let levels = DEFAULT_EFFORTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
             let map = feather_core::provider::compat::THINKING_LEVELS
                 .iter()
                 .map(|l| {
@@ -237,12 +343,25 @@ fn merge_catalogs(builtin: &ModelsFile, user: ModelsFile) -> ModelsFile {
             .collect(),
     };
     for (id, mut user_provider) in user.providers {
+        // Borrowed here, cloned only in the one branch that needs the list.
+        let builtin_models = builtin.providers.get(&id).map(|p| &p.models);
         if let Some(builtin_provider) = builtin.providers.get(&id) {
-            if user_provider.base_url.is_none() {
+            // Built-in providers own their routing: a persisted entry contributes
+            // its credential (API key / OAuth token) and user extras, but never a
+            // conflicting endpoint. Without this, a stale or hand-edited
+            // `api`/`baseUrl` sends every request to the wrong server.
+            if is_managed_provider(&id) {
+                // Built-in ids always route to their bundled endpoint; a persisted
+                // value here is stale data, not a user preference.
                 user_provider.base_url = builtin_provider.base_url.clone();
-            }
-            if user_provider.api.is_none() {
                 user_provider.api = builtin_provider.api.clone();
+            } else {
+                if user_provider.base_url.is_none() {
+                    user_provider.base_url = builtin_provider.base_url.clone();
+                }
+                if user_provider.api.is_none() {
+                    user_provider.api = builtin_provider.api.clone();
+                }
             }
             if user_provider.api_key.is_none() {
                 user_provider.api_key = builtin_provider.api_key.clone();
@@ -250,8 +369,20 @@ fn merge_catalogs(builtin: &ModelsFile, user: ModelsFile) -> ModelsFile {
             if user_provider.headers.is_none() {
                 user_provider.headers = builtin_provider.headers.clone();
             }
-            if user_provider.compat.is_none() {
-                user_provider.compat = builtin_provider.compat.clone();
+            // Bundled compat keys win per key; user-only keys (session affinity,
+            // long cache retention, …) survive.
+            user_provider.compat = Some(feather_core::provider::compat::merge_compat(
+                user_provider.compat.as_ref(),
+                builtin_provider.compat.as_ref(),
+            ));
+        }
+        if user_provider.models.is_empty() && is_managed_provider(&id) {
+            if let Some(builtin_models) = builtin_models.filter(|m| !m.is_empty()) {
+                // Built-in providers may be persisted before their model list is
+                // imported (an OAuth/API-key login writes the credential entry
+                // first). Keep the credential but expose the bundled model
+                // definitions.
+                user_provider.models = builtin_models.clone();
             }
         }
         // User provider entries, including their model arrays, win wholesale.
@@ -260,9 +391,89 @@ fn merge_catalogs(builtin: &ModelsFile, user: ModelsFile) -> ModelsFile {
     merged
 }
 
-pub fn load() -> Option<ModelsFile> {
-    load_for(&config::feather_home())
+/// Cache key for the resolved catalog. Rebuilding parses the persisted `models`
+/// document, deep-merges the ~434 KB bundled catalog and re-derives every
+/// model's effort levels, so the result is memoized under this key instead of
+/// being repeated per wire message.
+///
+/// The generation counter is bumped by every write path (see
+/// `config_store::update`); the size+mtime stamp additionally catches an
+/// external writer such as another Feather process. Both checks are O(1).
+#[derive(Clone, PartialEq, Eq)]
+struct CatalogKey {
+    generation: u64,
+    stamp: Option<(u64, u64)>,
 }
+
+/// `(key, resolved catalog)`. A `None` catalog means "resolved and empty"; it is
+/// cached too, so a missing catalog does not force a rebuild on every lookup.
+type CatalogCache = std::sync::Mutex<Option<(CatalogKey, Option<ModelsFile>)>>;
+
+static CATALOG_CACHE: std::sync::OnceLock<CatalogCache> = std::sync::OnceLock::new();
+static CATALOG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cheap identity for the config database: (mtime millis, len). `None` when the
+/// file does not exist yet, which is itself a valid cache key.
+fn catalog_stamp(home: &std::path::Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(home.join("config.redb")).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)?;
+    Some((mtime, meta.len()))
+}
+
+/// Drop the cached catalog. Every `models` write calls this; a no-op when the
+/// cache is cold, so it is safe to call from the write path unconditionally.
+pub fn invalidate_catalog() {
+    CATALOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn catalog_key(home: &std::path::Path) -> CatalogKey {
+    CatalogKey {
+        generation: CATALOG_GENERATION.load(std::sync::atomic::Ordering::Relaxed),
+        stamp: catalog_stamp(home),
+    }
+}
+
+/// Run `f` against the resolved catalog without cloning it. Hot paths (per
+/// message, per event, per transcript row) must use this rather than `load()`,
+/// which hands back a full copy of the bundled catalog.
+pub fn with_catalog<T>(home: &std::path::Path, f: impl FnOnce(&ModelsFile) -> T) -> Option<T> {
+    let key = catalog_key(home);
+    let cache = CATALOG_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache.lock().ok()?;
+    if guard.as_ref().is_none_or(|(cached, _)| *cached != key) {
+        // Rebuild under the lock so concurrent readers wait for one load
+        // instead of each starting their own.
+        *guard = Some((key, load_for(home)));
+    }
+    guard
+        .as_ref()
+        .and_then(|(_, catalog)| catalog.as_ref())
+        .map(f)
+}
+
+/// Pricing for one model id, without cloning the catalog. This is the lookup
+/// the RPC wire encoder needs for every assistant message.
+pub fn cost_for(model: &str) -> Option<ModelCost> {
+    with_catalog(&config::feather_home(), |cat| {
+        find(cat, model).and_then(|(_, _, m)| m.cost.clone())
+    })
+    .flatten()
+}
+
+pub fn load() -> Option<ModelsFile> {
+    load_cached(&config::feather_home())
+}
+
+/// Cached `load_for`. Prefer this over `load_for` for anything that can run
+/// more than once per user action.
+pub fn load_cached(home: &std::path::Path) -> Option<ModelsFile> {
+    with_catalog(home, ModelsFile::clone)
+}
+
 pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
     let mut value = crate::config_store::read(home, "models")
         .ok()
@@ -281,43 +492,21 @@ pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
     };
     if let Some(deleted) = deleted.as_array() {
         for item in deleted.iter().filter_map(|v| v.as_str()) {
-            if let Some((pid, id)) = item.split_once('/') {
-                if let Some(p) = catalog.providers.get_mut(pid) {
-                    p.models.retain(|m| m.id != id);
-                }
+            let Some((pid, id)) = item.split_once('/') else {
+                continue;
+            };
+            // Built-in providers own their model list, so a stale deletion entry
+            // for one (from an older build) is ignored instead of hiding the
+            // bundled model.
+            if is_managed_provider(pid) {
+                continue;
+            }
+            if let Some(p) = catalog.providers.get_mut(pid) {
+                p.models.retain(|m| m.id != id);
             }
         }
     }
     apply_manual_effort(&mut catalog);
-    if let Some(limits) = value
-        .get("modelLimits")
-        .and_then(serde_json::Value::as_object)
-    {
-        for (key, raw) in limits {
-            let Some((provider, model)) = key.split_once('/') else {
-                continue;
-            };
-            let Some(entry) = catalog
-                .providers
-                .get_mut(provider)
-                .and_then(|p| p.models.iter_mut().find(|m| m.id == model))
-            else {
-                continue;
-            };
-            if let Some(n) = raw.get("contextWindow").and_then(serde_json::Value::as_u64) {
-                entry.context_window = Some(n);
-            }
-            if let Some(n) = raw.get("reserveTokens").and_then(serde_json::Value::as_u64) {
-                entry.reserve_tokens = Some(n);
-            }
-            if let Some(n) = raw
-                .get("keepRecentTokens")
-                .and_then(serde_json::Value::as_u64)
-            {
-                entry.keep_recent_tokens = Some(n);
-            }
-        }
-    }
     Some(catalog)
 }
 
@@ -325,7 +514,8 @@ pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
 /// thousands of bundled models merely because a provider credential exists.
 pub fn saved_for(home: &std::path::Path) -> std::io::Result<ModelsFile> {
     let value = crate::config_store::read(home, "models")?.unwrap_or_else(|| serde_json::json!({}));
-    let all = load_for(home).ok_or_else(|| std::io::Error::other("model catalog unavailable"))?;
+    let all =
+        load_cached(home).ok_or_else(|| std::io::Error::other("model catalog unavailable"))?;
     let mut providers = BTreeMap::new();
     if let Some(saved) = value["providers"].as_object() {
         for (pid, entry) in saved {
@@ -353,8 +543,8 @@ pub fn save_for(home: &std::path::Path, catalog: &ModelsFile) -> std::io::Result
     })
 }
 
-/// Validate the three per-model compaction limits without overflowing arithmetic.
-pub fn validate_model_limits(
+/// Validate the global context/compaction budget without overflowing arithmetic.
+pub fn validate_context_limits(
     context_window: u64,
     reserve_tokens: u64,
     keep_recent_tokens: u64,
@@ -380,56 +570,20 @@ pub fn validate_model_limits(
     Ok(())
 }
 
-/// Persist only the context budget fields for one model. Built-in models are
-/// overridden in a narrow `modelLimits` map, so their catalog siblings and
-/// provider metadata remain untouched.
-pub fn save_model_limits_for(
-    home: &std::path::Path,
-    provider: &str,
-    model: &str,
-    context_window: u64,
-    reserve_tokens: u64,
-    keep_recent_tokens: u64,
-) -> std::io::Result<()> {
-    validate_model_limits(context_window, reserve_tokens, keep_recent_tokens)?;
-    let catalog = load_for(home).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "model catalog unavailable")
-    })?;
-    if find(&catalog, &format!("{provider}/{model}")).is_none() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("unknown model: {provider}/{model}"),
-        ));
+/// The context window the agent actually runs with: the global context setting
+/// capped by what the selected model accepts. A model without an advertised
+/// window (custom endpoints) simply follows the global setting.
+pub fn effective_context_window(global_context: u64, model: Option<&ModelEntry>) -> u64 {
+    match model.and_then(|m| m.context_window) {
+        Some(cap) if cap > 0 => global_context.min(cap),
+        _ => global_context,
     }
-    crate::config_store::update(home, "models", |v| {
-        if !v["modelLimits"].is_object() {
-            v["modelLimits"] = serde_json::json!({});
-        }
-        let key = format!("{provider}/{model}");
-        if !v["modelLimits"][&key].is_object() {
-            v["modelLimits"][&key] = serde_json::json!({});
-        }
-        v["modelLimits"][&key]["contextWindow"] = serde_json::json!(context_window);
-        v["modelLimits"][&key]["reserveTokens"] = serde_json::json!(reserve_tokens);
-        v["modelLimits"][&key]["keepRecentTokens"] = serde_json::json!(keep_recent_tokens);
-    })
 }
 
-pub fn save_model_limits(
-    provider: &str,
-    model: &str,
-    context_window: u64,
-    reserve_tokens: u64,
-    keep_recent_tokens: u64,
-) -> std::io::Result<()> {
-    save_model_limits_for(
-        &config::feather_home(),
-        provider,
-        model,
-        context_window,
-        reserve_tokens,
-        keep_recent_tokens,
-    )
+/// Effective context window of `provider/id` (or a bare model id) in the
+/// catalog, falling back to the global setting when the model is unknown.
+pub fn effective_context_for(cat: &ModelsFile, global_context: u64, model: &str) -> u64 {
+    effective_context_window(global_context, find(cat, model).map(|(_, _, m)| m))
 }
 
 pub fn save(catalog: &ModelsFile) -> std::io::Result<()> {
@@ -439,6 +593,7 @@ pub fn save(catalog: &ModelsFile) -> std::io::Result<()> {
     })
 }
 pub fn upsert_model(pid: &str, provider: ProviderEntry, model: ModelEntry) -> std::io::Result<()> {
+    guard_managed(pid)?;
     let pv = serde_json::to_value(&provider).map_err(std::io::Error::other)?;
     let mv = serde_json::to_value(&model).map_err(std::io::Error::other)?;
     crate::config_store::update(&config::feather_home(), "models", |v| {
@@ -467,6 +622,7 @@ pub fn delete_model(pid: &str, id: &str) -> std::io::Result<()> {
     delete_model_for(&config::feather_home(), pid, id)
 }
 pub fn delete_model_for(home: &std::path::Path, pid: &str, id: &str) -> std::io::Result<()> {
+    guard_managed(pid)?;
     crate::config_store::update(home, "models", |v| {
         if let Some(list) = v
             .get_mut("providers")
@@ -529,7 +685,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persisted_model_deletions_survive_reload_including_builtins() {
+    fn catalog_cache_follows_writes_and_reflects_external_changes() {
+        // The resolved catalog is memoized because rebuilding it per wire
+        // message is far too expensive. A write must still be visible
+        // immediately, and an outside writer must not be masked forever.
+        let home = std::env::temp_dir().join(feather_core::provider::gen_id("catalog-cache"));
+        crate::config_store::write(
+            &home,
+            "models",
+            &serde_json::json!({"providers":{"custom":{"baseUrl":"https://one.test/v1","models":[{"id":"m"}]}}}),
+        )
+        .unwrap();
+        let first = load_cached(&home).unwrap();
+        assert!(first.providers.contains_key("custom"));
+        assert_eq!(first.providers["custom"].models.len(), 1);
+
+        // A store write invalidates the cache, so the new model is visible.
+        crate::config_store::update(&home, "models", |value| {
+            value["providers"]["custom"]["models"] = serde_json::json!([{"id": "m"}, {"id": "n"}]);
+        })
+        .unwrap();
+        let second = load_cached(&home).unwrap();
+        assert_eq!(second.providers["custom"].models.len(), 2);
+
+        // Repeated reads reuse the cached catalog (same content, no rebuild).
+        let third = load_cached(&home).unwrap();
+        assert_eq!(third.providers["custom"].models.len(), 2);
+
+        // A stamp change also invalidates the cache, so a write that bypasses
+        // the store (another process, or a hand-edited document) is picked up.
+        let mut external = crate::config_store::read(&home, "models").unwrap().unwrap();
+        external["providers"]["custom"]["models"] = serde_json::json!([{"id": "m"}]);
+        invalidate_catalog();
+        crate::config_store::write(&home, "models", &external).unwrap();
+        let fourth = load_cached(&home).unwrap();
+        assert_eq!(fourth.providers["custom"].models.len(), 1);
+
+        // Borrowed access runs the closure against the cached catalog without
+        // cloning it, and reports "no such entry" as `None`.
+        let ids = with_catalog(&home, |cat| {
+            cat.providers["custom"]
+                .models
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        assert_eq!(ids, vec!["m".to_string()]);
+        assert!(with_catalog(&home, |cat| find(cat, "custom/absent").is_some()) == Some(false));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn persisted_model_deletions_survive_reload_and_builtins_are_read_only() {
         let home = std::env::temp_dir().join(feather_core::provider::gen_id("model-delete"));
         let builtin = builtin_catalog().unwrap();
         let (pid, p) = builtin
@@ -542,13 +750,13 @@ mod tests {
             .models
             .iter()
             .any(|m| &m.id == id));
-        delete_model_for(&home, pid, id).unwrap();
-        for _ in 0..2 {
-            assert!(!load_for(&home).unwrap().providers[pid]
-                .models
-                .iter()
-                .any(|m| &m.id == id));
-        }
+        // Built-in providers own their model list: delete/upsert are refused and
+        // no `deletedModels` entry is written.
+        assert!(delete_model_for(&home, pid, id).is_err());
+        assert!(load_for(&home).unwrap().providers[pid]
+            .models
+            .iter()
+            .any(|m| &m.id == id));
         crate::config_store::write(
             &home,
             "models",
@@ -556,10 +764,65 @@ mod tests {
         )
         .unwrap();
         delete_model_for(&home, "custom", "one").unwrap();
-        let cat = load_for(&home).unwrap();
-        assert_eq!(cat.providers["custom"].models.len(), 1);
-        assert_eq!(cat.providers["custom"].models[0].id, "two");
+        for _ in 0..2 {
+            let cat = load_for(&home).unwrap();
+            assert_eq!(cat.providers["custom"].models.len(), 1);
+            assert_eq!(cat.providers["custom"].models[0].id, "two");
+        }
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn upsert_model_rejects_builtin_providers() {
+        let builtin = builtin_catalog().unwrap();
+        let pid = builtin
+            .providers
+            .iter()
+            .find(|(_, p)| !p.models.is_empty())
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        let provider: ProviderEntry =
+            serde_json::from_value(serde_json::json!({"baseUrl": "https://example.test/v1"}))
+                .unwrap();
+        let model: ModelEntry =
+            serde_json::from_value(serde_json::json!({"id": "hijacked"})).unwrap();
+        let err = upsert_model(&pid, provider, model).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(is_managed_provider(&pid));
+        assert!(!is_managed_provider("my-local-server"));
+    }
+
+    #[test]
+    fn effective_context_is_the_smaller_of_global_and_model() {
+        let model: ModelEntry =
+            serde_json::from_value(serde_json::json!({"id": "m", "contextWindow": 128_000}))
+                .unwrap();
+        assert_eq!(effective_context_window(200_000, Some(&model)), 128_000);
+        assert_eq!(effective_context_window(64_000, Some(&model)), 64_000);
+        // No advertised window (custom endpoints) follows the global setting.
+        let bare: ModelEntry = serde_json::from_value(serde_json::json!({"id": "m"})).unwrap();
+        assert_eq!(effective_context_window(200_000, Some(&bare)), 200_000);
+        assert_eq!(effective_context_window(200_000, None), 200_000);
+    }
+
+    #[test]
+    fn volcano_models_resolve_to_the_ark_coding_endpoint() {
+        // Regression: saving a model from the custom editor used to rewrite a
+        // bundled provider's `api`, and a stale persisted entry could point the
+        // Coding Plan at an unrelated gateway. Every Volcano model must resolve
+        // to the Ark OpenAI-compatible endpoint with its metadata intact.
+        let cat = builtin_catalog().unwrap();
+        let (pid, p, m) = find(&cat, "volcengine-plan/deepseek-v4.1-flash").unwrap();
+        assert_eq!(pid, "volcengine-plan");
+        assert_eq!(p.api.as_deref(), Some("openai-completions"));
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some("https://ark.cn-beijing.volces.com/api/coding/v3")
+        );
+        assert!(m.reasoning && !m.reasoning_not_supported);
+        // The duplicate `volcano` entry was folded into the Coding Plan provider.
+        assert!(cat.providers.get("volcano").is_none());
+        assert!(is_volcengine_provider("volcano"));
     }
     #[test]
     fn catalog_entry_keeps_pi_thinking_map_and_compat() {
@@ -694,5 +957,93 @@ mod tests {
         assert_eq!(zai.models[0].id, "custom-glm");
         assert_eq!(zai.models[0].api.as_deref(), Some("anthropic-messages"));
         assert!(merged.providers.contains_key("local"));
+    }
+
+    #[test]
+    fn builtin_provider_routing_cannot_be_overridden_by_persisted_entries() {
+        // A saved/stale `baseUrl` or `api` for a bundled provider sent requests
+        // to the wrong server (the Volcano Coding Plan pointed at an unrelated
+        // gateway). Routing now always comes from the bundled catalog, while the
+        // credential and user-only compat keys are kept.
+        let builtin: ModelsFile = serde_json::from_str(
+            r#"{"providers":{"volcengine-plan":{
+                 "baseUrl":"https://ark.cn-beijing.volces.com/api/coding/v3",
+                 "api":"openai-completions",
+                 "compat":{"thinkingFormat":"deepseek"},
+                 "models":[{"id":"glm-5.3-flash"}]}}}"#,
+        )
+        .unwrap();
+        let user: ModelsFile = serde_json::from_str(
+            r#"{"providers":{"volcengine-plan":{
+                 "baseUrl":"https://token-plan.example.invalid/compatible-mode/v1",
+                 "api":"anthropic-messages",
+                 "apiKey":"ark-synthetic",
+                 "compat":{"sendSessionAffinityHeaders":true},
+                 "modelOverrides":{"glm-5.3-flash":{"compat":{"supportsLongCacheRetention":true}}},
+                 "models":[]}}}"#,
+        )
+        .unwrap();
+        let merged = merge_catalogs(&builtin, user);
+        let plan = merged.providers.get("volcengine-plan").unwrap();
+        assert_eq!(
+            plan.base_url.as_deref(),
+            Some("https://ark.cn-beijing.volces.com/api/coding/v3")
+        );
+        assert_eq!(plan.api.as_deref(), Some("openai-completions"));
+        assert_eq!(plan.api_key.as_deref(), Some("ark-synthetic"));
+        let compat = plan.compat.as_ref().unwrap();
+        assert_eq!(compat["thinkingFormat"], serde_json::json!("deepseek"));
+        assert_eq!(
+            compat["sendSessionAffinityHeaders"],
+            serde_json::json!(true)
+        );
+        // The bundled model list is restored for a built-in provider.
+        assert_eq!(plan.models.len(), 1);
+        assert_eq!(plan.models[0].id, "glm-5.3-flash");
+    }
+    #[test]
+    fn volcengine_plan_levels_keep_glm_forced_thinking_and_allow_off_elsewhere() {
+        // GLM-5.3 family on Ark rejects `thinking.type: "disabled"`, so `off`
+        // must be reported as unsupported for it; other coding-plan models keep
+        // the toggle. Both come from the bundled catalog plus the derived maps.
+        let mut catalog = builtin_catalog().cloned().expect("builtin catalog");
+        apply_manual_effort(&mut catalog);
+        let plan = catalog.providers.get("volcengine-plan").unwrap();
+        let glm = plan
+            .models
+            .iter()
+            .find(|m| m.id == "glm-5.3-flash")
+            .unwrap();
+        assert_eq!(
+            thinking_levels(glm, plan),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        let deepseek = plan
+            .models
+            .iter()
+            .find(|m| m.id == "deepseek-v4-pro")
+            .unwrap();
+        assert_eq!(
+            thinking_levels(deepseek, plan),
+            vec!["off", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(glm.reasoning && deepseek.reasoning);
+    }
+
+    #[test]
+    fn volcengine_plan_keeps_an_explicit_model_map() {
+        let mut catalog = builtin_catalog().cloned().expect("builtin catalog");
+        let plan = catalog.providers.get_mut("volcengine-plan").unwrap();
+        let pin = plan.models.iter_mut().find(|m| m.id == "kimi-k3").unwrap();
+        pin.thinking_level_map = Some(serde_json::json!({"off": null, "high": "high"}));
+        apply_manual_effort(&mut catalog);
+        let plan = catalog.providers.get("volcengine-plan").unwrap();
+        let pin = plan.models.iter().find(|m| m.id == "kimi-k3").unwrap();
+        // An explicit map wins over the derived one: `off` stays unsupported, and
+        // the other levels follow pi's "absent means supported" rule.
+        assert_eq!(
+            thinking_levels(pin, plan),
+            vec!["minimal", "low", "medium", "high"]
+        );
     }
 }

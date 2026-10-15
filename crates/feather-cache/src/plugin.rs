@@ -4,7 +4,7 @@
 //! response payloads** are ported here — the pieces whose TypeScript
 //! behaviour is fully specified by `index.ts`/`src/retention.ts`/
 //! `src/request-payload.ts` and does not depend on Pi's host API. The
-//! host-coupled half of the plugin (event hooks, `models.json` repair,
+//! host-coupled half of the plugin (event hooks, model-catalog repair,
 //! footer stat shards, routing-registry symbols, environment mutation, tool
 //! ordering) has no Rust counterpart by design; see the crate docs for the
 //! precise boundary.

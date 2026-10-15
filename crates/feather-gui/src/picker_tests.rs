@@ -109,11 +109,24 @@ fn effort_options_follow_selected_model() {
         serde_json::from_str(
             r#"{"providers":{"local":{"models":[
         {"id":"reasoner","reasoning":true,"thinkingLevels":["off","low","high"]},
+        {"id":"mapped","reasoning":true,"thinkingLevelMap":{"off":null,"high":"high"}},
+        {"id":"generic","reasoning":true},
         {"id":"plain","reasoningNotSupported":true}]}}}"#,
         )
         .unwrap(),
     );
+    // A model that declares its own levels offers exactly those.
     app.settings.model = "local/reasoner".into();
+    assert_eq!(app.effort_levels(), vec!["off", "low", "high"]);
+    // A model that only maps levels derives them from the map (absent entries
+    // are supported, so a `null` level is the only exclusion).
+    app.settings.model = "local/mapped".into();
+    assert_eq!(
+        app.effort_levels(),
+        vec!["minimal", "low", "medium", "high"]
+    );
+    // No metadata at all keeps the generic effort list.
+    app.settings.model = "local/generic".into();
     assert_eq!(
         app.effort_levels(),
         vec!["off", "low", "medium", "high", "xhigh", "max"]

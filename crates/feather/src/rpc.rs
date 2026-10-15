@@ -31,9 +31,9 @@ async fn emit(out: &mut (impl AsyncWrite + Unpin), value: &Value) -> anyhow::Res
     Ok(())
 }
 fn model_cost(model: &str) -> Option<models::ModelCost> {
-    let cat = models::load()?;
-    let (_, _, m) = models::find(&cat, model)?;
-    m.cost.clone()
+    // Called once per assistant message while encoding a transcript, so it must
+    // not clone the whole catalog (see `models::with_catalog`).
+    models::cost_for(model)
 }
 fn usage_cost(u: Usage, cost: Option<&models::ModelCost>) -> Value {
     if let Some(c) = cost {
@@ -47,7 +47,11 @@ fn usage_cost(u: Usage, cost: Option<&models::ModelCost>) -> Value {
     }
 }
 fn zero_cost() -> Value {
-    json!({"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0})
+    static ZERO: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    ZERO.get_or_init(
+        || json!({"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}),
+    )
+    .clone()
 }
 /// pi's `Usage` wire value. `cost` stays a zero object so pi clients that read
 /// `cost.total` keep working, but `pricingKnown: false` marks those zeros as
@@ -56,12 +60,26 @@ fn zero_cost() -> Value {
 fn wire_usage(u: Usage) -> Value {
     json!({"input":u.input,"output":u.output,"cacheRead":u.cache_read,"cacheWrite":u.cache_write,"totalTokens":u.total(),"cost":zero_cost(),"pricingKnown":false})
 }
-fn model_object(provider: &str, p: &models::ProviderEntry, m: &models::ModelEntry) -> Value {
+/// The all-zero usage attached to every streaming delta. Deltas arrive per
+/// token, and the object never varies, so it is built once and cloned.
+fn wire_usage_zero() -> Value {
+    static ZERO: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    ZERO.get_or_init(|| wire_usage(Usage::default())).clone()
+}
+fn model_object(
+    provider: &str,
+    p: &models::ProviderEntry,
+    m: &models::ModelEntry,
+    global_context: u64,
+) -> Value {
     let mut v = json!({
         "id": m.id, "name": m.name.clone().unwrap_or_else(|| m.id.clone()),
         "provider": provider, "api": p.api.clone().unwrap_or_else(|| "openai-completions".into()),
         "reasoning": m.reasoning, "input": m.input,
-        "contextWindow": m.context_window, "maxTokens": m.max_tokens,
+        // What the agent will run with (global context capped by the model) and
+        // the model's own advertised limit, for clients that show both.
+        "contextWindow": models::effective_context_window(global_context, Some(m)),
+        "modelContextWindow": m.context_window, "maxTokens": m.max_tokens,
     });
     if let Some(b) = &p.base_url {
         v["baseUrl"] = json!(b);
@@ -69,22 +87,17 @@ fn model_object(provider: &str, p: &models::ProviderEntry, m: &models::ModelEntr
     if let Some(c) = &m.cost {
         v["cost"] = json!(c);
     }
-    if let Some(n) = m.reserve_tokens {
-        v["reserveTokens"] = json!(n);
-    }
-    if let Some(n) = m.keep_recent_tokens {
-        v["keepRecentTokens"] = json!(n);
-    }
     v["thinkingLevels"] = json!(models::thinking_levels(m, p));
     v
 }
 fn current_model_object(agent: &Agent) -> Value {
+    let effective = agent.config().context_window;
     if let Some(cat) = models::load() {
         if let Some((pid, p, m)) = models::find(&cat, &agent.model_id()) {
-            return model_object(pid, p, m);
+            return model_object(pid, p, m, effective);
         }
     }
-    json!({"id":agent.model_id(),"api":api_name(agent.config().api),"contextWindow":agent.config().context_window,"maxTokens":agent.config().max_tokens})
+    json!({"id":agent.model_id(),"api":api_name(agent.config().api),"contextWindow":effective,"maxTokens":agent.config().max_tokens})
 }
 fn available_thinking_levels(agent: &Agent) -> Vec<String> {
     if let Some(cat) = models::load() {
@@ -391,8 +404,44 @@ fn user_message(command: &Value) -> Result<Message, String> {
     }
     Ok(message)
 }
+/// Session names come from `metadata.redb`. `state()` runs per command and per
+/// settle, so the lookup is memoized on the database's (mtime, len) stamp
+/// rather than reopening redb every time.
+type NameCache =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, (Option<(u64, u64)>, Option<String>)>>;
+static SESSION_NAMES: std::sync::OnceLock<NameCache> = std::sync::OnceLock::new();
+
+fn file_stamp(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((mtime, meta.len()))
+}
+
 /// Display-name metadata lives in redb; legacy name JSON is archived on import.
 fn read_session_name(dir: &Path) -> Option<String> {
+    let stamp = file_stamp(&dir.join("metadata.redb"));
+    let cache =
+        SESSION_NAMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_stamp, name)) = guard.get(dir) {
+            if *cached_stamp == stamp {
+                return name.clone();
+            }
+        }
+    }
+    let name = read_session_name_uncached(dir);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(dir.to_path_buf(), (stamp, name.clone()));
+    }
+    name
+}
+
+fn read_session_name_uncached(dir: &Path) -> Option<String> {
     let store = feather_core::records::Records::open(&dir.join("metadata.redb")).ok()?;
     if let Some(name) = store.get::<String>("name").ok()? {
         return Some(name);
@@ -405,9 +454,17 @@ fn read_session_name(dir: &Path) -> Option<String> {
     Some(name)
 }
 fn write_session_name(dir: &Path, name: &str) -> std::io::Result<()> {
-    feather_core::records::Records::open(&dir.join("metadata.redb"))
+    let result = feather_core::records::Records::open(&dir.join("metadata.redb"))
         .and_then(|s| s.put("name", &name))
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other);
+    // The stamp check cannot see a same-length rename within one mtime tick, so
+    // drop the entry explicitly.
+    if let Some(cache) = SESSION_NAMES.get() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.remove(dir);
+        }
+    }
+    result
 }
 /// Directory holding the active transcript, from the live agent when idle or
 /// the cached session file path while a run owns the agent.
@@ -446,10 +503,20 @@ fn read_transcript(dir: &Path) -> Result<Vec<TranscriptEntry>, String> {
 }
 /// Map the linear transcript to pi-style entries: `parentId` chains to the
 /// previous entry (a degenerate tree, since feather has no branches).
-fn entries_payload(entries: &[TranscriptEntry]) -> Vec<Value> {
-    let mut out = Vec::with_capacity(entries.len());
-    let mut parent: Option<&str> = None;
-    for entry in entries {
+/// Encode transcript entries, optionally starting at `start` (the entry the
+/// client already has). Only the requested tail is encoded: building every
+/// entry first and dropping the prefix costs a full wire serialization of the
+/// whole transcript, which is the hottest path in `get_entries`.
+fn entries_payload(entries: &[TranscriptEntry], start: usize) -> Vec<Value> {
+    let start = start.min(entries.len());
+    let tail = &entries[start..];
+    let mut out = Vec::with_capacity(tail.len());
+    // The parent of the first returned entry is the last entry the client saw.
+    let mut parent: Option<&str> = start
+        .checked_sub(1)
+        .and_then(|previous| entries.get(previous))
+        .map(|entry| entry.id.as_str());
+    for entry in tail {
         out.push(json!({
             "type": "message",
             "id": entry.id,
@@ -544,11 +611,11 @@ impl EventMapper {
                         let index = self.next_index;
                         self.next_index += 1;
                         *slot = Some(index);
-                        records.push(json!({"type":"message_update","usage":wire_usage(Usage::default()),"assistantMessageEvent":{"type":if thinking {"thinking_start"} else {"text_start"},"contentIndex":index}}));
+                        records.push(json!({"type":"message_update","usage":wire_usage_zero(),"assistantMessageEvent":{"type":if thinking {"thinking_start"} else {"text_start"},"contentIndex":index}}));
                         index
                     }
                 };
-                records.push(json!({"type":"message_update","usage":wire_usage(Usage::default()),"assistantMessageEvent":{"type":if thinking {"thinking_delta"} else {"text_delta"},"contentIndex":index,"delta":delta}}));
+                records.push(json!({"type":"message_update","usage":wire_usage_zero(),"assistantMessageEvent":{"type":if thinking {"thinking_delta"} else {"text_delta"},"contentIndex":index,"delta":delta}}));
                 records
             }
             AgentEvent::ResponseReset {
@@ -566,7 +633,7 @@ impl EventMapper {
                 let delay = retry_delay_label(delay_ms);
                 vec![
                     json!({"type":"message_reset","message":{"role":"assistant","content":[],"stopReason":"pending"},"attempt":attempt,"maxAttempts":max_attempts,"delayMs":delay_ms,"reason":reason}),
-                    json!({"type":"message_update","usage":wire_usage(Usage::default()),"assistantMessageEvent":{"type":"response_reset","attempt":attempt,"maxAttempts":max_attempts,"delayMs":delay_ms,"reason":reason}}),
+                    json!({"type":"message_update","usage":wire_usage_zero(),"assistantMessageEvent":{"type":"response_reset","attempt":attempt,"maxAttempts":max_attempts,"delayMs":delay_ms,"reason":reason}}),
                     json!({"type":"notice","message":format!("Retrying response: attempt {attempt}/{max_attempts} in {delay}"),"willRetry":true,"attempt":attempt,"maxAttempts":max_attempts,"delayMs":delay_ms}),
                 ]
             }
@@ -1262,8 +1329,7 @@ where
                                 None => 0,
                             };
                             let leaf_id = entries.last().map(|entry| entry.id.clone());
-                            let payload: Vec<Value> =
-                                entries_payload(&entries).into_iter().skip(start).collect();
+                            let payload = entries_payload(&entries, start);
                             Ok(Some(json!({"entries": payload, "leafId": leaf_id})))
                         })
                     }
@@ -1298,7 +1364,8 @@ where
                         Ok(Some(v))
                     }
                     "get_available_models" => {
-                        let models = models::load().map(|cat| cat.providers.iter().flat_map(|(pid,p)| p.models.iter().map(move |m| model_object(pid,p,m))).collect::<Vec<_>>()).unwrap_or_default();
+                        let global_context = idle.as_ref().map(|a| a.config().context_window).unwrap_or(200_000);
+                        let models = models::load().map(|cat| cat.providers.iter().flat_map(|(pid,p)| p.models.iter().map(move |m| model_object(pid,p,m,global_context))).collect::<Vec<_>>()).unwrap_or_default();
                         Ok(Some(json!({"models":models})))
                     }
                     "get_available_thinking_levels" => {

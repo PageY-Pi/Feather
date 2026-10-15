@@ -31,6 +31,44 @@ pub fn strip_effort_presets(value: &mut Value) {
         _ => {}
     }
 }
+
+/// Retired model state: the per-model `modelLimits` budget map (context/reserve
+/// /preserved are one global setting now) and per-model `reserveTokens` /
+/// `keepRecentTokens` keys, plus stale deletion entries for built-in providers
+/// whose model lists Feather owns.
+pub fn strip_retired_model_state(value: &mut Value) {
+    if let Value::Object(map) = value {
+        map.remove("modelLimits");
+    }
+    if let Some(deleted) = value.get_mut("deletedModels").and_then(Value::as_array_mut) {
+        deleted.retain(|item| {
+            item.as_str()
+                .and_then(|s| s.split_once('/'))
+                .is_none_or(|(pid, _)| !crate::models::is_managed_provider(pid))
+        });
+    }
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "reserveTokens",
+                "reserve_tokens",
+                "keepRecentTokens",
+                "keep_recent_tokens",
+            ] {
+                map.remove(key);
+            }
+            for v in map.values_mut() {
+                strip_retired_model_state(v);
+            }
+        }
+        Value::Array(list) => {
+            for v in list {
+                strip_retired_model_state(v);
+            }
+        }
+        _ => {}
+    }
+}
 fn with_db<T>(home: &Path, f: impl FnOnce(&Database) -> io::Result<T>) -> io::Result<T> {
     fs::create_dir_all(home)?;
     #[cfg(unix)]
@@ -282,11 +320,19 @@ pub fn update(home: &Path, key: &str, edit: impl FnOnce(&mut Value)) -> io::Resu
             edit(&mut value);
             if key == "models" {
                 strip_effort_presets(&mut value);
+                strip_retired_model_state(&mut value);
             }
             let text = serde_json::to_string(&value).map_err(io::Error::other)?;
             table.insert(key, text.as_str()).map_err(io::Error::other)?;
         }
         tx.commit().map_err(io::Error::other)
+    })
+    .inspect(|()| {
+        // A `models` write changes the resolved catalog, so drop the cached copy
+        // instead of serving stale provider/model data for the rest of the run.
+        if key == "models" {
+            crate::models::invalidate_catalog();
+        }
     })
 }
 pub fn write(home: &Path, key: &str, value: &Value) -> io::Result<()> {
@@ -410,6 +456,45 @@ mod tests {
         assert_eq!(
             read(&home, "capabilities").unwrap().unwrap()["test"]["fetched"],
             true
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn retired_per_model_limits_and_builtin_deletions_are_dropped() {
+        let home = std::env::temp_dir().join(feather_core::provider::gen_id("retired-limits"));
+        fs::create_dir_all(&home).unwrap();
+        // A build before the global context setting persisted per-model budgets
+        // and could hide bundled models behind `deletedModels`.
+        write(
+            &home,
+            "models",
+            &json!({
+                "modelLimits": {"volcengine-plan/glm-5.3-flash": {"contextWindow": 272000, "reserveTokens": 16384, "keepRecentTokens": 40000}},
+                "deletedModels": ["volcengine-plan/glm-5.3-flash", "my-proxy/local"],
+                "providers": {
+                    "my-proxy": {"baseUrl": "https://example.test/v1", "models": [{"id": "local", "reserveTokens": 4096, "keepRecentTokens": 2048, "maxTokens": 8192}]},
+                    "volcengine-plan": {"baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3", "api": "openai-completions", "apiKey": "ark-synthetic"}
+                }
+            }),
+        )
+        .unwrap();
+        let value = read(&home, "models").unwrap().unwrap();
+        assert!(value.get("modelLimits").is_none());
+        // Only the deletable custom provider keeps its deletion entry.
+        assert_eq!(value["deletedModels"], json!(["my-proxy/local"]));
+        let model = &value["providers"]["my-proxy"]["models"][0];
+        assert!(model.get("reserveTokens").is_none());
+        assert!(model.get("keepRecentTokens").is_none());
+        // Credentials and routing metadata survive the cleanup.
+        assert_eq!(model["maxTokens"], 8192);
+        assert_eq!(
+            value["providers"]["volcengine-plan"]["apiKey"],
+            "ark-synthetic"
+        );
+        assert_eq!(
+            value["providers"]["volcengine-plan"]["api"],
+            "openai-completions"
         );
         fs::remove_dir_all(home).unwrap();
     }

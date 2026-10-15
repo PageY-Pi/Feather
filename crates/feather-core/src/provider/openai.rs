@@ -293,7 +293,9 @@ fn apply_openai_thinking(body: &mut Value, compat: &OpenAiCompat, thinking: Opti
     // pi clamps the requested level against the model map before mapping it.
     // feather only clamps when the caller supplied a custom map, so an absent
     // map keeps the existing minimal..max passthrough.
-    let level = if compat.has_level_map {
+    let level = if raw == "off" {
+        "off".to_string()
+    } else if compat.has_level_map {
         clamp_level(&compat.thinking_level_map, raw)
     } else {
         raw.to_string()
@@ -517,12 +519,6 @@ fn map_stop(s: &str) -> StopReason {
         "content_filter" => StopReason::Error,
         _ => StopReason::Stop,
     }
-}
-
-// silence unused-variant lint when only constructed via Message::assistant
-#[allow(dead_code)]
-fn _never(c: &ContentBlock) -> bool {
-    matches!(c, ContentBlock::Thinking { .. })
 }
 
 #[cfg(test)]

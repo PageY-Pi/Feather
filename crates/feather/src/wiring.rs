@@ -69,7 +69,7 @@ fn catalog_entry<'a>(
 }
 
 /// Compatibility entry point for callers without a provider id. Frontends use
-/// provider_from_entry_for so auth.json can be routed to the correct account.
+/// provider_with_entry so the credential resolves for the correct account.
 pub fn provider_from_entry(p: &models::ProviderEntry, m: &models::ModelEntry) -> ProviderRef {
     provider_from_entry_for("", p, m)
 }
@@ -95,6 +95,15 @@ fn provider_with_entry(
         feather_core::provider::compat::merge_compat(p.compat.as_ref(), m.compat.as_ref());
     if !compat.is_object() {
         compat = serde_json::json!({});
+    }
+    if models::is_volcengine_provider(pid) {
+        compat["supportsDeveloperRole"] = serde_json::json!(false);
+        compat["supportsReasoningEffort"] = serde_json::json!(true);
+        compat["maxTokensField"] = serde_json::json!("max_tokens");
+        compat["thinkingFormat"] = serde_json::json!("deepseek");
+        if let Some(map) = models::volcengine_thinking_map(pid, &m.id) {
+            compat["thinkingLevelMap"] = map;
+        }
     }
     compat["reasoning"] = serde_json::json!(m.reasoning);
     if let Some(map) = &m.thinking_level_map {
@@ -341,7 +350,7 @@ pub fn runtime_components(
         session_dir,
         &provider,
     );
-    let mut compaction: CompactionSettings = (&settings.compaction).into();
+    let compaction: CompactionSettings = (&settings.compaction).into();
     // the provider/id prefix is catalog routing only — the wire request
     // carries the bare model id (deepseek rejects "deepseek/deepseek-flash")
     let wire_model = entry.map(|(_, _, m)| m.id.clone()).unwrap_or_else(|| {
@@ -400,18 +409,12 @@ Project-specific instructions and guidelines:
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(settings.max_tokens),
         temperature: settings.temperature,
-        context_window: entry
-            .and_then(|(_, _, m)| m.context_window)
-            .unwrap_or(settings.context_window),
-        compaction: {
-            if let Some(reserved) = entry.and_then(|(_, _, m)| m.reserve_tokens) {
-                compaction.reserve_tokens = reserved;
-            }
-            if let Some(preserved) = entry.and_then(|(_, _, m)| m.keep_recent_tokens) {
-                compaction.keep_recent_tokens = preserved;
-            }
-            compaction
-        },
+        // One global context setting, capped by what the selected model accepts.
+        context_window: models::effective_context_window(
+            settings.context_window,
+            entry.map(|(_, _, m)| m),
+        ),
+        compaction,
         compaction_model,
         tools: registry.defs().into(),
     };
@@ -424,7 +427,7 @@ pub fn model_control(
     agent: &mut Agent,
     command: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let catalog = models::load().ok_or("No model catalog configured in ~/.feather/models.json")?;
+    let catalog = models::load().ok_or("No model catalog configured in ~/.feather/config.redb")?;
     let requested = match command["type"].as_str() {
         Some("set_model") => format!(
             "{}/{}",
@@ -472,6 +475,6 @@ pub fn model_control(
     agent.reconfigure(runtime, provider, tools);
     *settings = next;
     Ok(
-        serde_json::json!({"id":model.id,"name":model.name,"provider":pid,"api":provider_entry.api,"reasoning":model.reasoning,"input":model.input,"contextWindow":model.context_window,"maxTokens":model.max_tokens,"cost":model.cost}),
+        serde_json::json!({"id":model.id,"name":model.name,"provider":pid,"api":provider_entry.api,"reasoning":model.reasoning,"input":model.input,"contextWindow":models::effective_context_window(settings.context_window,Some(model)),"maxTokens":model.max_tokens,"cost":model.cost}),
     )
 }

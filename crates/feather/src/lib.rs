@@ -3,7 +3,6 @@
 
 pub mod auth;
 pub mod bash;
-pub mod capabilities;
 pub mod command_policy;
 pub mod config;
 pub mod config_store;
@@ -17,12 +16,10 @@ pub mod rpc;
 mod shell;
 pub mod subagent;
 pub mod tasks;
-// The interactive TUI module was removed. The TUI now ships as the separate
-// `feather-gui` binary; this crate no longer references `tui_loop`.
-// Obsolete file left for the parent to delete: src/tui_loop.rs
 pub mod web;
 pub mod wiring;
-// Terminal theme/editor preferences retired with the TUI frontend.
+// The interactive TUI frontend was retired: GUI work lives in `feather-gui`, and
+// this crate exposes only the agent wiring, tools and the RPC bridge.
 
 #[cfg(test)]
 mod http_test;

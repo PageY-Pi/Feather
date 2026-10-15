@@ -15135,6 +15135,7 @@
         "zaiToolStream": true
       }
     },
+
     "zai-coding-cn": {
       "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
       "api": "openai-completions",
@@ -15287,6 +15288,118 @@
         "supportsStrictMode": true,
         "zaiToolStream": true
       }
+    },
+    "volcengine-plan": {
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "api": "openai-completions",
+      "apiKey": "$ARK_API_KEY",
+      "models": [
+        {
+          "id": "ark-code-latest",
+          "name": "Ark Code Latest",
+          "contextWindow": 1048576,
+          "maxTokens": 256000,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "doubao-seed-evolving",
+          "name": "Doubao Seed Evolving",
+          "contextWindow": 1048576,
+          "maxTokens": 256000,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "doubao-seed-2.1-pro",
+          "name": "Doubao Seed 2.1 Pro",
+          "contextWindow": 1048576,
+          "maxTokens": 256000,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "doubao-seed-2.1-lite",
+          "name": "Doubao Seed 2.1 Lite",
+          "contextWindow": 1048576,
+          "maxTokens": 256000,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "doubao-seed-2.0-mini",
+          "name": "Doubao Seed 2.0 Mini",
+          "contextWindow": 262144,
+          "maxTokens": 128000,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "glm-5.3",
+          "name": "GLM-5.3",
+          "contextWindow": 1048576,
+          "maxTokens": 128000,
+          "reasoning": true,
+          "input": ["text"]
+        },
+        {
+          "id": "glm-5.3-flash",
+          "name": "GLM-5.3 Flash",
+          "contextWindow": 1048576,
+          "maxTokens": 128000,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro",
+          "contextWindow": 1048576,
+          "maxTokens": 393216,
+          "reasoning": true,
+          "input": ["text"]
+        },
+        {
+          "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "contextWindow": 1048576,
+          "maxTokens": 393216,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash",
+          "contextWindow": 1048576,
+          "maxTokens": 393216,
+          "reasoning": true,
+          "input": ["text"]
+        },
+        {
+          "id": "kimi-k2.8-preview",
+          "name": "Kimi K2.8 Preview",
+          "contextWindow": 1048576,
+          "maxTokens": 1048576,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "kimi-k3",
+          "name": "Kimi K3",
+          "contextWindow": 1048576,
+          "maxTokens": 65536,
+          "reasoning": true,
+          "input": ["text", "image"]
+        },
+        {
+          "id": "minimax-m3",
+          "name": "MiniMax M3",
+          "contextWindow": 200000,
+          "maxTokens": 128000,
+          "reasoning": true,
+          "input": ["text"]
+        }
+      ]
     }
   }
 }
+

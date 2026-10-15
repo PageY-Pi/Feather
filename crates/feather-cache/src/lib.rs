@@ -32,7 +32,7 @@
 //!
 //! * Pi event hooks (`before_provider_request`, `message_end`, …) — feather
 //!   calls [`CacheOptimizer`] through the `CachePlanner` seam instead.
-//! * `models.json` auto-repair / rollback and the atomic receipt files — that
+//! * model-catalog auto-repair / rollback and the atomic receipt files — that
 //!   is a host configuration concern, not a request concern.
 //! * Footer stat shards under `pi-cache-optimizer-stats.d/` — feather keeps
 //!   its own metrics.

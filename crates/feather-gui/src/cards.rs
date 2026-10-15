@@ -768,58 +768,59 @@ fn inline(text: &str) -> egui::text::LayoutJob {
     }
     job
 }
-
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
+    use super::*;
+    #[test]
+    fn short_one_line_user_bubble_hugs_text_but_long_text_keeps_maximum() {
+        let ctx = egui::Context::default();
+        crate::theme::apply_theme(&ctx);
+        let mut short = ChatRow::new(RowKind::User, "ok");
+        let mut long = ChatRow::new(RowKind::User, "long ".repeat(300));
+        let render = |ctx: &egui::Context, row: &mut ChatRow| {
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 300.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .show(ctx, |ui| render_row(ui, row, 0.0, true));
+                    },
+                ));
+            }
+            output.unwrap()
+        };
+        let short_output = render(&ctx, &mut short);
+        let long_output = render(&ctx, &mut long);
+        let rect = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.fill == USER_BUBBLE => Some(rect.rect),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            rect(&short_output).width() < 120.0,
+            "short bubble should hug content: {:?}",
+            rect(&short_output)
+        );
+        assert!(
+            rect(&long_output).width() > rect(&short_output).width() * 3.0,
+            "long bubble should retain readable width"
+        );
+    }
+
     #[test]
     fn user_bubble_is_right_anchored_but_each_line_is_left_aligned() {
-        #[test]
-        fn short_one_line_user_bubble_hugs_text_but_long_text_keeps_maximum() {
-            let ctx = egui::Context::default();
-            crate::theme::apply_theme(&ctx);
-            let mut short = ChatRow::new(RowKind::User, "ok");
-            let mut long = ChatRow::new(RowKind::User, "long ".repeat(300));
-            let render = |ctx: &egui::Context, row: &mut ChatRow| {
-                let mut output = None;
-                for _ in 0..3 {
-                    output = Some(ctx.run(
-                        egui::RawInput {
-                            screen_rect: Some(egui::Rect::from_min_size(
-                                egui::Pos2::ZERO,
-                                egui::vec2(900.0, 300.0),
-                            )),
-                            ..Default::default()
-                        },
-                        |ctx| {
-                            egui::CentralPanel::default()
-                                .show(ctx, |ui| render_row(ui, row, 0.0, true));
-                        },
-                    ));
-                }
-                output.unwrap()
-            };
-            let short_output = render(&ctx, &mut short);
-            let long_output = render(&ctx, &mut long);
-            let rect = |output: &egui::FullOutput| {
-                output
-                    .shapes
-                    .iter()
-                    .find_map(|shape| match &shape.shape {
-                        egui::Shape::Rect(rect) if rect.fill == USER_BUBBLE => Some(rect.rect),
-                        _ => None,
-                    })
-                    .unwrap()
-            };
-            assert!(
-                rect(&short_output).width() < 120.0,
-                "short bubble should hug content: {:?}",
-                rect(&short_output)
-            );
-            assert!(
-                rect(&long_output).width() > rect(&short_output).width() * 3.0,
-                "long bubble should retain readable width"
-            );
-        }
         for width in [360.0, 900.0] {
             let ctx = egui::Context::default();
             crate::theme::apply_theme(&ctx);
@@ -877,7 +878,6 @@ mod tests {
             assert!((text.pos.x - bubble.left() - 18.0).abs() < 1.0);
         }
     }
-    use super::*;
     #[test]
     fn global_thinking_toggle_folds_header_without_hiding_it() {
         let ctx = egui::Context::default();

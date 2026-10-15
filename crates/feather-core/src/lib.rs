@@ -3,7 +3,7 @@
 //! Library-first: the agent loop, linear session with turn-granularity
 //! snapshots, streaming providers, compaction and the static tool registry
 //! all live here with no I/O assumptions beyond async — the same code drives
-//! the TUI binary, one-shot mode and tests.
+//! the GUI binary, one-shot mode and tests.
 
 pub mod agent;
 pub mod compaction;

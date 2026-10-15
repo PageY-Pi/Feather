@@ -1,6 +1,6 @@
-# Feather 1.0.6 Windows installer
+# Feather 1.1.0 Windows installer
 
-Share `dist/Feather-1.0.6-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.1.0-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -25,7 +25,16 @@ Build:
 3. Install Inno Setup 6, then `ISCC installer\Feather.iss`.
 
 This version:
-- 1.0.6 aligns automatic context compaction with Pi: compaction triggers at context minus the configured reserve, does not subtract max output, preserves approximately 40k recent tokens by default, and supports per-model context/reserve/preserved-token overrides.
+- 1.1.0 keeps compaction aligned with Pi (trigger at context minus reserve, max
+  output not subtracted) but moves the retained-token budget out of per-model
+  settings: context/reserve/preserved tokens are now one global setting, and the
+  effective window is `min(global context, model context window)`.
+- 1.1.0 makes bundled providers read-only: their models, wire API and endpoints
+  come from the compiled catalog, so only the credential is user-owned. The
+  duplicate `volcano` provider was folded into `volcengine-plan`, and every
+  Volcano model routes to the Ark coding endpoint.
+- 1.1.0 memoizes the resolved model catalog and the session-name lookup, so RPC
+  transcript encoding no longer rebuilds the catalog per message.
 - Ordinary Backspace remains unchanged when no IME-owned key is reported.
 - 1.0.0 efficiency review: shared request ownership (no deep history/tool-schema
   clone), cached token/hash/prefix planning, linear SSE/FIFO, combined audit/meta

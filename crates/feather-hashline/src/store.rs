@@ -611,7 +611,6 @@ mod tests {
         let rows = s.read(&f, None, None).unwrap();
         assert_eq!(rows.len(), 3);
         let a0 = Anchor::parse(rows[0].split_once('│').unwrap().0).unwrap();
-        let a2 = Anchor::parse(rows[2].split_once('│').unwrap().0).unwrap();
 
         let diff = s.replace(&f, a0, a0, "ALPHA").unwrap();
         // pi-style diff: 2 churn rows (Removed+Added) + Kept context + Ellipsis

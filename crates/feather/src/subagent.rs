@@ -132,7 +132,8 @@ impl SubagentTool {
             }
             provider = crate::wiring::provider_from_entry_for(pid, p, m);
             model = m.id.clone();
-            context = m.context_window.unwrap_or(context);
+            // Same global-vs-model rule as the parent agent.
+            context = crate::models::effective_context_window(self.context_window, Some(m));
             if let Some(want) = args
                 .get("thinking")
                 .and_then(|v| v.as_str())

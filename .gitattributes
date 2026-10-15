@@ -1,0 +1,13 @@
+# Every text file in this repository is stored with LF endings, and the working
+# tree keeps LF too (the project is cross-platform and Windows tools here — git,
+# cargo, rustfmt, PowerShell — all accept LF). Declaring it explicitly means an
+# editor or script that rewrites a file with CRLF cannot silently turn a one-line
+# change into a whole-file diff.
+* text=auto eol=lf
+
+# Git's text detection is heuristic; these are binary regardless of content.
+*.png binary
+*.ico binary
+*.exe binary
+*.redb binary
+*.lock binary

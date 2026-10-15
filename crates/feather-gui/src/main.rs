@@ -56,8 +56,6 @@ mod theme;
 mod transcript;
 mod window_chrome;
 mod workspace;
-#[cfg(test)]
-use cards::render_row;
 use theme::{
     apply_theme, install_fonts, soft_shadow, INK, MUTED, PANEL, PANEL_2, RED, SIDEBAR, SOFT_ACCENT,
     TEAL, TEXT,
@@ -459,10 +457,10 @@ impl FeatherApp {
                     let mut preserved = old.clone();
                     preserved.name = m.name;
                     preserved.reasoning_not_supported = m.reasoning_not_supported;
-                    preserved.context_window = m.context_window;
                     preserved.max_tokens = m.max_tokens;
-                    preserved.reserve_tokens = m.reserve_tokens;
-                    preserved.keep_recent_tokens = m.keep_recent_tokens;
+                    // Context is a single global setting now: model entries keep no
+                    // per-model budget, so editing a model cannot reintroduce one.
+                    preserved.context_window = None;
                     m = preserved;
                 }
                 match models::upsert_model(&pid, p, m) {
@@ -474,13 +472,13 @@ impl FeatherApp {
                     Err(e) => Err(e),
                 }
             }
-            Action::SaveLimits(pid, id, context, reserve, preserved) => {
-                match models::validate_model_limits(context, reserve, preserved)
-                    .and_then(|_| models::save_model_limits(&pid, &id, context, reserve, preserved))
-                {
+            Action::SaveContext(context, reserve, preserved) => {
+                match models::validate_context_limits(context, reserve, preserved) {
                     Ok(()) => {
-                        self.catalog = models::load();
-                        self.auth_changed = true;
+                        self.settings.context_window = context;
+                        self.settings.compaction.reserve_tokens = reserve;
+                        self.settings.compaction.keep_recent_tokens = preserved;
+                        self.apply_settings_change();
                         Ok(())
                     }
                     Err(e) => Err(e),
@@ -1116,13 +1114,15 @@ impl FeatherApp {
     }
 
     fn renderer_window(&mut self, ctx: &egui::Context) {
+        let Some(picker) = &mut self.renderer_picker else {
+            return;
+        };
+        // Computed only while the picker is open: this runs per frame, and
+        // `try_lock` otherwise contends with a streaming response for nothing.
         let enabled = self.exit.is_none()
             && !self.running
             && self.auth_pending.is_empty()
             && self.agent.as_ref().map_or(true, |a| a.try_lock().is_ok());
-        let Some(picker) = &mut self.renderer_picker else {
-            return;
-        };
         let mut open = true;
         let picked = renderer_choice::picker_window(ctx, picker, self.renderer, enabled, &mut open);
         if let Some(backend) = picked {
@@ -2627,10 +2627,20 @@ impl FeatherApp {
                                             highlighted.as_ref().is_some_and(|(provider, id)| {
                                                 provider == pid && id == &m.id
                                             });
-                                        let context = m
-                                            .context_window
-                                            .map(|n| format!("{}k context", n / 1000))
-                                            .unwrap_or_default();
+                                        // Show what the agent will really use: the
+                                        // global context capped by the model window.
+                                        let effective = models::effective_context_window(
+                                            self.settings.context_window,
+                                            Some(m),
+                                        );
+                                        let context = match m.context_window {
+                                            Some(cap) if cap > effective => format!(
+                                                "{}k of {}k context",
+                                                effective / 1000,
+                                                cap / 1000
+                                            ),
+                                            _ => format!("{}k context", effective / 1000),
+                                        };
                                         let response = egui::Frame::none()
                                             .fill(if selected { SOFT_ACCENT } else { PANEL_2 })
                                             .rounding(12.0)
@@ -2913,11 +2923,47 @@ impl FeatherApp {
         });
     }
 
+    /// `AuthStore` memoized on the config database's (mtime, len).
+    ///
+    /// The login window renders every frame, so reading the credential store
+    /// from redb per frame is pure waste. The stamp keeps the behavior exact:
+    /// any write — this process or another one — changes the file and forces a
+    /// reload.
+    fn cached_auth_store(home: &std::path::Path) -> Result<oauth::AuthStore, String> {
+        fn stamp(path: &std::path::Path) -> Option<(u64, u64)> {
+            let meta = std::fs::metadata(path).ok()?;
+            let mtime = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as u64;
+            Some((mtime, meta.len()))
+        }
+        type Cache = std::sync::Mutex<Option<(Option<(u64, u64)>, oauth::AuthStore)>>;
+        static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+        let path = home.join("config.redb");
+        let current = stamp(&path);
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(guard) = cache.lock() {
+            if let Some((cached, store)) = guard.as_ref() {
+                if *cached == current {
+                    return Ok(store.clone());
+                }
+            }
+        }
+        let store = oauth::AuthStore::load_from(&path)?;
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((current, store.clone()));
+        }
+        Ok(store)
+    }
+
     fn login_window(&mut self, ctx: &egui::Context) {
         if !self.show_login {
             return;
         }
-        let auth_error = match oauth::AuthStore::load_from(&self.home.join("config.redb")) {
+        let auth_error = match Self::cached_auth_store(&self.home) {
             Ok(store) => {
                 self.auth = store;
                 None
@@ -2964,10 +3010,15 @@ impl FeatherApp {
                         "OAuth / built-in providers",
                     );
                 });
-                if let Some(action) = self.model_manager.show_limits(
+                if let Some(action) = self.model_manager.show_context_settings(
                     ui,
                     self.catalog.as_ref(),
                     &self.settings.model,
+                    (
+                        self.settings.context_window,
+                        self.settings.compaction.reserve_tokens,
+                        self.settings.compaction.keep_recent_tokens,
+                    ),
                     self.running,
                 ) {
                     self.manage_model(action);

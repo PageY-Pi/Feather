@@ -1,4 +1,6 @@
 /target
+# The vendored egui-winit patch is built in place, so it grows its own target/.
+/vendor/*/target/
 Cargo.lock.bak
 *.redb
 *.redb.tmp

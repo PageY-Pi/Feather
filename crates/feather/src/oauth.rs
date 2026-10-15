@@ -30,13 +30,14 @@ pub enum Flow {
     OpenRouter,
     /// Radius gateway: PKCE with a fixed callback port, discovered authorize endpoint
     Radius,
-    /// user pastes an API key (pi's `/login zai` semantics: stored in auth.json)
+    /// user pastes an API key (pi's `/login zai` semantics: stored in the
+    /// `auth` document of `config.redb`)
     ApiKey,
 }
 
 /// One OAuth-capable provider (values mirror pi's provider implementations).
 pub struct OAuthProvider {
-    /// key in auth.json / models.json, e.g. "openai-codex"
+    /// key in the `auth` document of `config.redb`, e.g. "openai-codex"
     pub id: &'static str,
     /// login flow to run
     pub kind: Flow,
@@ -166,6 +167,18 @@ pub const ZAI_CODING_CN: OAuthProvider = OAuthProvider {
     scopes: "",
 };
 
+/// Volcengine Ark Coding Plan uses an API key and OpenAI-compatible Chat Completions.
+pub const VOLCENGINE_PLAN: OAuthProvider = OAuthProvider {
+    id: "volcengine-plan",
+    kind: Flow::ApiKey,
+    authorize_url: "https://ark.volcengine.com/region:cn-beijing/apikey",
+    token_url: "",
+    client_id: "",
+    redirect_port: 0,
+    redirect_path: "",
+    scopes: "",
+};
+
 pub const PROVIDERS: &[&OAuthProvider] = &[
     &OPENAI_CODEX,
     &ANTHROPIC,
@@ -176,6 +189,7 @@ pub const PROVIDERS: &[&OAuthProvider] = &[
     &OPENROUTER,
     &RADIUS,
     &ZAI,
+    &VOLCENGINE_PLAN,
     &ZAI_CODING_CN,
 ];
 
@@ -184,7 +198,7 @@ pub fn provider(id: &str) -> Option<&'static OAuthProvider> {
 }
 
 // ---------------------------------------------------------------------------
-// auth.json store (pi-compatible shape)
+// Credential store: the `auth` document of `config.redb` (pi-compatible shape)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,7 +257,7 @@ impl OAuthAccount {
     }
 }
 
-/// Flat provider map; no envelope or version marker, matching pi's auth.json.
+/// Flat provider map; no envelope or version marker, matching pi's auth shape.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AuthStore(pub BTreeMap<String, OAuthAccount>);
@@ -509,12 +523,6 @@ pub struct LoginPrompt {
 
 /// UI callback for device codes and browser authorization URLs.
 pub type Notify<'a> = &'a dyn Fn(LoginPrompt);
-
-/// Run one full login on a worker thread. Blocks; call from `std::thread::spawn`.
-#[allow(dead_code)] // convenience wrapper (tests / future CLI)
-pub fn run_login(p: &'static OAuthProvider) -> Result<LoginOutcome, String> {
-    run_login_with_notify(p, &|_| {})
-}
 
 pub fn run_login_with_notify(
     p: &'static OAuthProvider,
