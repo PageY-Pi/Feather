@@ -115,7 +115,7 @@ async fn auto_summary_is_private_and_preserves_latest_completed_answer() {
 }
 
 #[tokio::test]
-async fn threshold_noop_emits_no_refresh_or_summary_and_keeps_final_text() {
+async fn threshold_noop_reports_unavoidable_over_limit_without_repeating_compaction() {
     let session = Session::memory(Path::new("."), "compaction-noop");
     let mut agent = agent(
         session,
@@ -124,23 +124,15 @@ async fn threshold_noop_emits_no_refresh_or_summary_and_keeps_final_text() {
         FauxScript::new().with_text("ONLY FINAL"),
     );
     let mut events = agent.subscribe();
-    assert_eq!(
-        agent
-            .prompt(&"question ".repeat(1000))
-            .await
-            .unwrap()
-            .final_text,
-        "ONLY FINAL"
-    );
+    let error = agent.prompt(&"question ".repeat(1000)).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("context remains over model limit"));
     assert!(
         !drain(&mut events)
             .iter()
             .any(|e| matches!(e, AgentEvent::CompactionDone { .. })),
-        "nothing was compacted: no refresh notice"
-    );
-    assert_eq!(
-        agent.session().messages().last().unwrap().text(),
-        "ONLY FINAL"
+        "an ineffective compaction must not report repeated refreshes"
     );
 }
 

@@ -461,6 +461,8 @@ impl FeatherApp {
                     preserved.reasoning_not_supported = m.reasoning_not_supported;
                     preserved.context_window = m.context_window;
                     preserved.max_tokens = m.max_tokens;
+                    preserved.reserve_tokens = m.reserve_tokens;
+                    preserved.keep_recent_tokens = m.keep_recent_tokens;
                     m = preserved;
                 }
                 match models::upsert_model(&pid, p, m) {
@@ -472,6 +474,19 @@ impl FeatherApp {
                     Err(e) => Err(e),
                 }
             }
+            Action::SaveLimits(pid, id, context, reserve, preserved) => {
+                match models::validate_model_limits(context, reserve, preserved)
+                    .and_then(|_| models::save_model_limits(&pid, &id, context, reserve, preserved))
+                {
+                    Ok(()) => {
+                        self.catalog = models::load();
+                        self.auth_changed = true;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+
             Action::Delete(pid, id) => match models::delete_model(&pid, &id) {
                 Ok(()) => {
                     self.catalog = models::load();
@@ -1849,6 +1864,12 @@ impl FeatherApp {
                                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                             )
                             .show(ui, |ui| {
+                                // Scope the registry-style rails to the workspace tree;
+                                // other collapsing panels keep their lighter appearance.
+                                ui.visuals_mut().indent_has_left_vline = true;
+                                ui.visuals_mut().widgets.noninteractive.bg_stroke =
+                                    egui::Stroke::new(1.0_f32, workspace::TREE_GUIDE_COLOR);
+                                // Folder bodies are indented; egui paints their left rails using this local stroke.
                                 let root = self.root.clone();
                                 self.tree_dir(ui, &root, 0);
                             });
@@ -1866,13 +1887,28 @@ impl FeatherApp {
 
         for name in dirs {
             let path = dir.join(name);
-            let header = egui::RichText::new(name).size(13.0).color(TEXT);
+            // CollapsingHeader normally extends long labels. Give it a single-line
+            // galley instead so deep/long folder names cannot widen the sidebar.
+            let header_width =
+                (ui.available_width() - ui.spacing().indent - ui.spacing().button_padding.x)
+                    .max(0.0);
+            let header = egui::WidgetText::from(egui::RichText::new(name).size(13.0).color(TEXT))
+                .into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Truncate),
+                    header_width,
+                    egui::TextStyle::Button,
+                );
+
             ui.push_id(path.to_string_lossy().to_string(), |ui| {
                 egui::CollapsingHeader::new(header)
                     .default_open(depth == 0 && dirs.len() <= 6)
-                    .show_unindented(ui, |ui| {
+                    // Render the normal indented body so egui paints a vertical guide rail.
+                    .show(ui, |ui| {
                         self.tree_dir(ui, &path, depth + 1);
-                    });
+                    })
+                    .header_response
+                    .on_hover_text(path.display().to_string());
             });
         }
         for name in files {
@@ -1882,12 +1918,25 @@ impl FeatherApp {
                 .unwrap_or(&path)
                 .display()
                 .to_string();
-            let response = ui.add_sized(
-                [ui.available_width(), 20.0],
-                egui::Label::new(egui::RichText::new(name).size(13.0).color(TEXT))
-                    .truncate()
-                    .sense(egui::Sense::click()),
-            );
+            // Reserve the same disclosure-arrow column as folder headers, so
+            // files and folders belonging to one parent share a text baseline.
+            let response = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(ui.available_width().max(0.0), 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_space(ui.spacing().indent);
+                        ui.add_sized(
+                            [ui.available_width().max(0.0), 20.0],
+                            egui::Label::new(egui::RichText::new(name).size(13.0).color(TEXT))
+                                .halign(egui::Align::Min)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                    },
+                )
+                .inner;
             if response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(name)
@@ -2915,6 +2964,15 @@ impl FeatherApp {
                         "OAuth / built-in providers",
                     );
                 });
+                if let Some(action) = self.model_manager.show_limits(
+                    ui,
+                    self.catalog.as_ref(),
+                    &self.settings.model,
+                    self.running,
+                ) {
+                    self.manage_model(action);
+                }
+                ui.add_space(6.0);
                 ui.add_space(6.0);
                 if self.model_manager.enabled {
                     if ctx.screen_rect().height() < 700.0 {

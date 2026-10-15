@@ -69,6 +69,12 @@ fn model_object(provider: &str, p: &models::ProviderEntry, m: &models::ModelEntr
     if let Some(c) = &m.cost {
         v["cost"] = json!(c);
     }
+    if let Some(n) = m.reserve_tokens {
+        v["reserveTokens"] = json!(n);
+    }
+    if let Some(n) = m.keep_recent_tokens {
+        v["keepRecentTokens"] = json!(n);
+    }
     v["thinkingLevels"] = json!(models::thinking_levels(m, p));
     v
 }

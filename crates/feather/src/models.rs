@@ -69,6 +69,23 @@ pub struct ModelEntry {
     pub name: Option<String>,
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Per-model compaction headroom before the context limit triggers compression.
+    #[serde(
+        rename = "reserveTokens",
+        alias = "reserve_tokens",
+        alias = "compactionReserveTokens",
+        default
+    )]
+    pub reserve_tokens: Option<u64>,
+    /// Per-model recent context preserved after compaction. `None` uses the global setting.
+    #[serde(
+        rename = "keepRecentTokens",
+        alias = "preservedTokens",
+        alias = "keep_recent_tokens",
+        alias = "preserved_tokens",
+        default
+    )]
+    pub keep_recent_tokens: Option<u64>,
     #[serde(default)]
     pub max_tokens: Option<u64>,
     #[serde(default)]
@@ -247,12 +264,15 @@ pub fn load() -> Option<ModelsFile> {
     load_for(&config::feather_home())
 }
 pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
-    let mut value = crate::config_store::read(home, "models").ok().flatten()?;
+    let mut value = crate::config_store::read(home, "models")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| serde_json::json!({}));
     let deleted = value
         .get_mut("deletedModels")
         .map(serde_json::Value::take)
         .unwrap_or_default();
-    let user = serde_json::from_value::<ModelsFile>(value).ok();
+    let user = serde_json::from_value::<ModelsFile>(value.clone()).ok();
     let mut catalog = match (builtin_catalog(), user) {
         (Some(b), Some(u)) => merge_catalogs(b, u),
         (Some(b), None) => b.clone(),
@@ -269,6 +289,35 @@ pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
         }
     }
     apply_manual_effort(&mut catalog);
+    if let Some(limits) = value
+        .get("modelLimits")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, raw) in limits {
+            let Some((provider, model)) = key.split_once('/') else {
+                continue;
+            };
+            let Some(entry) = catalog
+                .providers
+                .get_mut(provider)
+                .and_then(|p| p.models.iter_mut().find(|m| m.id == model))
+            else {
+                continue;
+            };
+            if let Some(n) = raw.get("contextWindow").and_then(serde_json::Value::as_u64) {
+                entry.context_window = Some(n);
+            }
+            if let Some(n) = raw.get("reserveTokens").and_then(serde_json::Value::as_u64) {
+                entry.reserve_tokens = Some(n);
+            }
+            if let Some(n) = raw
+                .get("keepRecentTokens")
+                .and_then(serde_json::Value::as_u64)
+            {
+                entry.keep_recent_tokens = Some(n);
+            }
+        }
+    }
     Some(catalog)
 }
 
@@ -297,6 +346,92 @@ pub fn saved_for(home: &std::path::Path) -> std::io::Result<ModelsFile> {
     }
     Ok(ModelsFile { providers })
 }
+pub fn save_for(home: &std::path::Path, catalog: &ModelsFile) -> std::io::Result<()> {
+    let value = serde_json::to_value(catalog).map_err(std::io::Error::other)?;
+    crate::config_store::update(home, "models", |v| {
+        v["providers"] = value["providers"].clone();
+    })
+}
+
+/// Validate the three per-model compaction limits without overflowing arithmetic.
+pub fn validate_model_limits(
+    context_window: u64,
+    reserve_tokens: u64,
+    keep_recent_tokens: u64,
+) -> std::io::Result<()> {
+    if context_window == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "context window must be positive",
+        ));
+    }
+    if reserve_tokens >= context_window {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "reserve tokens must be below the context window",
+        ));
+    }
+    if keep_recent_tokens >= context_window {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preserved tokens must be below the input compaction budget",
+        ));
+    }
+    Ok(())
+}
+
+/// Persist only the context budget fields for one model. Built-in models are
+/// overridden in a narrow `modelLimits` map, so their catalog siblings and
+/// provider metadata remain untouched.
+pub fn save_model_limits_for(
+    home: &std::path::Path,
+    provider: &str,
+    model: &str,
+    context_window: u64,
+    reserve_tokens: u64,
+    keep_recent_tokens: u64,
+) -> std::io::Result<()> {
+    validate_model_limits(context_window, reserve_tokens, keep_recent_tokens)?;
+    let catalog = load_for(home).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "model catalog unavailable")
+    })?;
+    if find(&catalog, &format!("{provider}/{model}")).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("unknown model: {provider}/{model}"),
+        ));
+    }
+    crate::config_store::update(home, "models", |v| {
+        if !v["modelLimits"].is_object() {
+            v["modelLimits"] = serde_json::json!({});
+        }
+        let key = format!("{provider}/{model}");
+        if !v["modelLimits"][&key].is_object() {
+            v["modelLimits"][&key] = serde_json::json!({});
+        }
+        v["modelLimits"][&key]["contextWindow"] = serde_json::json!(context_window);
+        v["modelLimits"][&key]["reserveTokens"] = serde_json::json!(reserve_tokens);
+        v["modelLimits"][&key]["keepRecentTokens"] = serde_json::json!(keep_recent_tokens);
+    })
+}
+
+pub fn save_model_limits(
+    provider: &str,
+    model: &str,
+    context_window: u64,
+    reserve_tokens: u64,
+    keep_recent_tokens: u64,
+) -> std::io::Result<()> {
+    save_model_limits_for(
+        &config::feather_home(),
+        provider,
+        model,
+        context_window,
+        reserve_tokens,
+        keep_recent_tokens,
+    )
+}
+
 pub fn save(catalog: &ModelsFile) -> std::io::Result<()> {
     let value = serde_json::to_value(catalog).map_err(std::io::Error::other)?;
     crate::config_store::update(&config::feather_home(), "models", |v| {

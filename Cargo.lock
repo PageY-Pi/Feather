@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "feather"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "feather-cache",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "feather-cache"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "feather-core",
  "serde",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "feather-core"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "feather-gui"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "accesskit_winit",
  "anyhow",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "feather-hashline"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "feather-core",
  "regex",

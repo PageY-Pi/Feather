@@ -36,7 +36,7 @@ smokes passed on the release build; final installed version/hashes are verified.
 
 ## Distribution
 
-`dist/Feather-1.0.5-Setup-x64.exe` is a per-user Windows x64 installer. It bundles
+`dist/Feather-1.0.6-Setup-x64.exe` is a per-user Windows x64 installer. It bundles
 only feather.exe, feather-gui.exe and third-party notices, never credentials,
 config databases or sessions. Unsigned; SmartScreen may warn. Close and reopen
 a running old Feather window to activate the installed update.

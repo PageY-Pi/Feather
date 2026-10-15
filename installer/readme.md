@@ -1,6 +1,6 @@
-# Feather 1.0.5 Windows installer
+# Feather 1.0.6 Windows installer
 
-Share `dist/Feather-1.0.5-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.0.6-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -25,7 +25,7 @@ Build:
 3. Install Inno Setup 6, then `ISCC installer\Feather.iss`.
 
 This version:
-- 1.0.5 fixes Sogou/Windows Chinese IME popup editing: native `VK_PROCESSKEY` events are filtered before egui's physical-key fallback, so Backspace used to correct pinyin no longer also deletes committed Hanzi from the Feather composer. Both CPU and GPU hosts use the same boundary.
+- 1.0.6 aligns automatic context compaction with Pi: compaction triggers at context minus the configured reserve, does not subtract max output, preserves approximately 40k recent tokens by default, and supports per-model context/reserve/preserved-token overrides.
 - Ordinary Backspace remains unchanged when no IME-owned key is reported.
 - 1.0.0 efficiency review: shared request ownership (no deep history/tool-schema
   clone), cached token/hash/prefix planning, linear SSE/FIFO, combined audit/meta

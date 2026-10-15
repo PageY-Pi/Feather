@@ -1,10 +1,15 @@
 //! Directory enumeration must never block an input/caret frame.
+//! The tree uses indented folder bodies and workspace-local hierarchy guides.
+
 use eframe::egui;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+/// Warm gray branch rails, visible on the pearl sidebar without competing with text.
+pub(crate) const TREE_GUIDE_COLOR: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(178, 169, 155);
 #[derive(Default)]
 pub struct Listing {
     pub dirs: Vec<String>,

@@ -60,7 +60,6 @@ pub(crate) fn fixture() -> FeatherApp {
     }
 }
 
-
 fn call(id: &str) -> ToolCall {
     ToolCall {
         id: id.into(),

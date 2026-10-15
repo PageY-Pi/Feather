@@ -15,14 +15,21 @@ pub struct ModelManager {
     pub reasoning_not_supported: bool,
     pub context: String,
     pub tokens: String,
+    pub reserve: String,
     pub error: Option<String>,
+    pub preserved: String,
     pub confirm_delete: Option<(String, String)>,
     cached_models: Option<models::ModelsFile>,
     cached_home: Option<std::path::PathBuf>,
     loaded_at: Option<std::time::Instant>,
+    limits_model: Option<String>,
+    pub limits_context: String,
+    pub limits_reserve: String,
+    pub limits_preserved: String,
 }
 pub enum Action {
     Save(String, ProviderEntry, ModelEntry),
+    SaveLimits(String, String, u64, u64, u64),
     Delete(String, String),
 }
 impl ModelManager {
@@ -39,6 +46,110 @@ impl ModelManager {
             self.cached_home = Some(home.to_path_buf());
             self.loaded_at = Some(std::time::Instant::now());
         }
+    }
+    /// Render compaction limits for the currently selected model, including
+    /// built-in and OAuth-backed entries that are not part of the custom editor.
+    pub fn show_limits(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: Option<&models::ModelsFile>,
+        active: &str,
+        running: bool,
+    ) -> Option<Action> {
+        let Some(catalog) = catalog else {
+            return None;
+        };
+        let Some((provider, _provider_entry, model)) = models::find(catalog, active) else {
+            return None;
+        };
+        let key = format!("{provider}/{}", model.id);
+        if self.limits_model.as_deref() != Some(key.as_str()) {
+            let defaults = feather_core::compaction::CompactionSettings::default();
+            self.limits_model = Some(key);
+            self.limits_context = model.context_window.unwrap_or(200_000).to_string();
+            self.limits_reserve = model
+                .reserve_tokens
+                .unwrap_or(defaults.reserve_tokens)
+                .to_string();
+            self.limits_preserved = model
+                .keep_recent_tokens
+                .unwrap_or(defaults.keep_recent_tokens)
+                .to_string();
+        }
+
+        let mut action = None;
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Compaction limits")
+                .size(13.5)
+                .color(crate::theme::TEAL),
+        )
+        .id_salt("selected-model-compaction-limits")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Selected: {provider}/{}", model.id))
+                    .size(12.0)
+                    .color(crate::theme::MUTED),
+            );
+            egui::Grid::new("selected-model-compaction-limits-grid")
+                .num_columns(2)
+                .spacing(egui::vec2(18.0, 8.0))
+                .show(ui, |ui| {
+                    ui.label("Context tokens");
+                    ui.text_edit_singleline(&mut self.limits_context);
+                    ui.end_row();
+                    ui.label("Compaction reserve tokens");
+                    ui.text_edit_singleline(&mut self.limits_reserve);
+                    ui.end_row();
+                    ui.label("Preserved recent tokens");
+                    ui.text_edit_singleline(&mut self.limits_preserved);
+                    ui.end_row();
+                });
+
+            let parse = |value: &str| value.trim().parse::<u64>().ok().filter(|n| *n > 0);
+            if let (Some(context), Some(reserve)) =
+                (parse(&self.limits_context), parse(&self.limits_reserve))
+            {
+                let trigger = context.saturating_sub(reserve);
+                ui.small(format!(
+                    "Automatic compaction starts above {trigger} tokens (context − reserve). Max output is not reserved."
+                ));
+            } else {
+                ui.small("Enter positive integer token limits.");
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!running, egui::Button::new("Save limits"))
+                    .clicked()
+                {
+                    let parsed = parse(&self.limits_context)
+                        .zip(parse(&self.limits_reserve))
+                        .zip(parse(&self.limits_preserved));
+                    match parsed {
+                        Some(((context, reserve), preserved)) => {
+                            match models::validate_model_limits(context, reserve, preserved) {
+                                Ok(()) => {
+                                    self.error = None;
+                                    action = Some(Action::SaveLimits(
+                                        provider.to_string(),
+                                        model.id.clone(),
+                                        context,
+                                        reserve,
+                                        preserved,
+                                    ));
+                                }
+                                Err(error) => self.error = Some(error.to_string()),
+                            }
+                        }
+                        None => self.error = Some("Token limits must be positive integers.".into()),
+                    }
+                }
+                if running {
+                    ui.small("Stop the current response before changing limits.");
+                }
+            });
+        });
+        action
     }
     fn draft(&self) -> Result<Action, String> {
         let pid = self.provider.trim();
@@ -78,15 +189,20 @@ impl ModelManager {
                 .filter(|n| *n > 0)
                 .ok_or_else(|| "Token limits must be positive integers.".into())
         };
+        let defaults = feather_core::compaction::CompactionSettings::default();
         let context = number(&self.context, 200_000)?;
         let tokens = number(&self.tokens, 8192)?;
+        let reserve = number(&self.reserve, defaults.reserve_tokens)?;
+        let preserved = number(&self.preserved, defaults.keep_recent_tokens)?;
+        feather::models::validate_model_limits(context, reserve, preserved)
+            .map_err(|e| e.to_string())?;
         let api = if self.anthropic {
             "anthropic-messages"
         } else {
             "openai-completions"
         };
         let p = serde_json::from_value(json!({"baseUrl":self.base_url.trim().trim_end_matches('/'),"api":api,"apiKey":self.api_key.trim(),"models":[]})).map_err(|e|e.to_string())?;
-        let m = serde_json::from_value(json!({"id":model,"name":if self.name.trim().is_empty(){model}else{self.name.trim()},"reasoningNotSupported":self.reasoning_not_supported,"contextWindow":context,"maxTokens":tokens,"input":["text"]})).map_err(|e|e.to_string())?;
+        let m = serde_json::from_value(json!({"id":model,"name":if self.name.trim().is_empty(){model}else{self.name.trim()},"reasoningNotSupported":self.reasoning_not_supported,"contextWindow":context,"maxTokens":tokens,"reserveTokens":reserve,"keepRecentTokens":preserved,"input":["text"]})).map_err(|e|e.to_string())?;
         Ok(Action::Save(pid.into(), p, m))
     }
     pub fn show(
@@ -164,6 +280,12 @@ impl ModelManager {
                             ui.label("Context tokens");
                             ui.text_edit_singleline(&mut self.context);
                             ui.end_row();
+                            ui.label("Compaction reserve tokens");
+                            ui.text_edit_singleline(&mut self.reserve);
+                            ui.end_row();
+                            ui.label("Preserved recent tokens");
+                            ui.text_edit_singleline(&mut self.preserved);
+                            ui.end_row();
                             ui.label("Max output tokens");
                             ui.text_edit_singleline(&mut self.tokens);
                             ui.end_row();
@@ -236,6 +358,14 @@ impl ModelManager {
                                                 .max_tokens
                                                 .map(|v| v.to_string())
                                                 .unwrap_or_default();
+                                            self.preserved = m
+                                                .keep_recent_tokens
+                                                .map(|v| v.to_string())
+                                                .unwrap_or_else(|| feather_core::compaction::CompactionSettings::default().keep_recent_tokens.to_string());
+                                            self.reserve = m
+                                                .reserve_tokens
+                                                .map(|v| v.to_string())
+                                                .unwrap_or_else(|| feather_core::compaction::CompactionSettings::default().reserve_tokens.to_string());
                                         }
                                         if ui
                                             .add_enabled(!running, egui::Button::new("Delete"))

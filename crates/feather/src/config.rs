@@ -34,7 +34,7 @@ pub struct Settings {
     pub bash: BashSettings,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompactionToml {
     pub enabled: bool,
@@ -44,6 +44,21 @@ pub struct CompactionToml {
     pub kept_tool_result_budget: usize,
     pub shrink_kept: bool,
     pub keep_last_turns_unshrunk: u64,
+}
+
+impl Default for CompactionToml {
+    fn default() -> Self {
+        let settings = feather_core::compaction::CompactionSettings::default();
+        Self {
+            enabled: settings.enabled,
+            reserve_tokens: settings.reserve_tokens,
+            keep_recent_tokens: settings.keep_recent_tokens,
+            summary_tool_result_budget: settings.summary_tool_result_budget,
+            kept_tool_result_budget: settings.kept_tool_result_budget,
+            shrink_kept: settings.shrink_kept,
+            keep_last_turns_unshrunk: settings.keep_last_turns_unshrunk,
+        }
+    }
 }
 
 impl From<&CompactionToml> for feather_core::compaction::CompactionSettings {
@@ -94,15 +109,7 @@ impl Default for Settings {
             max_tokens: 8192,
             temperature: None,
             context_window: 200_000,
-            compaction: CompactionToml {
-                enabled: true,
-                reserve_tokens: 16_384,
-                keep_recent_tokens: 20_000,
-                summary_tool_result_budget: 2_000,
-                kept_tool_result_budget: 4_000,
-                shrink_kept: true,
-                keep_last_turns_unshrunk: 2,
-            },
+            compaction: CompactionToml::default(),
             palette_override: None,
             compaction_model: None,
             subagent: SubagentSettings {

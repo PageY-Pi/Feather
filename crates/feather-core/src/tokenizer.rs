@@ -86,6 +86,37 @@ pub fn estimate_context_tokens(msgs: &[crate::message::Message]) -> u64 {
     msgs.iter().map(estimate_message_tokens).sum::<u64>() + 16
 }
 
+/// Estimate the tokens occupied by a tool schema in the provider request.
+/// This is deliberately conservative: the wire providers add role/function
+/// wrappers around the same name, description, and JSON schema.
+pub fn estimate_tool_tokens(tool: &crate::provider::ToolDef) -> u64 {
+    12 + estimate_tokens(&tool.name)
+        + estimate_tokens(&tool.description)
+        + serde_json::to_string(&tool.parameters)
+            .map(|json| estimate_tokens(&json))
+            .unwrap_or(0)
+}
+
+/// Estimate the complete prompt-side request, including system instructions
+/// and tool definitions. `Session::context_tokens` intentionally tracks only
+/// messages for cache metrics; compaction must use this larger number because
+/// providers enforce their context limit on the complete request.
+pub fn estimate_request_input_tokens(
+    system: &str,
+    messages: &[crate::message::Message],
+    tools: &[crate::provider::ToolDef],
+) -> u64 {
+    let system_tokens = if system.is_empty() {
+        0
+    } else {
+        estimate_tokens(system) + 4
+    };
+    system_tokens
+        + messages.iter().map(estimate_message_tokens).sum::<u64>()
+        + tools.iter().map(estimate_tool_tokens).sum::<u64>()
+        + 16
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

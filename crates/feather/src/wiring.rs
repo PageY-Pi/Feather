@@ -341,7 +341,7 @@ pub fn runtime_components(
         session_dir,
         &provider,
     );
-    let compaction: CompactionSettings = (&settings.compaction).into();
+    let mut compaction: CompactionSettings = (&settings.compaction).into();
     // the provider/id prefix is catalog routing only — the wire request
     // carries the bare model id (deepseek rejects "deepseek/deepseek-flash")
     let wire_model = entry.map(|(_, _, m)| m.id.clone()).unwrap_or_else(|| {
@@ -403,7 +403,15 @@ Project-specific instructions and guidelines:
         context_window: entry
             .and_then(|(_, _, m)| m.context_window)
             .unwrap_or(settings.context_window),
-        compaction,
+        compaction: {
+            if let Some(reserved) = entry.and_then(|(_, _, m)| m.reserve_tokens) {
+                compaction.reserve_tokens = reserved;
+            }
+            if let Some(preserved) = entry.and_then(|(_, _, m)| m.keep_recent_tokens) {
+                compaction.keep_recent_tokens = preserved;
+            }
+            compaction
+        },
         compaction_model,
         tools: registry.defs().into(),
     };

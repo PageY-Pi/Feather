@@ -202,7 +202,7 @@ fn auto_compaction_preserves_plain_text_rows_without_summary_leaks() {
     let script = FauxScript::new()
         .with_text("SUMMARYMARKER should never show")
         .with_text("NEW FINAL");
-    let agent = make_agent_seeded(session, 1000, script);
+    let agent = make_agent_seeded(session, 1000, 1, script);
     let mut app = crate::tests::fixture();
     app.input_queue = agent.input_queue();
     app.abort_tx = agent.abort_sender();
@@ -235,7 +235,12 @@ fn auto_compaction_preserves_plain_text_rows_without_summary_leaks() {
         && !r.text.contains("· 0 characters")));
 }
 
-fn make_agent_seeded(session: Session, context_window: u64, script: FauxScript) -> Agent {
+fn make_agent_seeded(
+    session: Session,
+    context_window: u64,
+    keep_recent_tokens: u64,
+    script: FauxScript,
+) -> Agent {
     let tools = ToolRegistry::new();
     let defs = tools.defs();
     Agent::new(
@@ -250,7 +255,7 @@ fn make_agent_seeded(session: Session, context_window: u64, script: FauxScript) 
             compaction: CompactionSettings {
                 enabled: true,
                 reserve_tokens: 100,
-                keep_recent_tokens: 1,
+                keep_recent_tokens,
                 summary_tool_result_budget: 2000,
                 kept_tool_result_budget: 4000,
                 shrink_kept: true,
@@ -270,7 +275,8 @@ fn make_agent_seeded(session: Session, context_window: u64, script: FauxScript) 
 fn noop_compaction_does_not_create_refresh_or_replace_last_answer() {
     let agent = make_agent_seeded(
         Session::memory(std::path::Path::new("fixture"), "noop"),
-        1000,
+        10_000,
+        1,
         FauxScript::new().with_text("ONLY FINAL"),
     );
     let mut app = crate::tests::fixture();

@@ -7,8 +7,7 @@
 //! the native GUI and headless/RPC mode.
 
 use crate::compaction::{
-    self, file_ops, should_compact, shrink_kept_span, summary_message, CompactionSettings,
-    SUMMARY_SYSTEM,
+    self, file_ops, shrink_kept_span, summary_message, CompactionSettings, SUMMARY_SYSTEM,
 };
 use crate::message::{Api, ContentBlock, Message, StopReason, ToolCall, Usage};
 use crate::provider::{CacheHints, ChatRequest, StreamEvent, ThinkingLevel, ToolDef};
@@ -628,23 +627,52 @@ impl Agent {
                 stop = StopReason::Aborted;
                 break;
             }
-            // --- compaction check before the next model request ---
-            let ctx_tokens = self.session.context_tokens();
-            if should_compact(
-                ctx_tokens,
+            // The provider limit applies to the complete request, not just the
+            // cached message rows. Include system instructions and tool schemas,
+            // and use only the configured compaction headroom before each normal request.
+            // build_request so no later async work can make the prompt stale.
+            let request_tokens = tokenizer::estimate_request_input_tokens(
+                &self.config.system_prompt,
+                self.session.messages(),
+                &self.config.tools,
+            );
+            if compaction::should_compact_request(
+                request_tokens,
                 self.config.context_window,
-                &self.config.compaction,
+                self.config.compaction.reserve_tokens,
             ) {
+                let before_request_tokens = request_tokens;
                 match self.compact("threshold").await {
                     Ok(saved) if saved > 0 => {
-                        let after = self.session.context_tokens();
+                        let after = tokenizer::estimate_request_input_tokens(
+                            &self.config.system_prompt,
+                            self.session.messages(),
+                            &self.config.tools,
+                        );
                         let _ = self.events.send(AgentEvent::CompactionDone {
-                            tokens_before: ctx_tokens,
+                            tokens_before: before_request_tokens,
                             tokens_after: after,
                             chars_saved: saved,
                         });
                     }
-                    Ok(_) => {} // no-op: do not announce a context rewrite
+                    Ok(_) => {
+                        // A no-op compaction must not issue an over-limit request.
+                        // Surface the condition rather than compacting repeatedly
+                        // and sending the same invalid prompt three times.
+                        let after = tokenizer::estimate_request_input_tokens(
+                            &self.config.system_prompt,
+                            self.session.messages(),
+                            &self.config.tools,
+                        );
+                        if after > self.config.context_window {
+                            return Err(AgentError::Provider(crate::provider::ProviderError::Stream(
+                                format!(
+                                    "context remains over model limit after compaction: {after} >= {}",
+                                    self.config.context_window
+                                ),
+                            )));
+                        }
+                    }
                     Err(e) => {
                         // never kill the run for a failed compaction; surface
                         // it — but a deliberate abort is not a failure.
@@ -1094,8 +1122,13 @@ impl Agent {
             return Err(AgentError::Aborted);
         }
         let settings = self.config.compaction.clone();
+        let before_request_tokens = tokenizer::estimate_request_input_tokens(
+            &self.config.system_prompt,
+            self.session.messages(),
+            &self.config.tools,
+        );
         let before_chars = compaction::context_characters(self.session.messages());
-        let before_tokens = self.session.context_tokens();
+        let _before_tokens = self.session.context_tokens();
         let cut = compaction::plan_cut_without_thinking(
             self.session.messages(),
             settings.keep_recent_tokens,
@@ -1179,11 +1212,29 @@ impl Agent {
         drop(context); // release old immutable history before installing new context
         shrink_kept_span(&mut kept, &settings);
         let mut new_msgs = vec![summary_message(&summary, &reads, &writes)];
+
         new_msgs.extend(kept);
+        let static_request_tokens = tokenizer::estimate_request_input_tokens(
+            &self.config.system_prompt,
+            &[],
+            &self.config.tools,
+        );
+        compaction::shrink_messages_to_tokens(
+            &mut new_msgs,
+            self.config
+                .context_window
+                .saturating_sub(settings.reserve_tokens)
+                .saturating_sub(static_request_tokens),
+        );
         let after_chars = compaction::context_characters(&new_msgs);
-        let after_tokens = tokenizer::estimate_context_tokens(&new_msgs);
+        let after_request_tokens = tokenizer::estimate_request_input_tokens(
+            &self.config.system_prompt,
+            &new_msgs,
+            &self.config.tools,
+        );
+        let _after_tokens = tokenizer::estimate_context_tokens(&new_msgs);
         let saved = before_chars.saturating_sub(after_chars);
-        if saved == 0 || after_tokens >= before_tokens {
+        if saved == 0 || after_request_tokens >= before_request_tokens {
             return Ok(0); // oversized/ineffective summary: preserve original context
         }
         // replace the whole linear list; raw transcript keeps originals

@@ -263,10 +263,13 @@ mod tests {
             merge(v, &source).unwrap();
         })
         .unwrap();
+        let mut expected = source.clone();
+        config_store::strip_effort_presets(&mut expected);
         assert_eq!(
             config_store::read(&home, "models").unwrap().unwrap(),
-            source
+            expected
         );
+
         assert_eq!(
             config_store::read(&home, "settings").unwrap().unwrap(),
             json!({"model":"selected","unknown":42})

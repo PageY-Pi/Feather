@@ -17,7 +17,8 @@ use crate::tokenizer;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactionSettings {
     pub enabled: bool,
-    /// Tokens reserved for the model's response.
+    /// Input tokens left unused before the provider context limit triggers compaction.
+    /// This is independent of the normal request's max output setting.
     pub reserve_tokens: u64,
     /// Recent tokens that survive compaction un-summarized.
     pub keep_recent_tokens: u64,
@@ -36,7 +37,7 @@ impl Default for CompactionSettings {
         Self {
             enabled: true,
             reserve_tokens: 16384,
-            keep_recent_tokens: 20000,
+            keep_recent_tokens: 40000,
             summary_tool_result_budget: 2000,
             kept_tool_result_budget: 4000,
             shrink_kept: true,
@@ -59,6 +60,18 @@ pub fn should_compact(
     settings.enabled && context_tokens > context_window.saturating_sub(settings.reserve_tokens)
 }
 
+/// Decide from the complete provider prompt, rather than message rows alone.
+/// System instructions and tool schemas count against the model context too.
+/// `reserve_tokens` is compaction headroom; max output is deliberately not
+/// subtracted because compaction runs asynchronously before the next request.
+pub fn should_compact_request(
+    request_input_tokens: u64,
+    context_window: u64,
+    reserve_tokens: u64,
+) -> bool {
+    request_input_tokens > context_window.saturating_sub(reserve_tokens)
+}
+
 /// Head+tail shrink around an elision marker. Never returns something longer
 /// than the input; the marker states how much was removed.
 pub fn shrink_tool_result(text: &str, budget: usize) -> (String, usize, usize) {
@@ -75,6 +88,91 @@ pub fn shrink_tool_result(text: &str, budget: usize) -> (String, usize, usize) {
     (out, total, elided)
 }
 
+/// Shrink arbitrary live-context text with a neutral marker. Raw audit text is
+/// never passed here; this is only for the replaceable model context.
+pub fn shrink_text(text: &str, budget: usize) -> (String, usize, usize) {
+    let total = text.chars().count();
+    if total <= budget || budget < 64 {
+        return (text.to_string(), total, total);
+    }
+    let marker = "\n[feather: content elided by compaction]\n";
+    let marker_len = marker.chars().count();
+    let usable = budget.saturating_sub(marker_len);
+    let head = usable * 3 / 5;
+    let tail = usable.saturating_sub(head);
+    let head_s: String = text.chars().take(head).collect();
+    let tail_s: String = text.chars().skip(total.saturating_sub(tail)).collect();
+    let removed = total.saturating_sub(head + tail);
+    (format!("{head_s}{marker}{tail_s}"), total, removed)
+}
+
+/// Force a live context under an estimated-token budget. Complete oldest turns
+/// are removed first; if the remaining turn is itself too large, text and tool
+/// arguments are elided while preserving message roles and call/result pairing.
+/// The durable raw audit is never passed here and therefore remains complete.
+pub fn shrink_messages_to_tokens(messages: &mut Vec<Message>, budget: u64) {
+    loop {
+        if tokenizer::estimate_context_tokens(messages) <= budget {
+            return;
+        }
+        // Keep the synthetic summary at index zero. Remove the oldest complete
+        // kept turn whenever another user boundary exists.
+        let starts: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(i, m)| (m.role == Role::User).then_some(i))
+            .collect();
+        if starts.len() >= 2 {
+            messages.drain(1..starts[1]);
+            continue;
+        }
+        break;
+    }
+
+    for _ in 0..64 {
+        let current = tokenizer::estimate_context_tokens(messages);
+        if current <= budget {
+            return;
+        }
+        let excess = current.saturating_sub(budget);
+        let mut largest: Option<(usize, usize, usize)> = None;
+        for (mi, message) in messages.iter().enumerate() {
+            for (bi, block) in message.content.iter().enumerate() {
+                let len = match block {
+                    ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => {
+                        text.chars().count()
+                    }
+                    ContentBlock::ToolCall(call) => call.arguments.to_string().chars().count(),
+                    ContentBlock::Image { .. } => 0,
+                };
+                if largest.is_none_or(|(_, _, old)| len > old) {
+                    largest = Some((mi, bi, len));
+                }
+            }
+        }
+        let Some((mi, bi, len)) = largest else { return };
+        if len < 64 {
+            return;
+        }
+        let target = len
+            .saturating_sub((excess.max(1) * 4 + 64) as usize)
+            .max(64);
+        match &mut messages[mi].content[bi] {
+            ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => {
+                let (shrunk, _, _) = shrink_text(text, target);
+                *text = shrunk;
+            }
+            ContentBlock::ToolCall(call) => {
+                call.arguments = serde_json::json!({
+                    "_feather_arguments_elided": true,
+                    "tool": call.name,
+                });
+            }
+            ContentBlock::Image { .. } => return,
+        }
+    }
+}
 /// Serialize messages for the summarizer with tool results shrunk to
 /// `budget` chars (pi-style `[User]:` / `[Assistant]:` framing so the model
 /// treats it as material, not a conversation to continue).
@@ -495,6 +593,23 @@ mod tests {
         // idempotent
         let saved2 = shrink_kept_span(&mut msgs, &CompactionSettings::default());
         assert_eq!(saved2, 0);
+    }
+
+    #[test]
+    fn defaults_match_pi_preserved_span_and_headroom() {
+        let settings = CompactionSettings::default();
+        assert_eq!(settings.reserve_tokens, 16_384);
+        assert_eq!(settings.keep_recent_tokens, 40_000);
+        assert!(!should_compact(255_616, 272_000, &settings));
+        assert!(should_compact(255_617, 272_000, &settings));
+    }
+
+    #[test]
+    fn request_threshold_does_not_reserve_max_output() {
+        assert!(should_compact_request(255_617, 272_000, 16_384));
+        assert!(!should_compact_request(255_616, 272_000, 16_384));
+        assert!(!should_compact_request(271_999, 272_000, 0));
+        assert!(should_compact_request(272_001, 272_000, 0));
     }
 
     #[test]
