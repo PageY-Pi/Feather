@@ -308,6 +308,12 @@ fn plan_cut_with(
     // A newly appended user prompt can consume the entire recent-token budget.
     // Do not summarize away the latest completed answer (and its whole user/tool
     // span), which callers still need to display/reopen while that prompt runs.
+    // The clamp must never collapse the cut to zero, though: on tool-loop
+    // sessions the only plain answer can sit in the first span, and a zero cut
+    // makes every compaction a permanent no-op — the caller then aborts the
+    // run as over-limit. When the protected span is the first one, keep the
+    // budget-driven cut: a working context beats a protected display, and the
+    // raw audit still preserves the answer verbatim.
     if let Some(last_answer) = messages
         .iter()
         .rposition(|m| m.role == Role::Assistant && m.iter_tool_calls().next().is_none())
@@ -316,7 +322,10 @@ fn plan_cut_with(
             .iter()
             .rposition(|m| m.role == Role::User)
             .unwrap_or(0);
-        cut = cut.min(span_start);
+        let clamped = cut.min(span_start);
+        if clamped > 0 {
+            cut = clamped;
+        }
     }
     cut
 }

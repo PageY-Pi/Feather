@@ -3,7 +3,7 @@
 use feather_core::{
     agent::{AgentConfig, AgentEvent, ProviderRef},
     compaction::{self, CompactionSettings},
-    message::{Api, ContentBlock, Message, Role, StopReason, Usage},
+    message::{Api, ContentBlock, Message, Role, StopReason, ToolCall, Usage},
     provider::faux::{FauxProvider, FauxScript},
     tool::ToolRegistry,
     Agent, Session,
@@ -115,7 +115,10 @@ async fn auto_summary_is_private_and_preserves_latest_completed_answer() {
 }
 
 #[tokio::test]
-async fn threshold_noop_reports_unavoidable_over_limit_without_repeating_compaction() {
+async fn single_span_over_limit_compacts_by_elision_exactly_once() {
+    // One user span, no boundary to summarize over: compaction must fall back
+    // to in-place elision, complete the run, and report the refresh exactly
+    // once — never loop or die with "context remains over model limit".
     let session = Session::memory(Path::new("."), "compaction-noop");
     let mut agent = agent(
         session,
@@ -124,16 +127,76 @@ async fn threshold_noop_reports_unavoidable_over_limit_without_repeating_compact
         FauxScript::new().with_text("ONLY FINAL"),
     );
     let mut events = agent.subscribe();
-    let error = agent.prompt(&"question ".repeat(1000)).await.unwrap_err();
+    let result = agent.prompt(&"question ".repeat(1000)).await.unwrap();
+    assert_eq!(result.final_text, "ONLY FINAL");
+    let compactions = drain(&mut events)
+        .into_iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionDone { .. }))
+        .count();
+    assert_eq!(
+        compactions, 1,
+        "elision fallback reports one refresh, never a compaction loop"
+    );
+}
+
+#[tokio::test]
+async fn context_smaller_than_a_single_message_still_fails_cleanly() {
+    // Even elision has limits: a request over a window that cannot hold one
+    // short message must surface the over-limit error instead of looping.
+    let session = Session::memory(Path::new("."), "compaction-hopeless");
+    let mut agent = agent(session, 10, 100_000, FauxScript::new().with_text("X"));
+    let error = agent
+        .prompt("one two three four five six seven eight")
+        .await
+        .unwrap_err();
     assert!(error
         .to_string()
         .contains("context remains over model limit"));
-    assert!(
-        !drain(&mut events)
-            .iter()
-            .any(|e| matches!(e, AgentEvent::CompactionDone { .. })),
-        "an ineffective compaction must not report repeated refreshes"
+}
+
+#[tokio::test]
+async fn tool_loop_session_with_only_a_stale_answer_still_compacts() {
+    // The reported failure shape: the only plain answer sits in the first
+    // span; later spans are tool loops with no final text. The last-answer
+    // clamp must not collapse the cut to zero and make compaction a
+    // permanent no-op.
+    let mut session = Session::memory(Path::new("."), "compaction-tool-loop");
+    session.push(Message::user_text("old question")).unwrap();
+    session.push(answer("OLD ANSWER")).unwrap();
+    for q in 0..4 {
+        session
+            .push(Message::user_text(format!("tool question {q}")))
+            .unwrap();
+        session
+            .push(Message::assistant(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: format!("c{q}"),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                })],
+                "faux",
+                Api::Faux,
+                Usage::default(),
+                StopReason::Stop,
+            ))
+            .unwrap();
+        session
+            .push(Message::tool_result(
+                format!("c{q}"),
+                "bash",
+                "done".repeat(500),
+                false,
+            ))
+            .unwrap();
+    }
+    let mut agent = agent(
+        session,
+        3000,
+        100,
+        FauxScript::new().with_text("SUMMARY").with_text("AFTER"),
     );
+    let saved = agent.compact("manual").await.unwrap();
+    assert!(saved > 0, "compaction must find something to summarize");
 }
 
 #[tokio::test]

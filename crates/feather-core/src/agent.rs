@@ -1138,7 +1138,36 @@ impl Agent {
             settings.keep_recent_tokens,
         );
         if cut == 0 {
-            return Ok(0); // nothing to summarize
+            // No user boundary to summarize over (a single-span session, e.g.
+            // one long tool-loop turn or a giant paste). cut == 0 alone does
+            // not mean the context is over the window — a healthy short
+            // session also has cut 0 when everything fits in the recent
+            // budget — so only fall back to in-place elision when the request
+            // truly exceeds the window. Otherwise this would degrade to
+            // mangling history on every turn. The durable raw audit is never
+            // touched by elision.
+            if before_request_tokens <= self.config.context_window {
+                return Ok(0);
+            }
+            let static_request_tokens = tokenizer::estimate_request_input_tokens(
+                self.config.api,
+                &self.config.system_prompt,
+                &[],
+                &self.config.tools,
+            );
+            let budget = self
+                .config
+                .context_window
+                .saturating_sub(settings.reserve_tokens)
+                .saturating_sub(static_request_tokens);
+            let mut shrunk = self.session.messages().to_vec();
+            compaction::shrink_messages_to_tokens(&mut shrunk, budget);
+            let saved = before_chars.saturating_sub(compaction::context_characters(&shrunk));
+            if saved == 0 {
+                return Ok(0); // nothing removable at all; caller reports over-limit
+            }
+            self.replace_messages(shrunk);
+            return Ok(saved);
         }
         let context = self.session.shared_messages();
         let mut kept = compaction::without_thinking(&context[cut..]);
