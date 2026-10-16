@@ -43,6 +43,12 @@ This version:
   applies from the next request. The CLI, RPC bridge and one-shot runs honour the
   same persisted value as the GUI. Control requests (OAuth sign-in) are never
   shaped, so authenticating cannot hang.
+- 1.1.0 maps the system fonts read-only instead of copying them onto the heap.
+  The CJK face alone was ~19 MB of private memory pinned for the whole session;
+  mapped pages are file-backed, faulted in on use and evictable, so the GUI now
+  settles around 52 MB with CPU rendering instead of 71 MB, and around 125 MB
+  instead of 144 MB with GPU rendering. A typical Chinese transcript drops from
+  ~159 MB to ~128 MB. Rendering is unchanged.
 - Ordinary Backspace remains unchanged when no IME-owned key is reported.
 - 1.0.0 efficiency review: shared request ownership (no deep history/tool-schema
   clone), cached token/hash/prefix planning, linear SSE/FIFO, combined audit/meta
