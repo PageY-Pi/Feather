@@ -192,7 +192,25 @@ fn compute_stats(
             }
         }
     }
-    let ctx = feather_core::tokenizer::estimate_context_tokens(msgs);
+    // Count reasoning only when the provider replays it in the request body,
+    // exactly as compaction does. Otherwise this readout would report context
+    // pressure the endpoint never sees — for an `openai-completions` model that
+    // can show a session at or over its window while nothing needs compacting.
+    let api = msgs
+        .iter()
+        .rev()
+        .find_map(|m| m.api)
+        // Unknown provider: assume reasoning is sent, so the number is never
+        // understated.
+        .unwrap_or(Api::AnthropicMessages);
+    let ctx = if api.sends_reasoning_in_history() {
+        feather_core::tokenizer::estimate_context_tokens(msgs)
+    } else {
+        msgs.iter()
+            .map(feather_core::tokenizer::estimate_message_tokens_without_thinking)
+            .sum::<u64>()
+            + 16
+    };
     let mut v = json!({
         "sessionFile": session_file,
         "sessionId": session_id,

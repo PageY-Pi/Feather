@@ -86,6 +86,24 @@ pub enum Api {
     Faux,
 }
 
+impl Api {
+    /// Whether stored reasoning is replayed in the request history.
+    ///
+    /// Only some providers accept reasoning back: anthropic replays signed
+    /// thinking blocks, `openai-responses` replays encrypted reasoning, and
+    /// `pi-messages` sends `thinking` parts. `openai-completions` — used by
+    /// volcengine-plan, deepseek, Bailian and the rest of the compatible
+    /// endpoints — serializes `Message::text()` plus tool calls only, so
+    /// reasoning never reaches the wire.
+    ///
+    /// The distinction decides whether reasoning may be counted against the
+    /// model's context window: counting what is never sent makes a session look
+    /// oversized, triggers pointless compaction, and can fail the turn outright.
+    pub fn sends_reasoning_in_history(self) -> bool {
+        !matches!(self, Self::OpenaiCompletions | Self::Faux)
+    }
+}
+
 /// A single message in the linear session history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {

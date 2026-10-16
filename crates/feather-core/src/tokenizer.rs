@@ -18,6 +18,38 @@ pub fn estimate_tokens(text: &str) -> u64 {
     est.max(1)
 }
 
+/// Token estimate for a JSON value as it appears inside a request body.
+///
+/// Walks the value instead of serializing it: the shape is all that matters for
+/// a heuristic, and a full `to_string()` per tool call per turn would allocate
+/// megabytes on a session that writes large files. Values are counted — that is
+/// the whole point, since a tool call's arguments are sent verbatim.
+fn estimate_json_tokens(value: &serde_json::Value) -> u64 {
+    use serde_json::Value;
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(n) => n.to_string().len() as u64,
+        // Quotes are two characters; escape sequences are ignored, which can
+        // only under-count a pathological string.
+        Value::String(s) => s.chars().count() as u64 + 2,
+        Value::Array(items) => {
+            items.iter().map(estimate_json_tokens).sum::<u64>() + 2 + items.len() as u64
+        }
+        Value::Object(entries) => {
+            entries
+                .iter()
+                .map(|(key, item)| {
+                    estimate_json_tokens(&Value::String(key.clone())) + estimate_json_tokens(item)
+                })
+                .sum::<u64>()
+                + 2
+                + entries.len() as u64
+        }
+    }
+}
+
 pub fn estimate_message_tokens(m: &crate::message::Message) -> u64 {
     estimate_message_tokens_filtered(m, true)
 }
@@ -36,42 +68,11 @@ fn estimate_message_tokens_filtered(m: &crate::message::Message, include_thinkin
             }
             ContentBlock::Thinking { .. } => {}
             ContentBlock::ToolCall(c) => {
-                // Estimate without re-serializing the arguments value — a full
-                // serde pass per tool call per turn is pure waste for a rough
-                // heuristic. Key names approximate the JSON payload size.
-                let arguments = if let Some(s) = c.arguments.as_str() {
-                    estimate_tokens(s)
-                } else if let Some(object) = c.arguments.as_object() {
-                    // Exactly the former joined-key estimate, without a Vec or
-                    // String. Count whitespace boundaries across each key and
-                    // the virtual separator inserted between consecutive keys.
-                    let mut chars = 0u64;
-                    let mut words = 0u64;
-                    let mut in_word = false;
-                    for (index, key) in object.keys().enumerate() {
-                        if index > 0 {
-                            chars += 1;
-                            in_word = false;
-                        }
-                        for ch in key.chars() {
-                            chars += 1;
-                            if ch.is_whitespace() {
-                                in_word = false;
-                            } else if !in_word {
-                                words += 1;
-                                in_word = true;
-                            }
-                        }
-                    }
-                    if chars == 0 {
-                        0
-                    } else {
-                        ((chars.div_ceil(4) * 3 + words) / 4).max(1)
-                    }
-                } else {
-                    0
-                };
-                total += estimate_tokens(&c.name) + arguments + 8;
+                // Arguments are sent verbatim as JSON, so values must count: a
+                // `write` call carrying a large file body is the biggest thing a
+                // request can contain. Measured without allocating the whole
+                // serialized form on every turn.
+                total += estimate_tokens(&c.name) + estimate_json_tokens(&c.arguments) + 8;
             }
             // images: rough fixed cost per block (real cost depends on the
             // provider's vision pricing; keep it conservative)
@@ -101,7 +102,14 @@ pub fn estimate_tool_tokens(tool: &crate::provider::ToolDef) -> u64 {
 /// and tool definitions. `Session::context_tokens` intentionally tracks only
 /// messages for cache metrics; compaction must use this larger number because
 /// providers enforce their context limit on the complete request.
+///
+/// The estimate counts reasoning only when `api` actually replays it — see
+/// [`crate::message::Api::sends_reasoning_in_history`]. Providers that drop
+/// reasoning from the request body would otherwise appear to hold far more
+/// context than they send, which triggers compaction that has nothing to
+/// summarize and can fail the turn for a request the endpoint would accept.
 pub fn estimate_request_input_tokens(
+    api: crate::message::Api,
     system: &str,
     messages: &[crate::message::Message],
     tools: &[crate::provider::ToolDef],
@@ -111,36 +119,24 @@ pub fn estimate_request_input_tokens(
     } else {
         estimate_tokens(system) + 4
     };
-    system_tokens
-        + messages.iter().map(estimate_message_tokens).sum::<u64>()
-        + tools.iter().map(estimate_tool_tokens).sum::<u64>()
-        + 16
+    let message_tokens = if api.sends_reasoning_in_history() {
+        messages.iter().map(estimate_message_tokens).sum::<u64>()
+    } else {
+        messages
+            .iter()
+            .map(estimate_message_tokens_without_thinking)
+            .sum::<u64>()
+    };
+    system_tokens + message_tokens + tools.iter().map(estimate_tool_tokens).sum::<u64>() + 16
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn argument_key_estimate_matches_previous_join_without_allocations() {
+    fn tool_arguments_are_estimated_from_their_values() {
         use crate::message::{Api, ContentBlock, Message, StopReason, ToolCall, Usage};
-        for arguments in [
-            serde_json::json!({}),
-            serde_json::json!({"":1," whitespace \t key":2,"羽毛":3}),
-            serde_json::json!("words 羽毛"),
-            serde_json::json!([1, 2]),
-        ] {
-            let expected = match arguments.as_str() {
-                Some(s) => estimate_tokens(s),
-                None => arguments.as_object().map_or(0, |object| {
-                    estimate_tokens(
-                        &object
-                            .keys()
-                            .map(String::as_str)
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    )
-                }),
-            };
-            let msg = Message::assistant(
+        let message = |arguments: serde_json::Value| {
+            Message::assistant(
                 vec![
                     ContentBlock::ToolCall(ToolCall {
                         id: "t".into(),
@@ -155,12 +151,23 @@ mod tests {
                 Api::Faux,
                 Usage::default(),
                 StopReason::ToolUse,
-            );
-            assert_eq!(
-                estimate_message_tokens(&msg),
-                4 + estimate_tokens("read") + expected + 8 + estimate_tokens("tail") + 3
-            );
-        }
+            )
+        };
+        // Values are sent verbatim, so a large payload must dominate the count.
+        let small = estimate_message_tokens(&message(serde_json::json!({"path": "a"})));
+        let large =
+            estimate_message_tokens(&message(serde_json::json!({"path": "a".repeat(200_000)})));
+        assert!(
+            large > small + 40_000,
+            "a 200 KB argument must count: small={small} large={large}"
+        );
+
+        // The exact structure is not the point; the values are. Pin the shape of
+        // the walk so a future change cannot silently drop them again.
+        assert_eq!(estimate_json_tokens(&serde_json::json!("abcd")), 6);
+        // 2 braces + 1 comma + ("k" quoted) 3 + ("abcd" quoted) 6
+        assert_eq!(estimate_json_tokens(&serde_json::json!({"k": "abcd"})), 12);
+        assert_eq!(estimate_json_tokens(&serde_json::json!([1, 22])), 7);
     }
     use super::*;
 

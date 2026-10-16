@@ -632,6 +632,7 @@ impl Agent {
             // and use only the configured compaction headroom before each normal request.
             // build_request so no later async work can make the prompt stale.
             let request_tokens = tokenizer::estimate_request_input_tokens(
+                self.config.api,
                 &self.config.system_prompt,
                 self.session.messages(),
                 &self.config.tools,
@@ -645,6 +646,7 @@ impl Agent {
                 match self.compact("threshold").await {
                     Ok(saved) if saved > 0 => {
                         let after = tokenizer::estimate_request_input_tokens(
+                            self.config.api,
                             &self.config.system_prompt,
                             self.session.messages(),
                             &self.config.tools,
@@ -660,6 +662,7 @@ impl Agent {
                         // Surface the condition rather than compacting repeatedly
                         // and sending the same invalid prompt three times.
                         let after = tokenizer::estimate_request_input_tokens(
+                            self.config.api,
                             &self.config.system_prompt,
                             self.session.messages(),
                             &self.config.tools,
@@ -1123,6 +1126,7 @@ impl Agent {
         }
         let settings = self.config.compaction.clone();
         let before_request_tokens = tokenizer::estimate_request_input_tokens(
+            self.config.api,
             &self.config.system_prompt,
             self.session.messages(),
             &self.config.tools,
@@ -1215,6 +1219,7 @@ impl Agent {
 
         new_msgs.extend(kept);
         let static_request_tokens = tokenizer::estimate_request_input_tokens(
+            self.config.api,
             &self.config.system_prompt,
             &[],
             &self.config.tools,
@@ -1228,6 +1233,7 @@ impl Agent {
         );
         let after_chars = compaction::context_characters(&new_msgs);
         let after_request_tokens = tokenizer::estimate_request_input_tokens(
+            self.config.api,
             &self.config.system_prompt,
             &new_msgs,
             &self.config.tools,
