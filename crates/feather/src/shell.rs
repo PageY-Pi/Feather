@@ -3,7 +3,9 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
-pub(crate) struct BashRuntime {
+/// Resolved Bash runtime. Public because the prerequisite report (and any
+/// embedder) must be able to ask what the Bash tool would actually use.
+pub struct BashRuntime {
     pub executable: PathBuf,
     pub path: Option<OsString>,
 }

@@ -286,6 +286,14 @@ impl FeatherApp {
             }
             sessions::StartupPlan::Welcome => {}
         }
+        // An install can be complete while the host is not: Bash and Git are
+        // deliberately not bundled. Say so here, once, with the fix — the
+        // alternative is a mysterious failure on the first Bash call.
+        if !preview {
+            if let Some(warning) = feather::prereq::warning() {
+                rows.push(ChatRow::new(RowKind::Error, warning));
+            }
+        }
 
         let kb = if preview {
             keybindings::Keybindings::load_from(&home.join("config.redb"))

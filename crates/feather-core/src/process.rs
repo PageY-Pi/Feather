@@ -25,6 +25,79 @@ pub fn async_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
     cmd
 }
 
+/// Resolve Git without trusting PATH alone. Git for Windows can be installed
+/// with "use Git from Git Bash only" (no PATH entry), and a process started
+/// before the installer refreshed PATH never sees a fresh install — both make
+/// `Command::new("git")` fail even though git is present. Checkpoints must work
+/// in that state or an install looks broken.
+pub fn git_command() -> std::process::Command {
+    command(git_program())
+}
+
+pub fn git_program() -> std::ffi::OsString {
+    git_executable().map_or_else(|| std::ffi::OsString::from("git"), Into::into)
+}
+
+pub fn git_executable() -> Option<std::path::PathBuf> {
+    let exe = if cfg!(windows) { "git.exe" } else { "git" };
+    if let Some(value) = std::env::var_os("FEATHER_GIT") {
+        let path = std::path::PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Some(found) = find_on_path(exe) {
+        return Some(found);
+    }
+    #[cfg(windows)]
+    for root in git_roots() {
+        for relative in ["cmd/git.exe", "bin/git.exe"] {
+            let candidate = root.join(relative);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn find_on_path(exe: &str) -> Option<std::path::PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(exe))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Install roots a Git for Windows setup can leave behind, including the
+/// per-user default. `FEATHER_BASH` is honored first so an explicit Bash
+/// choice also supplies its git.
+#[cfg(windows)]
+fn git_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(bash) = std::env::var_os("FEATHER_BASH") {
+        let bash = std::path::PathBuf::from(bash);
+        // <root>/bin/bash.exe or <root>/usr/bin/bash.exe -> <root>
+        if let Some(root) = bash.parent().and_then(|dir| {
+            if dir.file_name().is_some_and(|n| n == "bin") {
+                dir.parent()
+            } else {
+                dir.parent().and_then(|p| p.parent())
+            }
+        }) {
+            roots.push(root.to_path_buf());
+        }
+    }
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(dir) = std::env::var_os(var) {
+            roots.push(std::path::PathBuf::from(dir).join("Git"));
+        }
+    }
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(std::path::PathBuf::from(dir).join("Programs/Git"));
+    }
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]

@@ -42,17 +42,191 @@ Root: HKCU; Subkey: "Software\Classes\DesktopBackground\Shell\FeatherGUI\command
 [Run]
 Filename: "{app}\feather-gui.exe"; Description: "Open Feather and configure your API with + Add API"; WorkingDir: "{userdocs}"; Flags: nowait postinstall skipifsilent
 [Code]
-function SplitString(Value, Separator: String): TArrayOfString;
-var P, N: Integer;
+{ ---------------------------------------------------------------------------
+  Host prerequisites.
+
+  Feather runs model-issued commands through Git Bash and drives file
+  checkpoints with git. Neither is bundled: shipping them would add ~60 MB and
+  pull a GPLv2 redistribution obligation into this installer. A bare Windows
+  machine can therefore finish setup with an unusable Bash tool, so the wizard
+  detects Git for Windows and offers to install it.
+
+  Invariant: this step must never fail the install. Any network, UAC or
+  installer failure degrades to a clear message plus the download page.
+--------------------------------------------------------------------------- }
+#include "prereq_git.iss"
+
+const
+  GitDownloadPageUrl = 'https://git-scm.com/download/win';
+  GitLatestApiUrl = 'https://api.github.com/repos/git-for-windows/git/releases/latest';
+  GitInstallerName = 'Git-64-bit.exe';
+  GitSilentParams =
+    '/VERYSILENT /NORESTART /SP- /NOCANCEL /CLOSEAPPLICATIONS /SUPPRESSMSGBOXES';
+
+var
+  PrereqPage: TWizardPage;
+  PrereqInfo: TNewStaticText;
+  PrereqAuto, PrereqBrowser, PrereqSkip: TNewRadioButton;
+  DownloadPage: TDownloadWizardPage;
+  GitReady: Boolean;
+
+{ The release asset name carries the version, so there is no stable "latest"
+  URL to hard-code. Ask GitHub for the current release and pick the 64-bit
+  installer out of it; any failure simply leaves the browser path to the user. }
+function ResolveGitInstallerUrl(): String;
+var
+  Json: AnsiString;
+  Text, Rest, Needle, Url: String;
+  At, Quote: Integer;
 begin
-  SetArrayLength(Result, 0);
-  repeat
-    P := Pos(Separator, Value); N := GetArrayLength(Result);
-    SetArrayLength(Result, N+1);
-    if P = 0 then begin Result[N] := Value; Value := ''; end
-    else begin Result[N] := Copy(Value, 1, P-1); Delete(Value, 1, P); end;
-  until P = 0;
+  Result := '';
+  try
+    DownloadTemporaryFile(GitLatestApiUrl, 'git-latest.json', '', nil);
+  except
+    Exit;
+  end;
+  if not LoadStringFromFile(ExpandConstant('{tmp}\git-latest.json'), Json) then
+    Exit;
+  Text := String(Json);
+  Needle := '"browser_download_url":"';
+  Rest := Text;
+  while True do
+  begin
+    At := Pos(Needle, Rest);
+    if At = 0 then
+      Exit;
+    Rest := Copy(Rest, At + Length(Needle), Length(Rest));
+    Quote := Pos('"', Rest);
+    if Quote = 0 then
+      Exit;
+    Url := Copy(Rest, 1, Quote - 1);
+    if (Pos('-64-bit.exe', Url) > 0) and (Pos('.sig', Url) = 0) then
+    begin
+      Result := Url;
+      Exit;
+    end;
+    Rest := Copy(Rest, Quote, Length(Rest));
+  end;
 end;
+
+function InstallGitForWindows(): Boolean;
+var
+  Url, Installer: String;
+  ResultCode: Integer;
+begin
+  Result := False;
+  Url := ResolveGitInstallerUrl();
+  if Url = '' then
+    Exit;
+  Installer := ExpandConstant('{tmp}\') + GitInstallerName;
+  DownloadPage.Clear;
+  DownloadPage.Add(Url, GitInstallerName, '');
+  DownloadPage.Show;
+  try
+    try
+      DownloadPage.Download;
+    except
+      Exit;
+    end;
+  finally
+    DownloadPage.Hide;
+  end;
+  if not FileExists(Installer) then
+    Exit;
+  if not Exec(Installer, GitSilentParams, '', SW_SHOW, ewWaitUntilTerminated,
+    ResultCode) then
+    Exit;
+  GitReady := GitDetected();
+  Result := GitReady;
+end;
+
+procedure InitializeWizard();
+begin
+  DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing),
+    SetupMessage(msgPreparingDesc), nil);
+  DownloadPage.ShowBaseNameInsteadOfUrl := True;
+
+  GitReady := GitDetected();
+  PrereqPage := CreateCustomPage(wpSelectDir, 'Host prerequisites',
+    'Feather runs commands through Git Bash and records checkpoints with git.');
+
+  PrereqInfo := TNewStaticText.Create(PrereqPage);
+  PrereqInfo.Parent := PrereqPage.Surface;
+  PrereqInfo.Left := 0;
+  PrereqInfo.Top := 0;
+  PrereqInfo.Width := PrereqPage.SurfaceWidth;
+  PrereqInfo.Height := ScaleY(56);
+  PrereqInfo.AutoSize := False;
+  PrereqInfo.WordWrap := True;
+  if GitReady then
+    PrereqInfo.Caption :=
+      'Git for Windows is already installed, so the Bash tool and file ' +
+      'checkpoints will work. Nothing else is required.'
+  else
+    PrereqInfo.Caption :=
+      'Git for Windows was not found. It supplies both Git Bash (used by the ' +
+      'Bash tool) and git (used by file checkpoints). Feather installs either ' +
+      'way, but those two features stay unavailable until Git for Windows is ' +
+      'present.';
+
+  PrereqAuto := TNewRadioButton.Create(PrereqPage);
+  PrereqAuto.Parent := PrereqPage.Surface;
+  PrereqAuto.Left := 0;
+  PrereqAuto.Top := PrereqInfo.Top + PrereqInfo.Height + ScaleY(12);
+  PrereqAuto.Width := PrereqPage.SurfaceWidth;
+  PrereqAuto.Caption := 'Download and install Git for Windows now (recommended)';
+  PrereqAuto.Visible := not GitReady;
+  PrereqAuto.Checked := not GitReady;
+
+  PrereqBrowser := TNewRadioButton.Create(PrereqPage);
+  PrereqBrowser.Parent := PrereqPage.Surface;
+  PrereqBrowser.Left := 0;
+  PrereqBrowser.Top := PrereqAuto.Top + ScaleY(24);
+  PrereqBrowser.Width := PrereqPage.SurfaceWidth;
+  PrereqBrowser.Caption := 'Open ' + GitDownloadPageUrl + ' in my browser';
+  PrereqBrowser.Visible := not GitReady;
+
+  PrereqSkip := TNewRadioButton.Create(PrereqPage);
+  PrereqSkip.Parent := PrereqPage.Surface;
+  PrereqSkip.Left := 0;
+  PrereqSkip.Top := PrereqBrowser.Top + ScaleY(24);
+  PrereqSkip.Width := PrereqPage.SurfaceWidth;
+  PrereqSkip.Caption := 'Skip for now — I will install it myself';
+  PrereqSkip.Visible := not GitReady;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  { A machine that already has Git needs no decision here. }
+  Result := (PageID = PrereqPage.ID) and GitReady;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  if (CurPageID <> PrereqPage.ID) or GitReady then
+    Exit;
+  if PrereqBrowser.Checked then
+  begin
+    ShellExec('open', GitDownloadPageUrl, '', '', SW_SHOWNORMAL, ewNoWait,
+      ResultCode);
+    Exit;
+  end;
+  if not PrereqAuto.Checked then
+    Exit;
+  if InstallGitForWindows() then
+    MsgBox('Git for Windows is installed. The Bash tool and file checkpoints ' +
+      'are ready.', mbInformation, MB_OK)
+  else
+    MsgBox('Git for Windows could not be installed automatically (no network, ' +
+      'cancelled elevation, or the installer failed).' + #13#10#13#10 +
+      'Feather itself will still install. Install Git for Windows from ' +
+      GitDownloadPageUrl + ', or choose "Open in my browser" above.',
+      mbInformation, MB_OK);
+end;
+
 function ContainsPath(Value, Entry: String): Boolean;
 var Parts: TArrayOfString; I: Integer;
 begin
@@ -71,6 +245,18 @@ begin
       if (Value <> '') and (Value[Length(Value)] <> ';') then Value := Value + ';';
       if RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Value + AppDir) then
         RegWriteStringValue(HKCU, 'Software\Feather\Installer', 'AddedPath', AppDir);
+    end;
+    { The prereq page allows "skip": say plainly, at the end, what will not
+      work — before the user meets it as a failed tool call. Silent installs
+      must never open a dialog, so they only log. }
+    if not GitDetected() then begin
+      if WizardSilent() then
+        Log('warning: Git for Windows not found; Bash tool and checkpoints unavailable')
+      else
+        MsgBox('Feather is installed, but Git for Windows was not found.' + #13#10#13#10 +
+          'The Bash tool and file checkpoints need it. Install it from ' +
+          GitDownloadPageUrl + ' and reopen Feather.',
+          mbInformation, MB_OK);
     end;
   end;
 end;

@@ -155,6 +155,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
     }
+    // Host tools are not bundled: warn before the first Bash call fails, so the
+    // user gets the fix instead of an opaque tool error. RPC clients (the GUI)
+    // render this themselves.
+    if let Some(warning) = feather::prereq::warning() {
+        eprintln!("feather: {warning}\n");
+    }
     let mut events = agent.subscribe();
 
     if let Some(prompt) = cli.prompt {

@@ -191,10 +191,15 @@ Environment variables:
 | `FEATHER_HOME` | Override the default `~/.feather` state directory |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | Provider credential fallback |
 | `FEATHER_BASH` | Override the Bash executable used by tools |
+| `FEATHER_GIT` | Override the git executable used by checkpoints |
 | `FEATHER_GUI_RENDERER` | `cpu` or `wgpu` for renderer selection |
 
 On Windows Bash tools require **Git Bash or MSYS2 Bash**. Commands use POSIX
-syntax, not `cmd.exe` or PowerShell syntax.
+syntax, not `cmd.exe` or PowerShell syntax. Git itself is required for file
+checkpoints; both are resolved even when they are missing from `PATH`
+(`FEATHER_BASH`, `FEATHER_GIT` override either). The Windows installer detects
+both and offers to install Git for Windows, and the app warns at startup when
+either is missing.
 
 ## Build and test
 

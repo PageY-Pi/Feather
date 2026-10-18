@@ -16,13 +16,44 @@ Per-user installation (no admin):
 The installer `[Files]` section is an explicit allowlist of **two release EXEs plus the third-party license notice**.
 No config.redb, models.json, auth.json, credentials, sessions or user files are
 included. Embedded public model/protocol defaults are application data, not
-anyone's private configured models. Git and Bash are not bundled: live file
-checkpointing/tool execution may require Git for Windows to be installed.
+anyone's private configured models.
+
+## Host prerequisites (Git Bash and git)
+
+Feather runs model-issued commands through **Git Bash** and records file
+checkpoints with **git**. Neither ships inside the installer: bundling them adds
+roughly 60 MB and brings a GPLv2 redistribution obligation into a package that
+currently carries only Feather's own binaries.
+
+Setup therefore detects Git for Windows and, when it is missing, shows a
+**Host prerequisites** page with three choices:
+
+1. **Download and install Git for Windows now** (default) — fetches the current
+   64-bit installer from the official GitHub release, runs it silently, then
+   re-checks. Needs network access; Windows may ask for elevation because Git's
+   own installer is per-machine.
+2. **Open the download page** in the browser for a manual install.
+3. **Skip** — Feather installs anyway. The Bash tool and checkpoints stay
+   unavailable, and both the installer and the app say so instead of failing
+   later with an opaque tool error.
+
+This step can never fail the installation: no network, a declined UAC prompt or
+a failed Git setup only produce a message carrying the download URL. When Git is
+already present the page is skipped entirely.
+
+Detection reads the `SOFTWARE\GitForWindows` `InstallPath` value, then the common
+install roots, then `PATH` — where a `bash.exe` entry only counts when MSYS2 sits
+beside it, because Windows also ships a WSL launcher under that name. The rules
+live in `installer/prereq_git.iss` and are regression-tested by
+`installer/prereq_probe.iss` (see Build below).
 
 Build:
 1. `cargo test --workspace`
 2. `cargo build --release -p feather -p feather-gui`
 3. Install Inno Setup 6, then `ISCC installer\Feather.iss`.
+4. After changing prerequisite detection: `ISCC installer\prereq_probe.iss`,
+   run `target\prereq-probe\feather-prereq-probe.exe /VERYSILENT`, and confirm
+   every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
 - 1.1.0 keeps compaction aligned with Pi (trigger at context minus reserve, max

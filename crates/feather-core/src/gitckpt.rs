@@ -7,7 +7,7 @@
 //!   so HEAD, branch, and the user's index are never changed;
 //! - restore only touches files recorded by this session's checkpoints.
 
-use crate::process::command;
+use crate::process::git_command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -80,7 +80,7 @@ impl GitCheckpoints {
         if root.join(".git").exists() {
             return Ok((root, false));
         }
-        let out = command("git").arg("init").current_dir(&root).output()?;
+        let out = git_command().arg("init").current_dir(&root).output()?;
         if !out.status.success() {
             return Err(std::io::Error::other(format!(
                 "git init failed: {}",
@@ -92,7 +92,7 @@ impl GitCheckpoints {
     }
 
     fn run(repo: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-        command("git").args(args).current_dir(repo).output()
+        git_command().args(args).current_dir(repo).output()
     }
 
     fn check(repo: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -170,7 +170,7 @@ impl GitCheckpoints {
     }
 
     fn is_ignored(repo: &Path, rel: &str) -> bool {
-        command("git")
+        git_command()
             .args(["check-ignore", "-q", "--", rel])
             .current_dir(repo)
             .status()
@@ -227,7 +227,7 @@ impl GitCheckpoints {
             if Self::is_ignored(&repo, f) {
                 continue;
             }
-            let out = command("git")
+            let out = git_command()
                 .args(["add", "--", f])
                 .current_dir(&repo)
                 .env("GIT_INDEX_FILE", &index)
@@ -241,7 +241,7 @@ impl GitCheckpoints {
                 ));
             }
         }
-        let out = command("git")
+        let out = git_command()
             .arg("write-tree")
             .current_dir(&repo)
             .env("GIT_INDEX_FILE", &index)
@@ -254,7 +254,7 @@ impl GitCheckpoints {
             )));
         }
         let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let out = command("git")
+        let out = git_command()
             .args([
                 "-c",
                 "user.name=feather",
@@ -434,7 +434,7 @@ pub fn ensure_gitignore_entries(root: &Path, entries: &[&str]) {
 mod tests {
     use super::*;
     fn git(repo: &Path, args: &[&str]) -> String {
-        let out = command("git")
+        let out = git_command()
             .args(["-c", "user.name=feather", "-c", "user.email=feather@local"])
             .args(args)
             .current_dir(repo)
