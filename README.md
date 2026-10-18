@@ -199,7 +199,9 @@ syntax, not `cmd.exe` or PowerShell syntax. Git itself is required for file
 checkpoints; both are resolved even when they are missing from `PATH`
 (`FEATHER_BASH`, `FEATHER_GIT` override either). The Windows installer detects
 both and offers to install Git for Windows, and the app warns at startup when
-either is missing.
+either is missing. Because the official download host is unreliable in mainland
+China, that install resolves through the USTC mirror first, then npmmirror, and
+only then GitHub.
 
 ## Build and test
 

@@ -29,16 +29,37 @@ Setup therefore detects Git for Windows and, when it is missing, shows a
 **Host prerequisites** page with three choices:
 
 1. **Download and install Git for Windows now** (default) — fetches the current
-   64-bit installer from the official GitHub release, runs it silently, then
-   re-checks. Needs network access; Windows may ask for elevation because Git's
-   own installer is per-machine.
-2. **Open the download page** in the browser for a manual install.
+   64-bit installer, runs it silently, then re-checks. Needs network access;
+   Windows may ask for elevation because Git's own installer is per-machine.
+2. **Open a mirror** in the browser for a manual install.
 3. **Skip** — Feather installs anyway. The Bash tool and checkpoints stay
    unavailable, and both the installer and the app say so instead of failing
    later with an opaque tool error.
 
+### Download source: mainland-China mirrors first
+
+GitHub's release host is routinely blocked or throttled in mainland China, which
+would turn this step into a long timeout. Setup therefore resolves the download in
+this order, each attempt independent:
+
+1. **USTC** (中国科学技术大学开源镜像站) —
+   `https://mirrors.ustc.edu.cn/github-release/git-for-windows/git/LatestRelease/`
+   It keeps a stable `LatestRelease` directory naming the current assets, so one
+   small index fetch yields the exact file.
+2. **npmmirror** (阿里巴巴镜像) — `registry.npmmirror.com/-/binary/git-for-windows/`
+   One directory per release; setup reads the listing, picks the newest **stable**
+   version (pre-releases are ignored) and then the installer inside it.
+3. **GitHub releases API** — for machines outside China where the mirrors may be
+   the unreachable side.
+
+Both mirrors publish the official Git for Windows assets over HTTPS. The chosen
+host is logged and named in the completion message so the source is never
+implicit. Assets are selected by filename anchored on the name boundary, so
+`MinGit-…` (a stripped archive) and `PortableGit-…` can never be installed by
+mistake.
+
 This step can never fail the installation: no network, a declined UAC prompt or
-a failed Git setup only produce a message carrying the download URL. When Git is
+a failed Git setup only produce a message carrying both mirror URLs. When Git is
 already present the page is skipped entirely.
 
 Detection reads the `SOFTWARE\GitForWindows` `InstallPath` value, then the common

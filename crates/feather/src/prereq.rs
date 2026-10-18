@@ -19,13 +19,21 @@ pub struct Missing {
     pub detail: &'static str,
 }
 
+/// Git for Windows is not bundled with Feather, and its official download host
+/// is unreliable on mainland networks, so guidance points at the mirrors the
+/// installer itself uses.
+const GIT_MIRROR: &str =
+    "https://mirrors.ustc.edu.cn/github-release/git-for-windows/git/LatestRelease/";
+
 const BASH_DETAIL: &str = "Bash tools are unavailable: Git Bash/MSYS2 was not found. \
-Install Git for Windows (https://git-scm.com/download/win), then reopen Feather, \
-or set FEATHER_BASH to an existing bash.exe.";
+Install Git for Windows from a China mirror \
+(https://mirrors.ustc.edu.cn/github-release/git-for-windows/git/LatestRelease/) \
+or npmmirror, then reopen Feather, or set FEATHER_BASH to an existing bash.exe.";
 
 const GIT_DETAIL: &str = "File checkpoints are unavailable: git was not found. \
-Install Git for Windows (https://git-scm.com/download/win), then reopen Feather, \
-or set FEATHER_GIT to an existing git.exe.";
+Install Git for Windows from a China mirror \
+(https://mirrors.ustc.edu.cn/github-release/git-for-windows/git/LatestRelease/) \
+or npmmirror, then reopen Feather, or set FEATHER_GIT to an existing git.exe.";
 
 /// Everything missing on this machine, in a stable order (Bash first).
 pub fn missing() -> Vec<Missing> {
@@ -111,9 +119,13 @@ mod tests {
 
     #[test]
     fn guidance_names_the_fix() {
-        // The message is the whole point: it must carry the download link.
-        assert!(BASH_DETAIL.contains("https://git-scm.com/download/win"));
-        assert!(GIT_DETAIL.contains("https://git-scm.com/download/win"));
+        // The message is the whole point: it must carry a reachable download
+        // link. The official git-scm.com host is unreliable on mainland
+        // networks, so guidance must name a mirror instead.
+        assert!(BASH_DETAIL.contains(GIT_MIRROR));
+        assert!(GIT_DETAIL.contains(GIT_MIRROR));
+        assert!(!BASH_DETAIL.contains("git-scm.com"));
+        assert!(!GIT_DETAIL.contains("git-scm.com"));
     }
 
     #[test]
@@ -126,7 +138,7 @@ mod tests {
             for entry in missing {
                 assert!(text.contains(entry.name) || text.contains(entry.detail));
             }
-            assert!(text.contains("git-scm.com"));
+            assert!(text.contains(GIT_MIRROR));
         }
     }
 }

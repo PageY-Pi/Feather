@@ -57,8 +57,6 @@ Filename: "{app}\feather-gui.exe"; Description: "Open Feather and configure your
 #include "prereq_git.iss"
 
 const
-  GitDownloadPageUrl = 'https://git-scm.com/download/win';
-  GitLatestApiUrl = 'https://api.github.com/repos/git-for-windows/git/releases/latest';
   GitInstallerName = 'Git-64-bit.exe';
   GitSilentParams =
     '/VERYSILENT /NORESTART /SP- /NOCANCEL /CLOSEAPPLICATIONS /SUPPRESSMSGBOXES';
@@ -70,44 +68,6 @@ var
   DownloadPage: TDownloadWizardPage;
   GitReady: Boolean;
 
-{ The release asset name carries the version, so there is no stable "latest"
-  URL to hard-code. Ask GitHub for the current release and pick the 64-bit
-  installer out of it; any failure simply leaves the browser path to the user. }
-function ResolveGitInstallerUrl(): String;
-var
-  Json: AnsiString;
-  Text, Rest, Needle, Url: String;
-  At, Quote: Integer;
-begin
-  Result := '';
-  try
-    DownloadTemporaryFile(GitLatestApiUrl, 'git-latest.json', '', nil);
-  except
-    Exit;
-  end;
-  if not LoadStringFromFile(ExpandConstant('{tmp}\git-latest.json'), Json) then
-    Exit;
-  Text := String(Json);
-  Needle := '"browser_download_url":"';
-  Rest := Text;
-  while True do
-  begin
-    At := Pos(Needle, Rest);
-    if At = 0 then
-      Exit;
-    Rest := Copy(Rest, At + Length(Needle), Length(Rest));
-    Quote := Pos('"', Rest);
-    if Quote = 0 then
-      Exit;
-    Url := Copy(Rest, 1, Quote - 1);
-    if (Pos('-64-bit.exe', Url) > 0) and (Pos('.sig', Url) = 0) then
-    begin
-      Result := Url;
-      Exit;
-    end;
-    Rest := Copy(Rest, Quote, Length(Rest));
-  end;
-end;
 
 function InstallGitForWindows(): Boolean;
 var
@@ -121,11 +81,13 @@ begin
   Installer := ExpandConstant('{tmp}\') + GitInstallerName;
   DownloadPage.Clear;
   DownloadPage.Add(Url, GitInstallerName, '');
+  Log('prereq: downloading Git for Windows from ' + Url + ' (' + GitSource + ')');
   DownloadPage.Show;
   try
     try
       DownloadPage.Download;
     except
+      Log('prereq: download failed from ' + Url);
       Exit;
     end;
   finally
@@ -165,9 +127,9 @@ begin
   else
     PrereqInfo.Caption :=
       'Git for Windows was not found. It supplies both Git Bash (used by the ' +
-      'Bash tool) and git (used by file checkpoints). Feather installs either ' +
-      'way, but those two features stay unavailable until Git for Windows is ' +
-      'present.';
+      'Bash tool) and git (used by file checkpoints). Setup can download it from ' +
+      'a mirror in mainland China (USTC, falling back to npmmirror); if that ' +
+      'fails, Feather still installs but those two features stay unavailable.';
 
   PrereqAuto := TNewRadioButton.Create(PrereqPage);
   PrereqAuto.Parent := PrereqPage.Surface;
@@ -183,7 +145,8 @@ begin
   PrereqBrowser.Left := 0;
   PrereqBrowser.Top := PrereqAuto.Top + ScaleY(24);
   PrereqBrowser.Width := PrereqPage.SurfaceWidth;
-  PrereqBrowser.Caption := 'Open ' + GitDownloadPageUrl + ' in my browser';
+  PrereqBrowser.Caption :=
+    'Open a China mirror (USTC) in my browser, or npmmirror as a fallback';
   PrereqBrowser.Visible := not GitReady;
 
   PrereqSkip := TNewRadioButton.Create(PrereqPage);
@@ -217,13 +180,16 @@ begin
   if not PrereqAuto.Checked then
     Exit;
   if InstallGitForWindows() then
-    MsgBox('Git for Windows is installed. The Bash tool and file checkpoints ' +
-      'are ready.', mbInformation, MB_OK)
+    MsgBox('Git for Windows is installed (source: ' + GitSource + ').' + #13#10#13#10 +
+      'The Bash tool and file checkpoints are ready.',
+      mbInformation, MB_OK)
   else
     MsgBox('Git for Windows could not be installed automatically (no network, ' +
       'cancelled elevation, or the installer failed).' + #13#10#13#10 +
-      'Feather itself will still install. Install Git for Windows from ' +
-      GitDownloadPageUrl + ', or choose "Open in my browser" above.',
+      'Feather itself will still install. Download Git for Windows from either ' +
+      'mirror below, then reopen Feather:' + #13#10#13#10 +
+      GitDownloadPageUrl + #13#10 +
+      GitAltDownloadPageUrl,
       mbInformation, MB_OK);
 end;
 
@@ -254,8 +220,10 @@ begin
         Log('warning: Git for Windows not found; Bash tool and checkpoints unavailable')
       else
         MsgBox('Feather is installed, but Git for Windows was not found.' + #13#10#13#10 +
-          'The Bash tool and file checkpoints need it. Install it from ' +
-          GitDownloadPageUrl + ' and reopen Feather.',
+          'The Bash tool and file checkpoints need it. Download it from either ' +
+          'mirror below, then reopen Feather:' + #13#10#13#10 +
+          GitDownloadPageUrl + #13#10 +
+          GitAltDownloadPageUrl,
           mbInformation, MB_OK);
     end;
   end;
