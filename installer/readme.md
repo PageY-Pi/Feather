@@ -1,6 +1,6 @@
-# Feather 1.1.0 Windows installer
+# Feather 1.1.1 Windows installer
 
-Share `dist/Feather-1.1.0-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.1.1-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -77,6 +77,20 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.1.1 adds DeepSeek native web search. DeepSeek shipped the Search API on
+  2026-10-17 (`POST https://api.deepseek.com/v1/tools/search`, $0.75 per 1,000
+  successful calls, 5 QPS per account). Feather now routes `web_search` for the
+  `deepseek` provider — and for any provider whose base URL is on deepseek.com —
+  to that endpoint instead of scraping DuckDuckGo. One request returns ranked
+  structured results, so it works with every DeepSeek model: the Responses-API
+  `web_search` tool is v4-pro only and is ignored on `deepseek-flash`. Results
+  render as index/title/URL/summary, keep at most eight entries, drop URLs the
+  fetch guard refuses, and the query is cut to DeepSeek's 128-character limit.
+  Bases configured for `/anthropic` or `/beta` are folded back to the host root.
+  401/402/403/429 return a short sanitized reason and then fall back to
+  DuckDuckGo like every other native backend. `web_fetch` is unchanged: it stays
+  local (SSRF-guarded, no per-call fee) rather than proxying through
+  `/v1/tools/fetch`.
 - 1.1.0 keeps compaction aligned with Pi (trigger at context minus reserve, max
   output not subtracted) but moves the retained-token budget out of per-model
   settings: context/reserve/preserved tokens are now one global setting, and the

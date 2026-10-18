@@ -22,7 +22,16 @@ CLI/GUI agents and child agents, and require no Node/TypeScript extension runtim
 - `web_search {"query":"..."}`: official provider IDs `zai`, `anthropic`,
   `openai`, `xai`, `google` select native search: ZAI MCP Web Search Prime,
   Anthropic web_search_20250305, Responses web_search or Google grounding.
-- Unknown/custom provider IDs, including DeepSeek, use DuckDuckGo HTML.
+- `deepseek` (and any provider whose base URL is on `deepseek.com`) posts to the
+  DeepSeek Search API, `POST https://api.deepseek.com/v1/tools/search`. One
+  request returns ranked structured results instead of a model turn, so it works
+  with every DeepSeek model rather than only the v4-pro server-side tool.
+  Results render as index/title/URL/summary (summary, else snippet), are capped
+  at eight, and URLs failing the fetch guard are dropped. Bases configured for
+  another wire format (`/anthropic`, `/beta`) are folded back to the host root.
+  Queries are cut to DeepSeek's 128-character limit. Billed per successful call
+  (about $0.75 per 1,000) with a 5 QPS account limit.
+- Unknown/custom provider IDs use DuckDuckGo HTML.
 - Native failure is explicitly reported before DuckDuckGo fallback. Provider
   credentials are resolved at request time. Keys are never put in error messages
   or query URLs. Native search may incur provider charges/quota usage.
@@ -47,6 +56,8 @@ provider. No dynamic plugins or private extension config is shipped.
 MIT attribution is in `THIRD-PARTY-NOTICES.md`, also included by the installer.
 
 Validation: local native HTTP request/citation fixtures, UTF-8 limits, HTML/DDG
-parsing, cancellation and private target guards; live public example.com fetch
-and DuckDuckGo search both succeeded. No paid native requests were made. GUI
+parsing, cancellation and private target guards; a mocked DeepSeek Search request
+checks the `/v1/tools/search` route, 128-character query cut, structured result
+rendering, refused URLs, and sanitized 402/429 errors. Live public example.com
+fetch and DuckDuckGo search both succeeded. No paid native requests were made. GUI
 pointer-hover regression and workspace tests cover existing behavior.

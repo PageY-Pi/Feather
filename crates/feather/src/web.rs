@@ -3,7 +3,7 @@
 use crate::{auth::StoredCredentialResolver, models};
 use feather_core::provider::transport;
 use feather_core::{
-    provider::credentials::CredentialResolver,
+    provider::credentials::{CredentialResolver, ResolvedCredential},
     tool::{AgentTool, BoxFut, ToolOutcome},
 };
 use reqwest::{Client, Response, Url};
@@ -21,6 +21,7 @@ const MAX_LINES: usize = 2000;
 const UA: &str = "Mozilla/5.0 (compatible; FeatherWeb/0.1)";
 const DDG: &str = "https://html.duckduckgo.com/html/";
 const ZAI: &str = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+const DEEPSEEK: &str = "https://api.deepseek.com";
 fn client() -> Result<Client, String> {
     transport::async_builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -358,6 +359,7 @@ enum Backend {
     Responses,
     Google,
     Zai,
+    Deepseek,
 }
 fn backend(pid: &str) -> Backend {
     match pid {
@@ -365,6 +367,7 @@ fn backend(pid: &str) -> Backend {
         "openai" | "xai" => Backend::Responses,
         "google" => Backend::Google,
         "zai" => Backend::Zai,
+        "deepseek" => Backend::Deepseek,
         _ => Backend::Ddg,
     }
 }
@@ -375,13 +378,13 @@ struct Native {
     base: String,
     key: Option<String>,
     headers: Vec<(String, String)>,
+    /// Resolved search route: the provider id may be user-chosen, so the base
+    /// host can decide the backend.
+    kind: Backend,
 }
 fn context(model: &str, base_override: Option<&str>) -> Option<Native> {
     let catalog = models::load()?;
     let (pid, p, m) = models::find(&catalog, model)?;
-    if backend(pid) == Backend::Ddg {
-        return None;
-    }
     let base = base_override
         .or(m.base_url.as_deref())
         .or(p.base_url.as_deref())
@@ -389,8 +392,18 @@ fn context(model: &str, base_override: Option<&str>) -> Option<Native> {
             "anthropic" => "https://api.anthropic.com/v1",
             "xai" => "https://api.x.ai/v1",
             "google" => "https://generativelanguage.googleapis.com/v1beta",
+            "deepseek" => DEEPSEEK,
             _ => "https://api.openai.com/v1",
         });
+    // A user-defined provider may carry any ID; the host still identifies
+    // DeepSeek's own Search API, which is cheaper and needs no model turn.
+    let kind = match backend(pid) {
+        Backend::Ddg if deepseek_host(base) => Backend::Deepseek,
+        kind => kind,
+    };
+    if kind == Backend::Ddg {
+        return None;
+    }
     let mut headers = Vec::new();
     for h in [p.headers.as_ref(), m.headers.as_ref()]
         .into_iter()
@@ -410,6 +423,7 @@ fn context(model: &str, base_override: Option<&str>) -> Option<Native> {
         base: base.into(),
         key: p.api_key.clone(),
         headers,
+        kind,
     })
 }
 fn endpoint(base: &str, route: &str) -> String {
@@ -420,9 +434,57 @@ fn endpoint(base: &str, route: &str) -> String {
         format!("{base}/v1/{route}")
     }
 }
+/// DeepSeek's Search/Fetch APIs live under the model host itself, so a base
+/// configured for another wire format (`/anthropic`, `/beta`) is folded back to
+/// the root before `/v1/tools/*` is appended.
+fn deepseek_base(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    base.strip_suffix("/anthropic")
+        .or_else(|| base.strip_suffix("/beta"))
+        .unwrap_or(base)
+        .trim_end_matches('/')
+        .to_string()
+}
+fn deepseek_host(base: &str) -> bool {
+    Url::parse(base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "deepseek.com" || host.ends_with(".deepseek.com"))
+}
 async fn json_response(response: Response) -> Result<Value, String> {
     serde_json::from_slice(&body(response).await?)
         .map_err(|_| "Invalid JSON from native search".into())
+}
+/// DeepSeek Search returns ranked structured results rather than prose. Render
+/// them in the same shape as the other backends: index, title, URL, summary.
+fn deepseek_results(value: &Value) -> String {
+    let results = value["results"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let items = results
+        .iter()
+        .filter_map(|result| {
+            // Never surface a URL the fetch guard would refuse.
+            let url = web_url(result["url"].as_str()?).ok()?;
+            let title = result["title"].as_str().unwrap_or("").trim();
+            let summary = [&result["summary"], &result["snippet"]]
+                .into_iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .find(|v| !v.is_empty())
+                .unwrap_or("");
+            Some((title.to_string(), url, summary.to_string()))
+        })
+        .take(8)
+        .enumerate()
+        .map(|(i, (title, url, summary))| format!("{}. {title}\n   {url}\n   {summary}", i + 1))
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        "No results found.".into()
+    } else {
+        items.join("\n\n")
+    }
 }
 fn cited_response(value: &Value, kind: Backend) -> String {
     let mut texts = Vec::new();
@@ -480,6 +542,7 @@ fn cited_response(value: &Value, kind: Backend) -> String {
                 }
             }
         }
+        Backend::Deepseek => texts.push(deepseek_results(value)),
         _ => {
             for item in value["output"].as_array().into_iter().flatten() {
                 for part in item["content"].as_array().into_iter().flatten() {
@@ -583,6 +646,41 @@ async fn zai_search(http: &Client, key: &str, query: &str) -> Result<String, Str
         Ok(parsed.as_str().unwrap_or("No results found.").into())
     }
 }
+/// DeepSeek's standalone Search API: one request, structured results, billed per
+/// successful call rather than as a model turn. Queries are capped at 128
+/// characters server-side, so longer ones are cut here instead of failing.
+async fn deepseek_search(
+    http: &Client,
+    base: &str,
+    credential: &ResolvedCredential,
+    query: &str,
+) -> Result<String, String> {
+    let query: String = query.chars().take(128).collect();
+    let payload = json!({"query": query, "count": 8, "need_content": false});
+    let mut request = http
+        .post(web_url(&endpoint(&deepseek_base(base), "tools/search"))?)
+        .bearer_auth(&credential.api_key)
+        .json(&payload);
+    for (key, value) in &credential.headers {
+        request = request.header(key, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "DeepSeek search request failed".to_string())?;
+    match response.status().as_u16() {
+        401 => return Err("DeepSeek search rejected the API key".into()),
+        402 => return Err("DeepSeek account balance is insufficient for search".into()),
+        403 => return Err("DeepSeek search was rejected by its security policy".into()),
+        429 => return Err("DeepSeek search rate limit (5 QPS) exceeded".into()),
+        _ => {}
+    }
+    let value = json_response(response).await?;
+    if value["error"].is_object() {
+        return Err("DeepSeek search returned an error".into());
+    }
+    Ok(cited_response(&value, Backend::Deepseek))
+}
 async fn native_search(c: &Native, query: &str) -> Result<String, String> {
     let credential = StoredCredentialResolver::new(&c.pid, c.key.clone())
         .with_headers(c.headers.clone())
@@ -590,11 +688,11 @@ async fn native_search(c: &Native, query: &str) -> Result<String, String> {
         .await
         .map_err(|_| "Native search credential unavailable".to_string())?;
     let http = client()?;
-    let kind = backend(&c.pid);
-    if kind == Backend::Zai {
-        return zai_search(&http, &credential.api_key, query).await;
+    match c.kind {
+        Backend::Zai => zai_search(&http, &credential.api_key, query).await,
+        Backend::Deepseek => deepseek_search(&http, &c.base, &credential, query).await,
+        kind => native_request(c, query, &credential, &http, kind).await,
     }
-    native_request(c, query, &credential, &http, kind).await
 }
 async fn native_request(
     c: &Native,
@@ -718,7 +816,7 @@ impl AgentTool for WebSearchTool {
         "web_search"
     }
     fn description(&self) -> &'static str {
-        "Search the web for a query. Uses native ZAI MCP, Anthropic, OpenAI/xAI Responses or Google grounding when available; otherwise DuckDuckGo, with explicit fallback on native errors. Returns text and source URLs (untrusted). Native requests may incur provider fees; output capped at 50 KiB/2000 lines."
+        "Search the web for a query. Uses native ZAI MCP, Anthropic, OpenAI/xAI Responses, Google grounding or the DeepSeek Search API when available; otherwise DuckDuckGo, with explicit fallback on native errors. Returns text and source URLs (untrusted). Native requests may incur provider fees; output capped at 50 KiB/2000 lines."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})
@@ -802,8 +900,27 @@ mod tests {
     fn limits_backend_and_endpoint() {
         assert!(bounded(&"中".repeat(OUTPUT_LIMIT)).len() < OUTPUT_LIMIT + 100);
         assert!(bounded(&"line\n".repeat(3000)).contains("Truncated"));
-        assert_eq!(backend("deepseek"), Backend::Ddg);
+        assert_eq!(backend("deepseek"), Backend::Deepseek);
         assert_eq!(backend("zai"), Backend::Zai);
+        assert_eq!(backend("custom"), Backend::Ddg);
+        assert_eq!(
+            deepseek_base("https://api.deepseek.com/anthropic"),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            deepseek_base("https://api.deepseek.com/beta/"),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            endpoint(
+                &deepseek_base("https://api.deepseek.com/anthropic"),
+                "tools/search"
+            ),
+            "https://api.deepseek.com/v1/tools/search"
+        );
+        assert!(deepseek_host("https://api.deepseek.com/v1"));
+        assert!(!deepseek_host("https://api.deepseek.com.evil.test"));
+        assert!(!deepseek_host("https://api.notdeepseek.com"));
         assert_eq!(
             endpoint("https://api.anthropic.com/v1", "messages"),
             "https://api.anthropic.com/v1/messages"
@@ -846,6 +963,7 @@ mod tests {
                 base: server.url.clone(),
                 key: None,
                 headers: Vec::new(),
+                kind,
             };
             let credential = feather_core::provider::credentials::ResolvedCredential {
                 api_key: "synthetic-test-key".into(),
@@ -883,5 +1001,61 @@ mod tests {
             }
             server.finish();
         }
+    }
+    #[tokio::test]
+    async fn deepseek_search_uses_the_structured_search_api() {
+        let server = crate::http_test::serve(vec![(
+            200,
+            "application/json",
+            json!({"results":[
+                {"title":"Result A","url":"https://example.com/a","snippet":"short","summary":"long summary"},
+                {"title":"Unsafe","url":"javascript:alert(1)","summary":"must not appear"}
+            ]})
+            .to_string(),
+        )]);
+        let credential = ResolvedCredential {
+            api_key: "synthetic-test-key".into(),
+            ..Default::default()
+        };
+        // A base configured for the Anthropic wire format must still reach the
+        // model host's own /v1/tools/search route.
+        let text = deepseek_search(
+            &client().unwrap(),
+            &format!("{}/anthropic", server.url),
+            &credential,
+            &"q".repeat(300),
+        )
+        .await
+        .unwrap();
+        assert!(text.contains("1. Result A"), "{text}");
+        assert!(text.contains("https://example.com/a"));
+        assert!(text.contains("long summary"));
+        assert!(!text.contains("must not appear"));
+        let request = server.requests.recv().unwrap();
+        assert!(request.starts_with("POST /v1/tools/search"), "{request}");
+        assert!(request
+            .to_lowercase()
+            .contains("authorization: bearer synthetic-test-key"));
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let value: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(value["count"], 8);
+        assert_eq!(value["need_content"], false);
+        assert_eq!(value["query"].as_str().unwrap().chars().count(), 128);
+        server.finish();
+    }
+    #[tokio::test]
+    async fn deepseek_search_status_errors_stay_sanitized() {
+        let server = crate::http_test::serve(vec![(402, "application/json", "{}".into())]);
+        let credential = ResolvedCredential {
+            api_key: "synthetic-test-key".into(),
+            ..Default::default()
+        };
+        let error = deepseek_search(&client().unwrap(), &server.url, &credential, "q")
+            .await
+            .unwrap_err();
+        assert!(error.contains("balance"), "{error}");
+        assert!(!error.contains("synthetic-test-key"));
+        server.requests.recv().unwrap();
+        server.finish();
     }
 }
