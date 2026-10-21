@@ -1,6 +1,6 @@
-# Feather 1.1.1 Windows installer
+# Feather 1.1.2 Windows installer
 
-Share `dist/Feather-1.1.1-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.1.2-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -77,6 +77,17 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.1.2 makes model lists follow the provider. Feather compiled its catalog into
+  the binary, so a provider model launched after a release stayed invisible until
+  the next build. For the Volcengine Ark Coding Plan, Feather now reads the same
+  `GET /api/coding/v3/models` endpoint a chat request is authorized against, in
+  the background at startup, and caches the result in `config.redb` for 12 hours.
+  That response is Ark's whole platform catalog (137 ids, 83 retired), so entries
+  are filtered to callable chat models and folded onto the plan's documented names
+  — newest build wins, retired and undocumented ids are dropped. Discovered models
+  are unioned with the shipped ones, never substituted: offline, an auth failure or
+  a changed payload removes nothing. `deepseek-v4.1-flash-economy` (same weights as
+  the standard model, lower price, lower TPS) now appears without a rebuild.
 - 1.1.1 adds DeepSeek native web search. DeepSeek shipped the Search API on
   2026-10-17 (`POST https://api.deepseek.com/v1/tools/search`, $0.75 per 1,000
   successful calls, 5 QPS per account). Feather now routes `web_search` for the

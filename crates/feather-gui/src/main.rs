@@ -135,6 +135,8 @@ enum UiEvent {
         action: &'static str,
         result: Result<(), String>,
     },
+    /// Startup model discovery finished; the catalog on screen is stale.
+    ModelsRefreshed,
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +449,14 @@ impl FeatherApp {
         }
         if !preview {
             app.proxies.scan(app.home.clone(), app.egui_ctx.clone());
+            feather::model_refresh::spawn_startup_refresh(app.home.clone(), {
+                let tx = app.ev_tx.clone();
+                let ctx = app.egui_ctx.clone();
+                move || {
+                    let _ = tx.send(UiEvent::ModelsRefreshed);
+                    ctx.request_repaint();
+                }
+            });
         }
         Ok(app)
     }
@@ -1581,6 +1591,11 @@ impl FeatherApp {
                                 .push(ChatRow::new(RowKind::Error, format!("{provider}: {e}")));
                         }
                     }
+                }
+                UiEvent::ModelsRefreshed => {
+                    // A discovered model list is cached in config.redb and the
+                    // resolved catalog is rebuilt from it on the next read.
+                    self.catalog = models::load();
                 }
             }
             count += 1;

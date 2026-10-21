@@ -124,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
         let catalog = feather::proxy::merge_discovered(&proxy_scan_home, found);
         feather_core::provider::transport::set_route(catalog.selected);
     });
+    // Refresh provider-published model lists in the background so a slow or
+    // offline provider cannot delay this run. The next launch, and every read
+    // after the refresh lands, sees the new list.
+    feather::model_refresh::spawn_startup_refresh(proxy_home.clone(), || {});
     let mut settings = Settings::load();
     settings.save_default_if_missing();
     // pull pi's model catalog + compaction-model choice (a missing pi install

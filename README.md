@@ -11,7 +11,7 @@ Feather is a standalone coding assistant for your workspace. It combines a nativ
 parallel subtasks, recoverable history and anchor-verified file editing. No browser
 shell, Electron, Node.js runtime or dynamically loaded plugin engine is required.
 
-**Version 1.1.1** · Windows x64 is the release-tested platform. Rust sources contain
+**Version 1.1.2** · Windows x64 is the release-tested platform. Rust sources contain
 other-platform support, but those builds are not claimed to be release-validated.
 
 ## Why Feather?
@@ -37,7 +37,7 @@ other-platform support, but those builds are not claimed to be release-validated
 
 ## Install on Windows
 
-Use `Feather-1.1.1-Setup-x64.exe` from the project's published release assets, or
+Use `Feather-1.1.2-Setup-x64.exe` from the project's published release assets, or
 build it locally following the instructions below. The per-user installer needs
 no administrator privileges. It installs the two executables, adds Feather to
 your user PATH, and provides an **Open Feather here** Explorer menu.
@@ -64,6 +64,30 @@ feather-gui /path/to/project    # opens a specific workspace
 
 Without credentials Feather can run a deterministic offline provider for local
 smoke tests. That is a test fixture, not an offline general-purpose language model.
+
+### Model lists that follow the provider
+
+Frozen catalogs go stale: a provider launches a model and the picker keeps
+showing last month's list until Feather ships a release. For providers that
+expose a model-list endpoint, Feather refreshes the list in the **background at
+startup** and caches it in `config.redb` for 12 hours, so a normal launch makes
+no request and an offline launch keeps the previous list.
+
+Today this covers the Volcengine Ark Coding Plan (`volcengine-plan`), using the
+same `GET /api/coding/v3/models` endpoint a chat request is authorized against.
+The response is the whole Ark platform catalog — 137 ids including retired
+builds, video and embedding models — so entries are filtered to callable chat
+models and folded onto the plan's documented model names, newest build first.
+Retired (`Shutdown`/`Retiring`) entries are dropped, and so is anything the plan
+does not document, because the platform list is far wider than any subscription.
+A discovered model is added next to the bundled ones, never in place of them: if
+the endpoint changes shape, disappears or the machine is offline, the shipped
+list stays and nothing is removed.
+
+Credentials come from the same store and refresh path a chat request uses; no
+key is written to the cache, and a provider with no credential is never
+contacted. See [model discovery](crates/feather/docs/model-discovery.md) for the
+filtering rules and how to verify a refresh.
 
 ## Workflows
 
@@ -231,7 +255,7 @@ Build the Windows installer with **Inno Setup 6**:
 ISCC installer/Feather.iss
 ```
 
-Output: `dist/Feather-1.1.1-Setup-x64.exe`. See
+Output: `dist/Feather-1.1.2-Setup-x64.exe`. See
 [installer instructions](installer/README.md) for local deployment details.
 Native Windows smoke tests are in `scripts/cpu-smoke.ps1` and
 `scripts/renderer-restart-smoke.ps1`; they control isolated synthetic preview

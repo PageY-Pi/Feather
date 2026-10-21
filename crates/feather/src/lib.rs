@@ -7,6 +7,7 @@ pub mod command_policy;
 pub mod config;
 pub mod config_store;
 pub mod mentions;
+pub mod model_refresh;
 pub mod models;
 pub mod netlimit;
 pub mod oauth;

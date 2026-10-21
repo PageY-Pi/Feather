@@ -58,7 +58,7 @@ pub struct ModelCost {
     pub cache_write: Option<f64>,
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelEntry {
     pub id: String,
@@ -504,6 +504,33 @@ pub fn load_for(home: &std::path::Path) -> Option<ModelsFile> {
             if let Some(p) = catalog.providers.get_mut(pid) {
                 p.models.retain(|m| m.id != id);
             }
+        }
+    }
+    // Models discovered from a provider's own list endpoint. Unioned after
+    // deletion filtering, so a stale `deletedModels` entry cannot hide a model
+    // the provider actively serves, and never in place of a bundled entry: the
+    // bundled list stays authoritative when discovery fails.
+    for (pid, p) in catalog.providers.iter_mut() {
+        for discovered in crate::model_refresh::cached_models(home, pid) {
+            if p.models.iter().any(|m| m.id == discovered.id) {
+                continue;
+            }
+            // The endpoint under-reports capability (it omits `image` even for
+            // multimodal models), so a discovered variant adopts its bundled
+            // sibling's input when the endpoint does not report more.
+            let mut entry = discovered;
+            let sibling =
+                crate::model_refresh::family_of(&entry.id, p.models.iter().map(|m| m.id.as_str()))
+                    .and_then(|id| p.models.iter().find(|m| m.id == id))
+                    .cloned();
+            if let Some(sibling) = sibling {
+                let endpoint_has_image = entry.input.iter().any(|i| i == "image");
+                let sibling_has_image = sibling.input.iter().any(|i| i == "image");
+                if !endpoint_has_image && sibling_has_image {
+                    entry.input = sibling.input;
+                }
+            }
+            p.models.push(entry);
         }
     }
     apply_manual_effort(&mut catalog);

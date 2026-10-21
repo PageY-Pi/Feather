@@ -25,6 +25,18 @@ impl StoredCredentialResolver {
         }
     }
 
+    /// Resolve against a specific Feather home instead of the process default.
+    /// Background work that was given a `home` must use this, or it would read
+    /// one store's catalog and another store's credential.
+    pub fn for_home(home: &Path, provider: &str, fallback: Option<String>) -> Self {
+        Self {
+            path: home.join("config.redb"),
+            provider: provider.into(),
+            fallback,
+            headers: Vec::new(),
+        }
+    }
+
     pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.headers = headers;
         self
