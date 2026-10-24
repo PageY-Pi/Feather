@@ -130,7 +130,7 @@ impl AnchorStore {
         let content = String::from_utf8(bytes)
             .map_err(|_| EngineError::Encode(format!("{} is not valid UTF-8", path.display())))?;
         let seed = Self::seed_for(path, &content);
-        let mut map = AnchorMap::new(path.to_path_buf(), content, seed);
+        let mut map = AnchorMap::new(path.to_path_buf(), content, seed)?;
         let store = self.records().map_err(EngineError::Io)?;
         let key = norm_key(path).display().to_string();
         let rec = store.get::<PersistRecord>(&key).map_err(EngineError::Io)?;
@@ -602,6 +602,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
+    #[test]
+    fn pre_upgrade_record_is_ignored_and_restamped() {
+        // A record written by an older build holds 4-letter anchors, which no
+        // longer parse. It must not break the file, must not be trusted, and
+        // must be replaced with a current-format record.
+        let h = home("upgrade");
+        let f = h.join("code.rs");
+        std::fs::write(&f, "alpha\nbeta\n").unwrap();
+
+        let s1 = AnchorStore::new(&h);
+        let m1 = s1.build_map(&f).unwrap();
+        let anchors1: Vec<String> = (0..m1.len())
+            .map(|i| m1.anchor_at(i).unwrap().to_str())
+            .collect();
+
+        // Overwrite the persisted record with an old-format one (correct hashes,
+        // unparseable anchors) — exactly the shape a 4-letter build left behind.
+        let records = feather_core::records::Records::open(&h.join("anchors.redb")).unwrap();
+        let old = crate::engine::PersistRecord {
+            path: f.display().to_string(),
+            anchors: vec!["abcd".to_string(); 2],
+            hashes: ["alpha", "beta"]
+                .iter()
+                .map(|l| feather_core::message::fnv1a(l.as_bytes()))
+                .collect(),
+            free: vec![],
+            seed: 42,
+        };
+        records
+            .put(&norm_key(&f).display().to_string(), &old)
+            .unwrap();
+
+        // Re-open: the stale record is rejected, a fresh mapping is minted and
+        // written back, and the file stays fully addressable.
+        let s2 = AnchorStore::new(&h);
+        let rows = s2.read(&f, None, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let a = row.split('│').next().unwrap();
+            assert_eq!(a.len(), crate::engine::ANCHOR_LEN);
+            assert!(a.chars().all(|c: char| c.is_ascii_lowercase()));
+            assert!(crate::engine::Anchor::parse(a).is_some());
+        }
+
+        // A second restart now adopts the restamped record: stable anchors.
+        let s3 = AnchorStore::new(&h);
+        let m3 = s3.build_map(&f).unwrap();
+        let anchors3: Vec<String> = (0..m3.len())
+            .map(|i| m3.anchor_at(i).unwrap().to_str())
+            .collect();
+        assert_eq!(anchors3, anchors1, "restamped record must round-trip");
+
+        let _ = std::fs::remove_dir_all(&h);
+    }
     #[test]
     fn read_replace_undo_flow() {
         let h = home("flow");

@@ -1,7 +1,7 @@
 //! AgentTool implementations for the hashline surface.
 //!
 //! Tool schemas mirror the pi-hashline-edit-pro contract: edits are
-//! addressed by 4-char anchors, never line numbers; errors refuse with the
+//! addressed by 5-char anchors, never line numbers; errors refuse with the
 //! current rows attached so the model can retry without a fresh read.
 
 use crate::engine::{Anchor, Direction, EngineError};
@@ -29,7 +29,19 @@ fn parse_anchor(v: &Value, key: &str) -> Result<Anchor, ToolOutcome> {
         .and_then(|x| x.as_str())
         .ok_or_else(|| ToolOutcome::err(format!("missing string argument: {key}")))?;
     Anchor::parse(s).ok_or_else(|| {
-        ToolOutcome::err(format!("[E_ANCHOR_FORMAT] '{s}' is not a 4-letter anchor"))
+        // A 4-letter string is the shape of a pre-upgrade anchor; name that
+        // explicitly and point at the fix, instead of implying nonsense input.
+        if s.len() == 4 {
+            ToolOutcome::err(format!(
+                "[E_ANCHOR_FORMAT] '{s}' is a 4-letter anchor; anchors are now 5 lowercase \
+                 letters — re-read the file to get current anchors"
+            ))
+        } else {
+            ToolOutcome::err(format!(
+                "[E_ANCHOR_FORMAT] '{s}' is not a 5-lowercase-letter anchor; read the file \
+                 (or anchor_grep) to get anchors"
+            ))
+        }
     })
 }
 
@@ -62,7 +74,7 @@ impl AgentTool for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file as anchor rows `anchor│content` (4-character, letters-only, case-sensitive). \
+        "Read a text file as anchor rows `anchor│content` (5-character, lowercase letters only). A 4-letter anchor is from an older session — re-read instead. \
 Prefer the hashline tools for anything that touches files: read, replace, replace_within, insert, copy, move, write — the shell (python/sed) is for running code, never for editing files. \
 Line numbers are not shown and are not accepted by edit tools — edit by anchor. \
 Page long files with offset (1-indexed) and limit; when the output says truncated, continue with the hinted offset/limit. \
@@ -133,7 +145,7 @@ impl AgentTool for ReplaceTool {
 
     fn description(&self) -> &'static str {
         "Replace a range of lines (or a single line) in a text file by anchor. \
-`remove_from` and `remove_to` are the 4-character anchors of the first and last line to remove, and `replacement_lines` is one string with the exact replacement text: \"\" deletes the range. \
+`remove_from` and `remove_to` are the 5-character anchors of the first and last line to remove, and `replacement_lines` is one string with the exact replacement text: \"\" deletes the range. \
 Target lines by anchor, never by content or line number. \
 A trailing line break sets the last line's ending instead of adding a blank line. \
 Path resolution is anchor-only. Same-file calls in one message batch share one undo."
@@ -143,8 +155,8 @@ Path resolution is anchor-only. Same-file calls in one message batch share one u
         serde_json::json!({
             "type": "object",
             "properties": {
-                "remove_from": { "type": "string", "description": "4-char anchor of the FIRST line to remove" },
-                "remove_to": { "type": "string", "description": "4-char anchor of the LAST line to remove" },
+                "remove_from": { "type": "string", "description": "5-char anchor of the FIRST line to remove" },
+                "remove_to": { "type": "string", "description": "5-char anchor of the LAST line to remove" },
                 "replacement_lines": { "type": "string", "description": "Exact replacement text; \"\" deletes" }
             },
             "required": ["remove_from", "remove_to", "replacement_lines"]
@@ -196,8 +208,8 @@ impl AgentTool for ReplaceWithinTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "replace_from": { "type": "string", "description": "4-char anchor of the FIRST line searched" },
-                "replace_to": { "type": "string", "description": "4-char anchor of the LAST line searched" },
+                "replace_from": { "type": "string", "description": "5-char anchor of the FIRST line searched" },
+                "replace_to": { "type": "string", "description": "5-char anchor of the LAST line searched" },
                 "replace_old": { "type": "string" },
                 "replace_new": { "type": "string" }
             },
@@ -245,7 +257,7 @@ impl AgentTool for InsertTool {
     }
 
     fn description(&self) -> &'static str {
-        "Insert text after or before one existing line, addressed by a 4-char anchor. \
+        "Insert text after or before one existing line, addressed by a 5-char anchor. \
 The anchor line is preserved: `lines` go after it with direction \"after\" or before it with direction \"before\". \
 \"\" inserts one blank line; a trailing line break sets the last line's ending instead of adding a blank line. \
 Never include the anchor line. Compare both edges of the inserted block in the post-edit diff against the request."
@@ -255,7 +267,7 @@ Never include the anchor line. Compare both edges of the inserted block in the p
         serde_json::json!({
             "type": "object",
             "properties": {
-                "anchor": { "type": "string", "description": "4-char anchor of the line to insert next to" },
+                "anchor": { "type": "string", "description": "5-char anchor of the line to insert next to" },
                 "direction": { "type": "string", "enum": ["after", "before"] },
                 "lines": { "type": "string", "description": "Exact text to insert; empty string inserts one blank line" }
             },
@@ -300,7 +312,7 @@ impl AgentTool for CopyTool {
     }
 
     fn description(&self) -> &'static str {
-        "Copy a range of lines to another position, targeted by 4-character anchors. \
+        "Copy a range of lines to another position, targeted by 5-character anchors. \
 `source_from`/`source_to` mark the first and last line to copy and `insert_after` the destination line after which the copy goes; anchors may belong to different files. \
 The source lines stay in place, and the copied lines are written exactly as the source file holds them."
     }
@@ -356,7 +368,7 @@ impl AgentTool for MoveTool {
     }
 
     fn description(&self) -> &'static str {
-        "Move a range of lines to another position, targeted by 4-character anchors. \
+        "Move a range of lines to another position, targeted by 5-character anchors. \
 `source_from`/`source_to` mark the range and `insert_after` the destination line after which the range goes; anchors may belong to different files. \
 `insert_after` must sit outside the source range when both anchors share a file; moving a range to where it already sits reports no change."
     }
@@ -687,6 +699,77 @@ mod tests {
             .await;
         assert!(!out.is_error, "{out:?}");
         assert!(out.text.contains("│"), "grep output was: {}", out.text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn descriptions_state_the_real_anchor_shape() {
+        // The tool description is the model's only spec for anchor syntax. It
+        // said "4-character, letters-only, case-sensitive" for a while after the
+        // alphabet changed; keep it pinned to the constants instead.
+        let dir = tmp("desc");
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        let len = crate::engine::ANCHOR_LEN.to_string();
+        for t in hashline_tools(store, dir.clone()) {
+            let d = t.description();
+            assert!(
+                !d.contains("4-char") && !d.contains("case-sensitive"),
+                "{} description still describes 4-char case-sensitive anchors: {d}",
+                t.name()
+            );
+            // Descriptions that state a width must state the current one; ones
+            // that stay quiet about width (write) need no assertion.
+            if d.contains("-char") || d.contains("-character") {
+                assert!(
+                    d.contains(&format!("{len}-char")) || d.contains(&format!("{len}-character")),
+                    "{} description states the wrong anchor width: {d}",
+                    t.name()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn four_letter_anchor_is_refused_with_a_reread_hint() {
+        // An anchor left over from a pre-upgrade conversation must produce a
+        // pointed refusal, not a generic format error and never a guess.
+        let dir = tmp("oldanchor");
+        let f = dir.join("t.txt");
+        std::fs::write(&f, "alpha\n").unwrap();
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store, dir.clone()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "1".into(),
+                    name: "replace".into(),
+                    arguments: serde_json::json!({
+                        "remove_from": "abcd",
+                        "remove_to": "abcd",
+                        "replacement_lines": "x"
+                    }),
+                },
+                abort.clone(),
+            )
+            .await;
+        assert!(out.is_error, "a 4-letter anchor must be refused");
+        assert!(
+            out.text.contains("[E_ANCHOR_FORMAT]"),
+            "expected E_ANCHOR_FORMAT, got: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("re-read"),
+            "the refusal must tell the model to re-read: {}",
+            out.text
+        );
+        // the file is untouched
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

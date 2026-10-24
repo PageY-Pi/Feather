@@ -88,6 +88,15 @@ This version:
   are unioned with the shipped ones, never substituted: offline, an auth failure or
   a changed payload removes nothing. `deepseek-v4.1-flash-economy` (same weights as
   the standard model, lower price, lower TPS) now appears without a rebuild.
+- Line anchors are now five lowercase letters instead of four mixed-case
+  letters. With both cases in the alphabet every anchor had 15 wrong-case
+  spellings, and each was a valid anchor for a *different* line — a model that
+  changed one letter's case edited the wrong line and no check could notice,
+  because the line it hit really was unchanged. Lowercase makes that
+  unrepresentable. The wider 26^5 space also covers every file Feather will map,
+  where 52^4 fell short by about a million lines. Anchors saved by an older
+  build are ignored and re-minted on the next read, so a 4-letter anchor left in
+  an old conversation is refused with a re-read hint instead of being guessed at.
 - 1.1.1 adds DeepSeek native web search. DeepSeek shipped the Search API on
   2026-10-17 (`POST https://api.deepseek.com/v1/tools/search`, $0.75 per 1,000
   successful calls, 5 QPS per account). Feather now routes `web_search` for the

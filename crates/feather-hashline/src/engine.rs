@@ -1,17 +1,23 @@
 //! Anchor-addressed editing engine (pi-hashline-edit-pro semantics).
 //!
-//! Every line a tool serves is prefixed with a unique 4-character anchor:
+//! Every line a tool serves is prefixed with a unique 5-character anchor:
 //!
 //! ```text
-//! Hasu│old text
-//! arvm│old text 2
+//! hnwae│old text
+//! vftkb│old text 2
 //! ```
 //!
 //! Edits are addressed by anchor, never by line number, and nothing is
 //! fuzzy-matched, so an edit lands on the line it meant. Properties:
 //!
-//! - **4-char, letters only, case-sensitive** — 52^4 anchors per file; the
-//!   alphabet avoids digits/symbols so anchors tokenize cheaply.
+//! - **5-char, lowercase letters only** — 26^5 anchors per file; the
+//!   alphabet avoids digits, symbols and uppercase so anchors tokenize
+//!   cheaply *and* have exactly one spelling. A single-case alphabet is
+//!   deliberate: with 52 letters every anchor had 15 wrong-case spellings
+//!   that each parsed to a different live anchor, so a model that changed
+//!   one letter's case silently addressed another line (and the stale check
+//!   could not catch it, since that other line's hash was valid). Lowercase
+//!   makes that failure class unrepresentable.
 //! - **Stable mapping** — unchanged lines keep their anchors across edits;
 //!   freed anchors (deleted lines) are reused LIFO; new lines draw fresh
 //!   anchors from a deterministic per-file stream. The mapping persists to
@@ -26,8 +32,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-pub const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+/// Lowercase only, by design: each anchor must have exactly one spelling.
+/// With 52 letters an anchor had 15 wrong-case spellings, each of which parsed
+/// to a *different* live anchor — a silent wrong-line edit that the stale
+/// check cannot catch, because the other line's hash is legitimately valid.
+pub const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+
+/// Characters per anchor.
+pub const ANCHOR_LEN: usize = 5;
+
+/// Number of distinct anchors: 26^5.
 pub const SPACE: u64 = (ALPHABET.len() as u64)
+    * (ALPHABET.len() as u64)
     * (ALPHABET.len() as u64)
     * (ALPHABET.len() as u64)
     * (ALPHABET.len() as u64);
@@ -48,7 +64,7 @@ impl Anchor {
     }
 
     pub fn parse(s: &str) -> Option<Anchor> {
-        if s.len() != 4 {
+        if s.len() != ANCHOR_LEN {
             return None;
         }
         let mut i: u64 = 0;
@@ -63,7 +79,7 @@ impl Anchor {
 impl std::fmt::Display for Anchor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut i = self.0 as u64;
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; ANCHOR_LEN];
         for slot in buf.iter_mut().rev() {
             *slot = ALPHABET[(i % ALPHABET.len() as u64) as usize];
             i /= ALPHABET.len() as u64;
@@ -225,7 +241,7 @@ pub struct AnchorMap {
 impl AnchorMap {
     /// Map a fresh file: allocate anchors for all lines from the per-file
     /// deterministic stream.
-    pub fn new(path: PathBuf, content: String, seed: u64) -> Self {
+    pub fn new(path: PathBuf, content: String, seed: u64) -> Result<Self, EngineError> {
         let crlf = content.contains("\r\n");
         let trailing_newline = content.ends_with('\n');
         let lines: Vec<String> = split_lines(&content);
@@ -233,7 +249,7 @@ impl AnchorMap {
         let mut used = HashSet::new();
         let mut anchors = Vec::with_capacity(lines.len());
         for _ in 0..lines.len() {
-            let a = draw_fresh(&mut rng, &used);
+            let a = draw_fresh_or_err(&mut rng, &used)?;
             used.insert(a);
             anchors.push(a);
         }
@@ -257,7 +273,7 @@ impl AnchorMap {
             generation: 0,
         };
         map.reindex();
-        map
+        Ok(map)
     }
 
     fn reindex(&mut self) {
@@ -340,15 +356,17 @@ impl AnchorMap {
         self.last_undo = None; // single-level undo per file
     }
 
-    fn take_anchor(&mut self) -> Anchor {
+    fn take_anchor(&mut self) -> Result<Anchor, EngineError> {
         // Popping from the free table hands the anchor to a NEW line, but the
         // anchor must STAY in `used`: it now names a live row, and removing it
         // would let draw_fresh() re-issue it to another row (duplicate anchors
         // => silent wrong-line edits). Invariant: used == active ∪ free.
         if let Some(a) = self.free.pop() {
-            return a;
+            return Ok(a);
         }
-        draw_fresh(&mut self.rng, &self.used)
+        let a = draw_fresh_or_err(&mut self.rng, &self.used)?;
+        self.used.insert(a);
+        Ok(a)
     }
 
     fn release_anchor(&mut self, a: Anchor) {
@@ -452,7 +470,7 @@ impl AnchorMap {
         self.lines.truncate(a);
         self.hashes.truncate(a);
         for content in new_lines {
-            let anchor = self.take_anchor();
+            let anchor = self.take_anchor()?;
             self.anchors.push(anchor);
             self.hashes
                 .push(feather_core::message::fnv1a(content.as_bytes()));
@@ -571,7 +589,7 @@ impl AnchorMap {
         self.lines.truncate(a);
         self.hashes.truncate(a);
         for content in new_lines {
-            let anchor = self.take_anchor();
+            let anchor = self.take_anchor()?;
             self.anchors.push(anchor);
             self.hashes
                 .push(feather_core::message::fnv1a(content.as_bytes()));
@@ -651,7 +669,7 @@ impl AnchorMap {
             .collect();
         self.hashes.truncate(at);
         for content in new_lines {
-            let anchor = self.take_anchor();
+            let anchor = self.take_anchor()?;
             self.anchors.push(anchor);
             self.hashes
                 .push(feather_core::message::fnv1a(content.as_bytes()));
@@ -748,7 +766,7 @@ impl AnchorMap {
         debug_assert_eq!(self.hashes.len(), self.lines.len());
         if self.lines.is_empty() {
             // keep one empty row so the file stays addressable
-            let anchor = self.take_anchor();
+            let anchor = self.take_anchor()?;
             self.anchors.push(anchor);
             self.lines.push(String::new());
             self.hashes.push(feather_core::message::fnv1a(b""));
@@ -817,7 +835,7 @@ impl AnchorMap {
                 self.free.retain(|a| a != old_anchor);
                 *old_anchor
             } else {
-                self.take_anchor()
+                self.take_anchor()?
             };
             self.anchors.push(anchor);
             self.lines.push(content.clone());
@@ -1001,13 +1019,36 @@ pub enum Direction {
     Before,
 }
 
-fn draw_fresh(rng: &mut AnchorRng, used: &HashSet<Anchor>) -> Anchor {
-    loop {
+/// How many random draws a single allocation may take before giving up.
+///
+/// `draw_fresh` samples a random slot and retries when it is taken, so the
+/// expected draws per anchor is `SPACE / remaining`. That stays near 1 until the
+/// file is a large fraction of `SPACE`, then rises steeply. The cap turns a
+/// pathological file into a prompt `[E_TOO_LARGE]` refusal instead of a hang:
+/// without it, a file holding more lines than the pool spins forever, because no
+/// free slot exists to find. `SPACE` (26^5 = 11,881,376) now exceeds the largest
+/// file `MAX_MAP_BYTES` allows (8,388,608 newline-only lines), so hitting this
+/// cap needs a genuinely pathological case, not merely a big file.
+const MAX_DRAW_PROBES: u32 = 4096;
+
+fn draw_fresh(rng: &mut AnchorRng, used: &HashSet<Anchor>) -> Option<Anchor> {
+    for _ in 0..MAX_DRAW_PROBES {
         let a = Anchor::from_index(rng.next_u64());
         if !used.contains(&a) {
-            return a;
+            return Some(a);
         }
     }
+    None
+}
+
+fn draw_fresh_or_err(rng: &mut AnchorRng, used: &HashSet<Anchor>) -> Result<Anchor, EngineError> {
+    draw_fresh(rng, used).ok_or_else(|| {
+        EngineError::TooLarge(format!(
+            "no free {ANCHOR_LEN}-char anchor after {MAX_DRAW_PROBES} draws ({} of {SPACE} \
+             anchors are in use); the file is too large to map",
+            used.len()
+        ))
+    })
 }
 
 fn unknown(a: Anchor) -> EngineError {
@@ -1060,7 +1101,7 @@ mod tests {
             std::process::id(),
             feather_core::message::now_millis()
         ));
-        AnchorMap::new(p, content.to_string(), 42)
+        AnchorMap::new(p, content.to_string(), 42).expect("test file is small")
     }
 
     fn anchor(m: &AnchorMap, idx: usize) -> Anchor {
@@ -1069,14 +1110,46 @@ mod tests {
 
     #[test]
     fn anchor_roundtrip_all_letters() {
-        for i in [0u64, 1, 51, 52, 12345, SPACE - 1] {
+        for i in [0u64, 1, 25, 26, 12345, SPACE - 1] {
             let a = Anchor::from_index(i);
             let s = a.to_str();
-            assert_eq!(s.len(), 4);
+            assert_eq!(s.len(), ANCHOR_LEN);
+            assert!(s.bytes().all(|b| b.is_ascii_lowercase()));
             assert_eq!(Anchor::parse(&s), Some(a));
         }
-        assert!(Anchor::parse("0abc").is_none());
-        assert!(Anchor::parse("abc").is_none());
+        // digits, uppercase and wrong lengths are all rejected
+        assert!(Anchor::parse("0abcd").is_none());
+        assert!(Anchor::parse("abcd1").is_none());
+        assert!(Anchor::parse("abcd").is_none());
+        assert!(Anchor::parse("Abcde").is_none());
+        assert!(Anchor::parse("abcdef").is_none());
+    }
+
+    #[test]
+    fn one_spelling_per_anchor() {
+        // The whole point of a single-case alphabet: no two distinct anchors
+        // can share a case-folded spelling, so a case slip cannot silently
+        // address another line. With the old 52-letter alphabet this held for
+        // only a fraction of a 2000-line file.
+        let m = map_with(&(0..2000).map(|i| format!("line {i}\n")).collect::<String>());
+        let mut seen = HashSet::new();
+        for idx in 0..m.len() {
+            let s = anchor(&m, idx).to_str();
+            // Lowercasing is a no-op, so there is exactly one spelling.
+            assert_eq!(s.to_lowercase(), s);
+            assert!(seen.insert(s), "two anchors shared a spelling");
+        }
+        assert_eq!(seen.len(), m.len());
+    }
+
+    #[test]
+    fn space_covers_the_largest_mappable_file() {
+        // max lines in an 8 MiB newline-only file, the widest the store allows
+        let max_lines = MAX_MAP_BYTES;
+        assert!(
+            SPACE > max_lines,
+            "anchor pool {SPACE} must exceed {max_lines} to keep draw_fresh terminating"
+        );
     }
 
     #[test]

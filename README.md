@@ -18,7 +18,8 @@ other-platform support, but those builds are not claimed to be release-validated
 
 - **Native desktop UI.** Workspace tree, virtualized conversation, foldable tool
   and reasoning cards, keyboard-first controls and inline slash-command menus.
-- **Edits you can verify.** Read tools return four-letter line anchors; replace,
+- **Edits you can verify.** Read tools return five-letter line anchors (lowercase
+  only, so an anchor has exactly one spelling); replace,
   insert, copy, move and undo target those anchors, not guessed line numbers.
 - **Your choice of provider.** Anthropic Messages, OpenAI-compatible Chat
   Completions, OpenAI/Codex Responses and Pi Messages. Add custom endpoints and

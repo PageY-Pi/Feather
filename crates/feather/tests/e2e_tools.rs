@@ -16,6 +16,7 @@ use feather_core::message::{Api, StopReason, ToolCall};
 use feather_core::provider::faux::{FauxProvider, FauxScript};
 use feather_core::session::Session;
 use feather_core::tool::ToolRegistry;
+use feather_hashline::engine::ANCHOR_LEN;
 use feather_hashline::store::AnchorStore;
 use feather_hashline::tools::{
     AnchorGrepTool, InsertTool, ReadTool, ReplaceTool, ReplaceWithinTool, UndoTool, WriteTool,
@@ -187,7 +188,7 @@ async fn agent_loop_end_to_end_matches_pi_formats() {
         text.lines().any(|l| {
             let body = l.strip_prefix('+').unwrap_or(l);
             body.split_once('│')
-                .map(|(a, t)| a.len() == 4 && t == "alpha line")
+                .map(|(a, t)| a.len() == ANCHOR_LEN && t == "alpha line")
                 .unwrap_or(false)
         }),
         "write returns +anchor│ rows:\n{text}"
@@ -228,7 +229,7 @@ async fn agent_loop_end_to_end_matches_pi_formats() {
                     no.trim().parse::<u64>().is_ok()
                         && rest
                             .split_once('│')
-                            .map(|(a, t)| a.len() == 4 && t == "beta line")
+                            .map(|(a, t)| a.len() == ANCHOR_LEN && t == "beta line")
                             .unwrap_or(false)
                 }
                 _ => false,
@@ -336,7 +337,7 @@ async fn anchor_flow_chains_like_pi() {
     .await;
     assert!(!out.is_error, "{}", out.text);
     let a_delta = anchor_of(&out.text, "delta line");
-    assert_eq!(a_delta.len(), 4);
+    assert_eq!(a_delta.len(), ANCHOR_LEN);
 
     // mismatched old content must be rejected — pi's guarantee, not a lenient diff
     let out = call(

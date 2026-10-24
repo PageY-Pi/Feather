@@ -306,8 +306,9 @@ mod tests {
         // the anchor part must parse
         let after_num = row.split_once(" │ ").unwrap().1;
         // anchor chars sit right before the separator and must parse
-        assert_eq!(after_num[4..].chars().next(), Some('│'));
-        assert!(crate::engine::Anchor::parse(&after_num[..4]).is_some());
+        let len = crate::engine::ANCHOR_LEN;
+        assert_eq!(after_num[len..].chars().next(), Some('│'));
+        assert!(crate::engine::Anchor::parse(&after_num[..len]).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -370,7 +371,7 @@ mod tests {
         assert_eq!(out.hits.len(), 1);
         assert!(out.hits[0].fragment);
         assert!(out.hits[0].row.contains("..."));
-        // anchor still covers the whole line: 4 chars before the │
+        // anchor still covers the whole line: ANCHOR_LEN chars before the │
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -426,7 +427,7 @@ mod tests {
         let row = &out.hits[0].row;
         // extract anchor: `2 │ abcd│    let big = 2;`
         let after_num = row.split_once(" │ ").unwrap().1;
-        let anchor_str = &after_num[..4];
+        let anchor_str = &after_num[..crate::engine::ANCHOR_LEN];
         let a = crate::engine::Anchor::parse(anchor_str).unwrap();
         store.replace_within(&f, a, a, "big", "huge").unwrap();
         assert!(std::fs::read_to_string(&f)
