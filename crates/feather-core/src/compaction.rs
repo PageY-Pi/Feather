@@ -116,14 +116,28 @@ pub fn shrink_messages_to_tokens(messages: &mut Vec<Message>, budget: u64) {
             return;
         }
         // Keep the synthetic summary at index zero. Remove the oldest complete
-        // kept turn whenever another user boundary exists.
+        // kept turn whenever another user boundary exists — but never drop the
+        // turn that holds the newest completed answer. A long tool-loop turn is
+        // one user span, so draining to the *next* user message would delete
+        // that entire piece of work (and the answer with it) instead of just
+        // shrinking it.
+        let protect_until = messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant && m.iter_tool_calls().next().is_none())
+            .map(|answer| {
+                messages[..=answer]
+                    .iter()
+                    .rposition(|m| m.role == Role::User)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(messages.len());
         let starts: Vec<usize> = messages
             .iter()
             .enumerate()
             .skip(1)
             .filter_map(|(i, m)| (m.role == Role::User).then_some(i))
             .collect();
-        if starts.len() >= 2 {
+        if starts.len() >= 2 && starts[1] <= protect_until {
             messages.drain(1..starts[1]);
             continue;
         }
@@ -265,6 +279,7 @@ pub fn plan_cut(messages: &[Message], keep_recent_tokens: u64) -> usize {
         messages,
         keep_recent_tokens,
         tokenizer::estimate_message_tokens,
+        true,
     )
 }
 pub fn plan_cut_without_thinking(messages: &[Message], keep_recent_tokens: u64) -> usize {
@@ -272,12 +287,31 @@ pub fn plan_cut_without_thinking(messages: &[Message], keep_recent_tokens: u64) 
         messages,
         keep_recent_tokens,
         tokenizer::estimate_message_tokens_without_thinking,
+        true,
+    )
+}
+/// Budget-driven cut that never protects a whole oversized turn.
+///
+/// [`plan_cut_without_thinking`] keeps the newest completed answer's entire
+/// user span intact. That is the right default, but one prompt that runs a
+/// very long tool loop makes that span most of the context: the kept span then
+/// eats the whole window, summarization saves almost nothing, and the next
+/// turn is over the trigger again — compaction on every single turn. Callers
+/// that can measure the remaining room use this variant when protection would
+/// starve the working context.
+pub fn plan_cut_budget(messages: &[Message], keep_recent_tokens: u64) -> usize {
+    plan_cut_with(
+        messages,
+        keep_recent_tokens,
+        tokenizer::estimate_message_tokens_without_thinking,
+        false,
     )
 }
 fn plan_cut_with(
     messages: &[Message],
     keep_recent_tokens: u64,
     estimate: fn(&Message) -> u64,
+    protect_answer_span: bool,
 ) -> usize {
     if messages.is_empty() {
         return 0;
@@ -297,13 +331,30 @@ fn plan_cut_with(
         cut += 1;
     }
     if cut >= messages.len() {
-        // no user boundary inside the budget (one user span exceeds it):
-        // walk back to the previous user-span start instead — the only cut
-        // that never separates an assistant's tool call from its result.
-        cut = idx;
-        while cut > 0 && messages[cut].role != Role::User {
-            cut -= 1;
-        }
+        // No user boundary inside the budget: the newest turn on its own is
+        // bigger than `keep_recent_tokens` (one prompt that ran a long tool
+        // loop). Keeping that turn whole is only affordable while the caller
+        // still has room to spare; otherwise the kept span swallows the window
+        // and compaction re-fires on every turn.
+        cut = if protect_answer_span {
+            // Display-first default: keep the whole turn containing the newest
+            // completed answer. Callers that can measure the remaining room
+            // re-cut with [`plan_cut_budget`] when that costs too much.
+            let mut start = idx;
+            while start > 0 && messages[start].role != Role::User {
+                start -= 1;
+            }
+            start
+        } else {
+            // Nearest safe boundary at or after the budget point. An assistant
+            // message never orphans a tool result: call/result pairs stay whole
+            // inside the kept span and the summarized prefix still ends on a
+            // complete pair. A user message here is the newly appended prompt;
+            // the answer clamp below keeps the work that prompt is about.
+            (idx..messages.len())
+                .find(|&i| matches!(messages[i].role, Role::User | Role::Assistant))
+                .unwrap_or(idx)
+        };
     }
     // A newly appended user prompt can consume the entire recent-token budget.
     // Do not summarize away the latest completed answer (and its whole user/tool
@@ -318,13 +369,19 @@ fn plan_cut_with(
         .iter()
         .rposition(|m| m.role == Role::Assistant && m.iter_tool_calls().next().is_none())
     {
-        let span_start = messages[..=last_answer]
-            .iter()
-            .rposition(|m| m.role == Role::User)
-            .unwrap_or(0);
-        let clamped = cut.min(span_start);
-        if clamped > 0 {
-            cut = clamped;
+        if protect_answer_span {
+            let span_start = messages[..=last_answer]
+                .iter()
+                .rposition(|m| m.role == Role::User)
+                .unwrap_or(0);
+            let clamped = cut.min(span_start);
+            if clamped > 0 {
+                cut = clamped;
+            }
+        } else if cut > last_answer {
+            // Even an oversized turn keeps its answer: the tool work behind it
+            // is summarized, the text the caller shows is not.
+            cut = last_answer;
         }
     }
     cut

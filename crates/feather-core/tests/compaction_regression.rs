@@ -199,6 +199,94 @@ async fn tool_loop_session_with_only_a_stale_answer_still_compacts() {
     assert!(saved > 0, "compaction must find something to summarize");
 }
 
+/// Reported shape: one prompt ran a very long tool loop, so the newest turn
+/// alone is most of the context. Turn-granular cutting then drags that whole
+/// turn into the kept span, compaction saves almost nothing, and the very next
+/// turn is over the threshold again — a compaction on every single turn.
+#[tokio::test]
+async fn oversized_tool_loop_turn_does_not_compact_on_every_turn() {
+    let mut session = Session::memory(Path::new("."), "compaction-giant-turn");
+    session.push(Message::user_text("first job")).unwrap();
+    for q in 0..4 {
+        session.push(tool_call(q)).unwrap();
+        session
+            .push(Message::tool_result(
+                format!("c{q}"),
+                "bash",
+                "x".repeat(600),
+                false,
+            ))
+            .unwrap();
+    }
+    session.push(Message::user_text("big job")).unwrap();
+    for q in 4..16 {
+        session.push(tool_call(q)).unwrap();
+        session
+            .push(Message::tool_result(
+                format!("c{q}"),
+                "bash",
+                "y".repeat(1_000),
+                false,
+            ))
+            .unwrap();
+    }
+    session.push(answer("BIG JOB ANSWER")).unwrap();
+
+    let mut agent = agent(
+        session,
+        2_000,
+        200,
+        FauxScript::new()
+            .with_text("SUMMARY")
+            .with_text("FIRST AFTER")
+            .with_text("SECOND AFTER"),
+    );
+    let mut events = agent.subscribe();
+    let result = agent.prompt("next question").await.unwrap();
+    assert_eq!(result.final_text, "FIRST AFTER");
+
+    // The compaction trigger sits at `window - reserve` = 1800. A rewrite that
+    // lands on that line means the next turn compacts again; leave real room.
+    let kept = feather_core::tokenizer::estimate_context_tokens(agent.session().messages());
+    assert!(
+        kept < 900,
+        "compaction must leave working headroom, kept {kept} of a 1800-token trigger"
+    );
+    assert!(
+        agent
+            .session()
+            .messages()
+            .iter()
+            .any(|m| m.text() == "BIG JOB ANSWER"),
+        "the newest answer itself must survive the rewrite"
+    );
+
+    let second = agent.prompt("one more question").await.unwrap();
+    assert_eq!(second.final_text, "SECOND AFTER");
+    let compactions = drain(&mut events)
+        .into_iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionDone { .. }))
+        .count();
+    assert_eq!(
+        compactions, 1,
+        "a second turn must not re-run compaction over the same context"
+    );
+}
+
+fn tool_call(q: usize) -> Message {
+    Message::assistant(
+        vec![ContentBlock::ToolCall(ToolCall {
+            id: format!("c{q}"),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "echo hi"}),
+        })],
+        "faux",
+        Api::Faux,
+        Usage::default(),
+        StopReason::Stop,
+    )
+}
+
 #[tokio::test]
 async fn manual_text_compaction_counts_unicode_characters_and_never_streams_a_reply() {
     let mut session = Session::memory(Path::new("."), "unicode-compaction");

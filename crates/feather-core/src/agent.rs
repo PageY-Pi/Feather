@@ -1133,10 +1133,22 @@ impl Agent {
         );
         let before_chars = compaction::context_characters(self.session.messages());
         let _before_tokens = self.session.context_tokens();
-        let cut = compaction::plan_cut_without_thinking(
-            self.session.messages(),
-            settings.keep_recent_tokens,
+        // Tokens the request spends before the first message (system prompt and
+        // tool schemas), and the room messages may occupy before the trigger
+        // fires again. Cut and safety-net shrink both use this, so a rewrite
+        // never lands exactly on the trigger and re-fires on the next turn.
+        let static_request_tokens = tokenizer::estimate_request_input_tokens(
+            self.config.api,
+            &self.config.system_prompt,
+            &[],
+            &self.config.tools,
         );
+        let room = self
+            .config
+            .context_window
+            .saturating_sub(settings.reserve_tokens)
+            .saturating_sub(static_request_tokens);
+        let cut = self.compaction_cut(&settings, room);
         if cut == 0 {
             // No user boundary to summarize over (a single-span session, e.g.
             // one long tool-loop turn or a giant paste). cut == 0 alone does
@@ -1149,17 +1161,7 @@ impl Agent {
             if before_request_tokens <= self.config.context_window {
                 return Ok(0);
             }
-            let static_request_tokens = tokenizer::estimate_request_input_tokens(
-                self.config.api,
-                &self.config.system_prompt,
-                &[],
-                &self.config.tools,
-            );
-            let budget = self
-                .config
-                .context_window
-                .saturating_sub(settings.reserve_tokens)
-                .saturating_sub(static_request_tokens);
+            let budget = room;
             let mut shrunk = self.session.messages().to_vec();
             compaction::shrink_messages_to_tokens(&mut shrunk, budget);
             let saved = before_chars.saturating_sub(compaction::context_characters(&shrunk));
@@ -1247,19 +1249,9 @@ impl Agent {
         let mut new_msgs = vec![summary_message(&summary, &reads, &writes)];
 
         new_msgs.extend(kept);
-        let static_request_tokens = tokenizer::estimate_request_input_tokens(
-            self.config.api,
-            &self.config.system_prompt,
-            &[],
-            &self.config.tools,
-        );
-        compaction::shrink_messages_to_tokens(
-            &mut new_msgs,
-            self.config
-                .context_window
-                .saturating_sub(settings.reserve_tokens)
-                .saturating_sub(static_request_tokens),
-        );
+        // Safety net only: the cut above already targets the keep budget, so
+        // this must stay a no-op in the normal case.
+        compaction::shrink_messages_to_tokens(&mut new_msgs, room);
         let after_chars = compaction::context_characters(&new_msgs);
         let after_request_tokens = tokenizer::estimate_request_input_tokens(
             self.config.api,
@@ -1275,6 +1267,32 @@ impl Agent {
         // replace the whole linear list; raw transcript keeps originals
         self.replace_messages(new_msgs);
         Ok(saved)
+    }
+
+    /// Cut point for compaction, in messages.
+    ///
+    /// Turn-granular cutting protects the newest completed answer's whole user
+    /// span, which is what keeps a rewritten session readable. One prompt that
+    /// runs a long tool loop can make that single span most of the context
+    /// though: protecting it then leaves no working room, compaction saves
+    /// almost nothing, and the next turn compacts again. Protect the span only
+    /// while it still leaves a keep-budget of room; otherwise cut inside the
+    /// oversized turn at boundaries that keep call/result pairs intact.
+    fn compaction_cut(&self, settings: &CompactionSettings, room: u64) -> usize {
+        let messages = self.session.messages();
+        let protected =
+            compaction::plan_cut_without_thinking(messages, settings.keep_recent_tokens);
+        if protected == 0 {
+            return 0;
+        }
+        let kept: u64 = messages[protected..]
+            .iter()
+            .map(tokenizer::estimate_message_tokens_without_thinking)
+            .sum();
+        if kept.saturating_add(settings.keep_recent_tokens) <= room {
+            return protected;
+        }
+        compaction::plan_cut_budget(messages, settings.keep_recent_tokens)
     }
 
     fn replace_messages(&mut self, msgs: Vec<Message>) {
