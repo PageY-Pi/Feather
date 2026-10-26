@@ -310,3 +310,19 @@ The workspace declares **MIT** licensing. Third-party attribution is collected i
 [third-party notices](third-party-notices.md); dependency licenses remain their
 upstream licenses. Feather's workflows draw on Pi's coding-agent concepts and
 hashline-style editing; it is an independent Rust implementation.
+
+## Overview
+
+TODO: Add project description.
+
+## Project Structure
+
+```
+├── target/repair-shortcut.ps1
+├── target/check-shortcut.ps1
+├── target/check-path.ps1
+├── target/verify-repair.ps1
+├── target/verify-guard.ps1
+├── target/verify-final.ps1
+feather/
+```

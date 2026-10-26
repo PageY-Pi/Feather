@@ -84,4 +84,12 @@ than claiming full behavioral parity.
   user-editable configuration/auth remains JSON and user project files/exports
   retain their normal formats. Legacy backups are kept until verified.
 - [x] 注意到feather中运行bash的失败率很高，比如cd /c/Users/Page/.feather/sessions && pwd && ls | head -3就失败了，分析当前目录下的feather会话历史，找出原因并解决；另外feather在工具卡中无法正常显示中文汉字，解决该问题；完成后更新exe _(2026-10-08 10:17:17)_
-- [ ] 发现异步压缩逻辑问题，会吞掉最后一条完成的消息，然后显示Context refreshed · 0 characters saved；修复压缩逻辑，避免异步，达到阈值后压缩即可；确认feather具备选择压缩模型的功能 _(2026-10-09 00:40:19)_
+- [x] feather isn't working properly after update, seems like the shortcut to it is broken, fix it _(2026-10-26 13:24:10)_
+  The **Open Feather here** key pointed at `%TEMP%\feather-114-verify\feather-gui.exe`
+  — a release check ran `--install-context-menu` from a throwaway copy, and the
+  temp directory was then deleted. `feather` on PATH also resolved to a stale
+  0.1.0 `cargo install` shim that shadowed the 1.1.4 install. Fixed on this
+  machine (menu repointed, install dir moved to the front of PATH, shim removed,
+  Start-menu/desktop shortcuts recreated) and in the product: a temp copy now
+  refuses to register the menu, a real start repoints a stale entry at itself,
+  and the installer prepends `{app}` to PATH instead of appending it.
