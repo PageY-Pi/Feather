@@ -11,7 +11,7 @@ Feather is a standalone coding assistant for your workspace. It combines a nativ
 parallel subtasks, recoverable history and anchor-verified file editing. No browser
 shell, Electron, Node.js runtime or dynamically loaded plugin engine is required.
 
-**Version 1.1.2** · Windows x64 is the release-tested platform. Rust sources contain
+**Version 1.1.3** · Windows x64 is the release-tested platform. Rust sources contain
 other-platform support, but those builds are not claimed to be release-validated.
 
 ## Why Feather?
@@ -38,7 +38,7 @@ other-platform support, but those builds are not claimed to be release-validated
 
 ## Install on Windows
 
-Use `Feather-1.1.2-Setup-x64.exe` from the project's published release assets, or
+Use `Feather-1.1.3-Setup-x64.exe` from the project's published release assets, or
 build it locally following the instructions below. The per-user installer needs
 no administrator privileges. It installs the two executables, adds Feather to
 your user PATH, and provides an **Open Feather here** Explorer menu.
@@ -256,7 +256,7 @@ Build the Windows installer with **Inno Setup 6**:
 ISCC installer/Feather.iss
 ```
 
-Output: `dist/Feather-1.1.2-Setup-x64.exe`. See
+Output: `dist/Feather-1.1.3-Setup-x64.exe`. See
 [installer instructions](installer/README.md) for local deployment details.
 Native Windows smoke tests are in `scripts/cpu-smoke.ps1` and
 `scripts/renderer-restart-smoke.ps1`; they control isolated synthetic preview

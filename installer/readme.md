@@ -1,6 +1,6 @@
-# Feather 1.1.2 Windows installer
+# Feather 1.1.3 Windows installer
 
-Share `dist/Feather-1.1.2-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.1.3-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -77,6 +77,22 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.1.3 stops compaction from firing on every turn after a long tool loop. The
+  cut was strictly turn-granular: it never split a user span, and the clamp that
+  protects the newest completed answer then dragged that whole span into the kept
+  context. One prompt that runs hundreds of tool calls makes a single span most
+  of the context, so a rewrite landed exactly on the trigger — the live session
+  went 258177 → 255600 tokens against a 255616 trigger, 16 tokens of headroom —
+  and the next turn compacted again, paying a summarization request each turn for
+  no gain. `plan_cut_budget` now cuts inside an oversized turn at a boundary that
+  keeps call/result pairs whole, keeps the newest answer's text, and the rewrite
+  is measured against the room left before the trigger, so it always leaves real
+  headroom instead of stopping on the line.
+- 1.1.3 also stops `shrink_messages_to_tokens` from deleting the turn that holds
+  the newest completed answer. When the summary plus the fresh prompt were the
+  only user messages, the drain ran to the next user boundary and took the whole
+  turn with it; oversized work is now elided in place instead.
+
 - 1.1.2 makes model lists follow the provider. Feather compiled its catalog into
   the binary, so a provider model launched after a release stayed invisible until
   the next build. For the Volcengine Ark Coding Plan, Feather now reads the same
