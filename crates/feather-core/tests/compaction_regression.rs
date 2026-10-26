@@ -405,3 +405,80 @@ async fn compaction_reopen_keeps_previous_final_and_current_prompt() {
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// Real-session shape behind the persistent re-firing: the only plain
+/// assistant answer is *early*, and everything after it is one long tool loop.
+/// The budget cut was clamped back to that stale answer (kept span = nearly the
+/// whole history), so compaction summarized a sliver and the rewrite landed on
+/// its own trigger — then every following turn compacted again.
+#[tokio::test]
+async fn stale_early_answer_does_not_pin_the_kept_span() {
+    let window = 272_000u64;
+    let reserve = 16_384u64;
+    let keep = 20_000u64;
+    let mut session = Session::memory(Path::new("."), "compaction-stale-answer");
+    session.push(Message::user_text("old question")).unwrap();
+    session.push(answer("OLD ANSWER")).unwrap();
+    for q in 0..800 {
+        session.push(tool_call(q)).unwrap();
+        session
+            .push(Message::tool_result(
+                format!("c{q}"),
+                "bash",
+                "x".repeat(1_600),
+                false,
+            ))
+            .unwrap();
+    }
+    let mut agent = Agent::new(
+        AgentConfig {
+            model: "faux".into(),
+            api: Api::Faux,
+            system_prompt: "test".into(),
+            max_tokens: 1024,
+            temperature: None,
+            context_window: window,
+            thinking_level: None,
+            compaction: CompactionSettings {
+                reserve_tokens: reserve,
+                keep_recent_tokens: keep,
+                ..Default::default()
+            },
+            compaction_model: None,
+            tools: vec![].into(),
+        },
+        session,
+        Arc::new(ToolRegistry::new()),
+        ProviderRef::Faux(FauxProvider::new(
+            FauxScript::new()
+                .with_text("SUMMARY")
+                .with_text("FIRST AFTER")
+                .with_text("SECOND AFTER"),
+        )),
+        None,
+    );
+    let mut events = agent.subscribe();
+    let first = agent.prompt("next question").await.unwrap();
+    assert_eq!(first.final_text, "FIRST AFTER");
+    let trigger = window - reserve;
+    let after = feather_core::tokenizer::estimate_request_input_tokens(
+        Api::Faux,
+        "test",
+        agent.session().messages(),
+        &[],
+    );
+    assert!(
+        after.saturating_add(keep) <= trigger,
+        "a rewrite must leave a keep-budget of working headroom: after={after} trigger={trigger}"
+    );
+    let second = agent.prompt("one more question").await.unwrap();
+    assert_eq!(second.final_text, "SECOND AFTER");
+    let compactions = drain(&mut events)
+        .into_iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionDone { .. }))
+        .count();
+    assert_eq!(
+        compactions, 1,
+        "a stale early answer must not make compaction re-fire on every turn"
+    );
+}

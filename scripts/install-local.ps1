@@ -1,5 +1,5 @@
 param(
-    [string]$Installer = 'dist/Feather-1.1.3-Setup-x64.exe',
+    [string]$Installer = 'dist/Feather-1.1.4-Setup-x64.exe',
     [switch]$BinariesOnly
 )
 # Developer/local deployment only. Keep any running GUI alive; a locked EXE can

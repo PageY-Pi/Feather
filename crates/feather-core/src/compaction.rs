@@ -72,6 +72,28 @@ pub fn should_compact_request(
     request_input_tokens > context_window.saturating_sub(reserve_tokens)
 }
 
+/// Budget the rewrite must hit: messages may occupy this many tokens after
+/// compaction, so the next turns have working room before [`should_compact_request`]
+/// fires again.
+///
+/// `trigger` is `context_window - reserve_tokens`; the tokens the request always
+/// spends come off first (system prompt + tool schemas), then the caller's keep
+/// budget. Subtracting the keep budget is what stops a rewrite from landing
+/// exactly on the trigger — the failure that made compaction re-fire on every
+/// turn, since one tool result was enough to cross the line again.
+pub fn compaction_room(
+    trigger: u64,
+    static_request_tokens: u64,
+    settings: &CompactionSettings,
+) -> u64 {
+    let available = trigger.saturating_sub(static_request_tokens);
+    // Never reserve more than half the available room: a keep budget at or above
+    // the window's own room is a misconfiguration, and a target near zero would
+    // elide the summary itself instead of leaving a working context.
+    let headroom = settings.keep_recent_tokens.min(available / 2);
+    available.saturating_sub(headroom)
+}
+
 /// Head+tail shrink around an elision marker. Never returns something longer
 /// than the input; the marker states how much was removed.
 pub fn shrink_tool_result(text: &str, budget: usize) -> (String, usize, usize) {
@@ -325,10 +347,17 @@ fn plan_cut_with(
             break;
         }
     }
-    // snap forward to the next turn boundary (a User message at or after idx)
+    // Snap forward to a turn boundary at or after the budget point. The
+    // display-first variant snaps to the next *user* message so kept turns stay
+    // whole. The budget variant must not: the next user message can be the
+    // prompt appended at the tail, arbitrarily far ahead, and snapping to it
+    // discards the entire keep budget (the kept span collapses to one row). It
+    // takes the nearest safe boundary instead — see below.
     let mut cut = idx;
-    while cut < messages.len() && messages[cut].role != Role::User {
-        cut += 1;
+    if protect_answer_span {
+        while cut < messages.len() && messages[cut].role != Role::User {
+            cut += 1;
+        }
     }
     if cut >= messages.len() {
         // No user boundary inside the budget: the newest turn on its own is
@@ -356,32 +385,46 @@ fn plan_cut_with(
                 .unwrap_or(idx)
         };
     }
-    // A newly appended user prompt can consume the entire recent-token budget.
-    // Do not summarize away the latest completed answer (and its whole user/tool
-    // span), which callers still need to display/reopen while that prompt runs.
-    // The clamp must never collapse the cut to zero, though: on tool-loop
-    // sessions the only plain answer can sit in the first span, and a zero cut
-    // makes every compaction a permanent no-op — the caller then aborts the
-    // run as over-limit. When the protected span is the first one, keep the
-    // budget-driven cut: a working context beats a protected display, and the
-    // raw audit still preserves the answer verbatim.
+    // The newest completed answer should survive the rewrite: it is what the
+    // caller displays and what a reopen shows. Two ways to keep it, and the
+    // affordable one depends on how far back the cut has to move:
+    //
+    // - Display-first (`plan_cut`): keep the answer's whole user span, so the
+    //   turn reads as one piece of work.
+    // - Budgeted (`plan_cut_budget`): keep only the answer message itself; the
+    //   tool work behind it is summarized, the text the caller shows is not.
+    //
+    // Both refuse the move when it would swallow the context. A cut that starts
+    // before a *stale* early answer keeps the entire history: compaction
+    // summarizes one message, the rewrite stays over the trigger, and every
+    // later turn compacts again — the re-firing bug. So a backwards move is
+    // allowed only while the messages it newly keeps fit the keep budget, and
+    // never when it would collapse the cut to zero (that makes compaction a
+    // permanent no-op and the run then aborts as over-limit).
     if let Some(last_answer) = messages
         .iter()
         .rposition(|m| m.role == Role::Assistant && m.iter_tool_calls().next().is_none())
     {
-        if protect_answer_span {
-            let span_start = messages[..=last_answer]
-                .iter()
-                .rposition(|m| m.role == Role::User)
-                .unwrap_or(0);
-            let clamped = cut.min(span_start);
-            if clamped > 0 {
-                cut = clamped;
-            }
-        } else if cut > last_answer {
-            // Even an oversized turn keeps its answer: the tool work behind it
-            // is summarized, the text the caller shows is not.
-            cut = last_answer;
+        let span_start = messages[..=last_answer]
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .unwrap_or(0);
+        let (target, nonempty) = if protect_answer_span {
+            (span_start, span_start > 0)
+        } else {
+            (last_answer, cut > last_answer)
+        };
+        let mut clamped = cut.min(target);
+        if protect_answer_span && !nonempty {
+            clamped = cut; // never collapse the cut to zero
+        }
+        // Cost of the backwards move: everything between the new cut and the old
+        // one becomes kept context. Charging it against the keep budget is what
+        // distinguishes "keep the recent answer" from "keep the whole session".
+        let added = clamped < cut
+            && messages[clamped..cut].iter().map(estimate).sum::<u64>() <= keep_recent_tokens;
+        if clamped > 0 && (protect_answer_span || added) {
+            cut = clamped;
         }
     }
     cut
@@ -686,5 +729,95 @@ mod tests {
         let mut off = s.clone();
         off.enabled = false;
         assert!(!should_compact(1_000_000, 200_000, &off));
+    }
+
+    /// The persisted-session shape that keeps re-firing compaction: one plain
+    /// answer at the very start, then prompt after prompt of tool loops. The
+    /// answer clamp used to drag the budget cut back to that stale answer, so
+    /// the kept span was the whole history and compaction summarized nothing.
+    #[test]
+    fn budget_cut_does_not_pin_a_stale_early_answer() {
+        let mut msgs = vec![Message::user_text("old question"), asst("EARLY ANSWER")];
+        for round in 0..8 {
+            msgs.push(Message::user_text(format!("job {round}")));
+            for q in 0..120 {
+                msgs.push(Message::assistant(
+                    vec![ContentBlock::ToolCall(crate::message::ToolCall {
+                        id: format!("c{round}-{q}"),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "x".repeat(200)}),
+                    })],
+                    "m",
+                    Api::Faux,
+                    Usage::default(),
+                    StopReason::ToolUse,
+                ));
+                msgs.push(Message::tool_result(
+                    format!("c{round}-{q}"),
+                    "bash",
+                    "x".repeat(2_000),
+                    false,
+                ));
+            }
+        }
+        let cut = plan_cut_budget(&msgs, 20_000);
+        let kept: u64 = msgs[cut..]
+            .iter()
+            .map(crate::tokenizer::estimate_message_tokens_without_thinking)
+            .sum();
+        assert!(
+            kept <= 60_000,
+            "budget cut kept {kept} tokens (cut={cut} of {}): a stale early answer must not pin the kept span",
+            msgs.len()
+        );
+    }
+
+    /// The same shape must also leave a *usable* working context: compaction
+    /// keeps the summary plus a bounded kept span, never the whole history.
+    #[test]
+    fn budget_cut_keeps_a_working_context() {
+        let mut msgs = vec![Message::user_text("old question"), asst("EARLY ANSWER")];
+        for round in 0..8 {
+            msgs.push(Message::user_text(format!("job {round}")));
+            for q in 0..120 {
+                msgs.push(Message::assistant(
+                    vec![ContentBlock::ToolCall(crate::message::ToolCall {
+                        id: format!("c{round}-{q}"),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "x".repeat(200)}),
+                    })],
+                    "m",
+                    Api::Faux,
+                    Usage::default(),
+                    StopReason::ToolUse,
+                ));
+                msgs.push(Message::tool_result(
+                    format!("c{round}-{q}"),
+                    "bash",
+                    "x".repeat(2_000),
+                    false,
+                ));
+            }
+        }
+        let keep = 20_000u64;
+        let cut = plan_cut_budget(&msgs, keep);
+        // What compaction actually installs: one summary message in front of the
+        // kept span. It must fit the keep budget with room to spare, otherwise
+        // the very next turn is over the trigger again.
+        let summary = summary_message("summary", &[], &[]);
+        let kept: u64 = std::iter::once(&summary)
+            .chain(msgs[cut..].iter())
+            .map(crate::tokenizer::estimate_message_tokens_without_thinking)
+            .sum();
+        // The cut accumulates whole messages until it reaches the budget, so the
+        // kept span may overshoot by the last message it added. What matters is
+        // that it stays near the budget instead of swallowing the session, and
+        // leaves real room before the trigger.
+        let ceiling = keep + keep / 2;
+        assert!(
+            kept < ceiling,
+            "kept context {kept} is not a working context (budget {keep}, ceiling {ceiling}, cut={cut} of {})",
+            msgs.len()
+        );
     }
 }

@@ -1143,11 +1143,14 @@ impl Agent {
             &[],
             &self.config.tools,
         );
-        let room = self
+        // Budget the rewrite must hit. `context_window - reserve` alone is the
+        // trigger *line*: a rewrite that lands on it is over it again as soon as
+        // one tool result arrives, so every later turn compacts.
+        let trigger = self
             .config
             .context_window
-            .saturating_sub(settings.reserve_tokens)
-            .saturating_sub(static_request_tokens);
+            .saturating_sub(settings.reserve_tokens);
+        let room = compaction::compaction_room(trigger, static_request_tokens, &settings);
         let cut = self.compaction_cut(&settings, room);
         if cut == 0 {
             // No user boundary to summarize over (a single-span session, e.g.
@@ -1280,19 +1283,33 @@ impl Agent {
     /// oversized turn at boundaries that keep call/result pairs intact.
     fn compaction_cut(&self, settings: &CompactionSettings, room: u64) -> usize {
         let messages = self.session.messages();
+        // Two candidate cuts. Display-first keeps the newest answer's whole user
+        // span readable; the budget cut keeps only a bounded span and summarizes
+        // the oversized work behind it. Display-first is affordable only when the
+        // span it protects fits the room available before the trigger.
         let protected =
             compaction::plan_cut_without_thinking(messages, settings.keep_recent_tokens);
-        if protected == 0 {
-            return 0;
-        }
-        let kept: u64 = messages[protected..]
+        let budget_cut = compaction::plan_cut_budget(messages, settings.keep_recent_tokens);
+        // Mid-turn the "next user message" that display-first snaps to is the
+        // prompt appended at the tail, so its kept span can collapse to one row.
+        // That passes any size check while summarizing the very work the caller
+        // is watching, so treat "nothing meaningful kept" as unaffordable.
+        let protects_work = messages[protected..]
+            .iter()
+            .any(|m| m.role != crate::message::Role::User || m.text_cow().len() > 200);
+        // Measure what the *installed* context would cost: `compact` shrinks old
+        // tool results in the kept span, so charging the raw size would reject a
+        // rewrite that is affordable in practice.
+        let mut provisional = messages[protected..].to_vec();
+        compaction::shrink_kept_span(&mut provisional, settings);
+        let protected_kept: u64 = provisional
             .iter()
             .map(tokenizer::estimate_message_tokens_without_thinking)
             .sum();
-        if kept.saturating_add(settings.keep_recent_tokens) <= room {
+        if protected > 0 && protects_work && protected_kept <= room {
             return protected;
         }
-        compaction::plan_cut_budget(messages, settings.keep_recent_tokens)
+        budget_cut
     }
 
     fn replace_messages(&mut self, msgs: Vec<Message>) {

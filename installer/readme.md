@@ -1,6 +1,6 @@
-# Feather 1.1.3 Windows installer
+# Feather 1.1.4 Windows installer
 
-Share `dist/Feather-1.1.3-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.1.4-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -77,6 +77,20 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.1.4 fixes why 1.1.3 still compacted on every turn. 1.1.3 changed the kept-span
+  arithmetic, but the cut point itself was wrong in three ways. (1) The budget cut
+  was clamped back to the newest plain answer, so a session whose only answer sat
+  early — every later prompt being a long tool loop — kept its entire history:
+  measured 584721 of 584746 tokens kept, one message summarized, and the rewrite
+  stayed over the trigger. (2) The forward snap looked only for user messages, so
+  mid-turn it jumped to the prompt appended at the tail and discarded the whole
+  keep budget, collapsing the kept span to a single row. (3) The rewrite targeted
+  `context − reserve` itself, the trigger line, so it landed a few tokens under it
+  (live session: 256545 → 255587 against a 255616 trigger). Now the backwards move
+  is charged against the keep budget, the budget cut snaps to the nearest safe
+  boundary, and `compaction_room` reserves the keep budget below the trigger. The
+  same 272k/16384/20000 session now rewrites 438583 → 20147 tokens with 235460 of
+  headroom and compacts once.
 - 1.1.3 stops compaction from firing on every turn after a long tool loop. The
   cut was strictly turn-granular: it never split a user span, and the clamp that
   protects the newest completed answer then dragged that whole span into the kept

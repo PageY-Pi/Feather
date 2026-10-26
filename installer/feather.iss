@@ -1,6 +1,6 @@
 ; Build with Inno Setup 6: ISCC installer\Feather.iss
 ; Strict allowlist: no home directory, databases, models, auth or sessions.
-#define AppVersion "1.1.3"
+#define AppVersion "1.1.4"
 [Setup]
 AppId={{BA63A0FA-5EDB-4C50-923B-56FEA51D6168}
 AppName=Feather
