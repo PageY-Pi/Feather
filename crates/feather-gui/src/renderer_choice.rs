@@ -1,6 +1,7 @@
 //! Persistent renderer choice + restart handoff. Separate GUI-only config
 //! document: choosing a renderer never overwrites model/auth/preferences.
 use eframe::egui;
+use crate::dialog::{choice_row, footnote, hint, sheet, Scrim};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -116,105 +117,44 @@ pub fn picker_window(
     open: &mut bool,
 ) -> Option<Backend> {
     let options = [Backend::Cpu, Backend::accelerated()];
-    let mut picked = None;
-    egui::Window::new("Choose renderer")
-        .title_bar(false)
-        .anchor(
-            egui::Align2::CENTER_CENTER,
-            egui::vec2(
-                if ctx.screen_rect().width() < 850.0 {
-                    60.0
-                } else {
-                    80.0
-                },
-                32.0,
-            ),
+    let (up, down, enter) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
         )
-        .order(egui::Order::Foreground)
-        .collapsible(false)
-        .resizable(false)
-        .default_width(360.0)
-        .max_width((ctx.screen_rect().width() * 0.48).clamp(260.0, 360.0))
-        .frame(egui::Frame::window(&ctx.style()).inner_margin(egui::Margin::same(18.0)))
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Choose renderer")
-                        .size(19.0)
-                        .strong()
-                        .color(crate::theme::INK),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(44.0, 42.0), egui::Sense::hover());
-                    if crate::window_chrome::control(ui, rect, crate::window_chrome::Control::Close)
-                        .clicked()
-                    {
-                        *open = false;
-                    }
-                    let c = rect.center();
-                    let stroke = egui::Stroke::new(1.8_f32, crate::theme::INK);
-                    ui.painter()
-                        .line_segment([c - egui::vec2(5.0, 5.0), c + egui::vec2(5.0, 5.0)], stroke);
-                    ui.painter().line_segment(
-                        [c + egui::vec2(-5.0, 5.0), c + egui::vec2(5.0, -5.0)],
-                        stroke,
-                    );
-                });
-            });
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new("↑ / ↓ choose · Enter selects · Esc closes")
-                    .size(12.0)
-                    .color(crate::theme::MUTED),
-            );
-            ui.add_space(10.0);
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
-                picker.cursor = (picker.cursor + 1) % options.len();
-            }
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-                picker.cursor = (picker.cursor + options.len() - 1) % options.len();
-            }
+    });
+    if enabled {
+        if down {
+            picker.cursor = (picker.cursor + 1) % options.len();
+        }
+        if up {
+            picker.cursor = (picker.cursor + options.len() - 1) % options.len();
+        }
+    }
+    let highlight = picker.cursor;
+    let mut picked = None;
+    let mut hover = None;
+
+    sheet(ctx, "renderer-picker", "Choose renderer")
+        .width(360.0)
+        .scrim(Scrim::Soft)
+        .lead("A change restarts Feather; your session and draft are kept.")
+        .body(|ui| {
             ui.add_enabled_ui(enabled, |ui| {
                 for (index, backend) in options.into_iter().enumerate() {
-                    let selected = index == picker.cursor;
+                    let current = backend == active;
                     let text = match backend {
                         Backend::Cpu => "CPU · lower memory",
                         _ => "GPU · native graphics acceleration",
                     };
-                    let response = ui.add_sized(
-                        [ui.available_width(), 40.0],
-                        egui::Button::new(
-                            egui::RichText::new(format!(
-                                "{text}{}",
-                                if backend == active {
-                                    "  · current"
-                                } else {
-                                    ""
-                                }
-                            ))
-                            .color(crate::theme::INK),
-                        )
-                        .fill(if selected {
-                            crate::theme::SOFT_ACCENT
-                        } else {
-                            crate::theme::PANEL_2
-                        })
-                        .stroke(egui::Stroke::new(
-                            1.0_f32,
-                            if selected {
-                                crate::theme::TEAL
-                            } else {
-                                crate::theme::BORDER
-                            },
-                        ))
-                        .rounding(10.0),
+                    let response = choice_row(
+                        ui,
+                        text,
+                        if current { "current" } else { "" },
+                        index == highlight,
+                        current,
                     );
-                    if backend == active {
-                        let center =
-                            egui::pos2(response.rect.left() + 16.0, response.rect.center().y);
-                        ui.painter().circle_filled(center, 3.0, crate::theme::TEAL);
-                    }
                     preview_bounds(backend.env(), response.rect);
                     if response.hovered()
                         && ui.input(|i| {
@@ -223,34 +163,33 @@ pub fn picker_window(
                                 .any(|e| matches!(e, egui::Event::PointerMoved(_)))
                         })
                     {
-                        picker.cursor = index;
+                        hover = Some(index);
                     }
                     if response.clicked() {
                         picked = Some(backend);
                     }
-                    if index + 1 < options.len() {
-                        ui.add_space(6.0);
-                    }
-                }
-                if enabled
-                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                {
-                    picked = Some(options[picker.cursor]);
+                    ui.add_space(4.0);
                 }
             });
-            // Choice rows fill only the modal; descriptions wrap naturally at
-            // compact widths instead of forcing an oversized dialog.
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new(if enabled {
-                    "Changing renderer restarts Feather. Your session and unsent draft are kept."
-                } else {
-                    "Finish or stop the response and pending sign-in before changing renderer."
-                })
-                .size(12.0)
-                .color(crate::theme::MUTED),
-            );
-        });
+            if !enabled {
+                ui.add_space(8.0);
+                hint(
+                    ui,
+                    "Finish or stop the response and pending sign-in before changing renderer.",
+                );
+            }
+        })
+        .bottom(|ui| {
+            footnote(ui, "↑ / ↓ choose · Enter selects · Esc closes");
+        })
+        .show(open);
+
+    if let Some(index) = hover {
+        picker.cursor = index;
+    }
+    if picked.is_none() && enabled && enter {
+        picked = Some(options[highlight]);
+    }
     picked
 }
 fn preview_bounds(name: &str, rect: egui::Rect) {

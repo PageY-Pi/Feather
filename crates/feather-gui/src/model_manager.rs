@@ -3,7 +3,7 @@
 use eframe::egui;
 use feather::models::{self, ModelEntry, ProviderEntry};
 use serde_json::json;
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ModelManager {
     pub enabled: bool,
     pub provider: String,
@@ -189,22 +189,18 @@ impl ModelManager {
         let m = serde_json::from_value(json!({"id":model,"name":if self.name.trim().is_empty(){model}else{self.name.trim()},"reasoningNotSupported":self.reasoning_not_supported,"maxTokens":tokens,"input":["text"]})).map_err(|e|e.to_string())?;
         Ok(Action::Save(pid.into(), p, m))
     }
+    /// The scrolling half of the form. The card owns the scroll area and the
+    /// pinned footer, so this draws fields only — no nested scroll, so nothing
+    /// can be clipped twice.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        catalog: Option<&models::ModelsFile>,
         home: &std::path::Path,
         active: &str,
         running: bool,
     ) -> Option<Action> {
         let mut action = None;
-        let height = (ui.ctx().screen_rect().height() - 290.0).max(160.0);
-        egui::ScrollArea::vertical()
-            .id_salt("api-model-form")
-            .max_height(height)
-            .auto_shrink([false, true])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .show(ui, |ui| {
+        {
                 ui.spacing_mut().text_edit_width = (ui.available_width() - 170.0).max(240.0);
                 ui.label(
                     egui::RichText::new("Provider connection")
@@ -379,43 +375,35 @@ impl ModelManager {
                     });
                 }
                 ui.add_space(16.0);
-            });
-        ui.add_space(8.0);
-        let edge = ui.available_rect_before_wrap();
-        ui.painter().line_segment(
-            [edge.left_top(), edge.right_top()],
-            egui::Stroke::new(1.0_f32, crate::theme::BORDER),
-        );
-        ui.add_space(12.0);
+        }
+        action
+    }
+
+    /// The pinned half: the validation line, then the two buttons. Kept apart
+    /// from `show` so the card can place it outside the scroll region.
+    pub fn show_footer(&mut self, ui: &mut egui::Ui, running: bool) -> Option<Action> {
+        let mut action = None;
+        if let Some(error) = &self.error {
+            crate::dialog::error_line(ui, error);
+            ui.add_space(10.0);
+        }
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !running,
-                    egui::Button::new(egui::RichText::new("Save model").color(crate::theme::INK))
-                        .fill(crate::theme::SOFT_ACCENT)
-                        .stroke(egui::Stroke::NONE),
-                )
-                .clicked()
-            {
+            let save = crate::dialog::button(ui, "Save model", crate::dialog::ButtonKind::Primary);
+            if !running && save.clicked() {
                 match self.draft() {
                     Ok(a) => {
                         self.error = None;
-                        action = Some(a)
+                        action = Some(a);
                     }
                     Err(e) => self.error = Some(e),
                 }
             }
-            if ui.button("Clear form").clicked() {
+            if crate::dialog::button(ui, "Clear form", crate::dialog::ButtonKind::Ghost).clicked() {
                 let enabled = self.enabled;
                 *self = Self::default();
                 self.enabled = enabled;
             }
         });
-        if let Some(e) = &self.error {
-            ui.colored_label(crate::theme::RED, e);
-        }
-        ui.add_space(10.0);
-        let _ = catalog;
         action
     }
 }

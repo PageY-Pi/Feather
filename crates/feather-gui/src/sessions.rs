@@ -11,7 +11,7 @@ use eframe::egui;
 use feather_core::session_catalog::{self, SessionInfo};
 use std::path::{Path, PathBuf};
 
-use crate::theme::{MUTED, PANEL_2, SOFT_ACCENT, TEXT};
+use crate::dialog::{button, choice_row, error_line, footnote, search, sheet, ButtonKind, Scrim};
 
 /// What resolving the chooser means for the app lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,145 +212,130 @@ impl SessionChooser {
     }
 }
 
-/// Centered modal. Rows are clickable styled cells (no buttons, per the feather
-/// look); keyboard is ↑/↓ + Enter. `open` is flipped by the window's × control.
+/// The resume chooser as a Feather sheet: a search field pinned under the title,
+/// a scrolling list of hairline-separated rows, and a delete confirmation that
+/// takes over the footer. Keyboard is ↑/↓ + Enter, Del asks, Esc closes.
 pub fn picker_window(
     ctx: &egui::Context,
     chooser: &mut SessionChooser,
     open: &mut bool,
 ) -> Option<Pick> {
     let mut pick = None;
-    egui::Window::new("Resume a session")
-        .open(open)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .order(egui::Order::Foreground)
-        .collapsible(false)
-        .resizable(true)
-        .default_width(520.0)
-        .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Type to search · ↑ / ↓ choose · Enter opens · Del deletes · Esc closes",
-                )
-                .size(12.5)
-                .color(MUTED),
-            );
-            if chooser.pending_delete.is_none()
-                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-            {
-                chooser.request_delete(chooser.active_row());
-            }
-            ui.add_sized(
-                [ui.available_width(), 30.0],
-                egui::TextEdit::singleline(&mut chooser.filter)
-                    .id(egui::Id::new("session-search"))
-                    .hint_text("Search session history…")
-                    .text_color(TEXT),
-            );
-            ui.add_space(4.0);
+    let rows = chooser.row_count();
+    let confirming = chooser.pending_delete.is_some();
 
-            let rows = chooser.row_count();
-            let down = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
-            let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
-            if rows > 0 {
-                if down {
-                    chooser.move_cursor(1);
+    // Keys are read once, before the regions are built, so a key handled by the
+    // search field never also moves the cursor.
+    let (down, up, enter, delete) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+        )
+    });
+    if confirming {
+        if enter {
+            pick = chooser.confirm_delete();
+        }
+    } else if rows > 0 {
+        if down {
+            chooser.move_cursor(1);
+        }
+        if up {
+            chooser.move_cursor(-1);
+        }
+        if delete {
+            chooser.request_delete(chooser.active_row());
+        } else if enter {
+            pick = Some(chooser.selected_pick());
+        }
+    }
+    let highlight = chooser.active_row();
+    // The card's regions are closures, so everything the rows need is snapshotted
+    // first and every intent is recorded rather than applied inside the draw.
+    let listed: Vec<(String, String)> = (0..rows).map(|row| chooser.row_text(row)).collect();
+    let mut filter = std::mem::take(&mut chooser.filter);
+    let error = chooser.error.clone();
+    let mut hover_row = None;
+    let mut click_row = None;
+    let mut clicked_primary = false;
+    let mut clicked_confirm = false;
+    let mut clicked_abort = false;
+
+    sheet(ctx, "session-chooser", "Resume a session")
+        .width(520.0)
+        .scrim(Scrim::Soft)
+        .lead(if confirming {
+            "This cannot be undone."
+        } else {
+            "Type to search · ↑ / ↓ choose · Enter opens · Del deletes"
+        })
+        .top(|ui| {
+            search(ui, "Search session history…", &mut filter, "session-history");
+        })
+        .body(|ui| {
+            for (row, (title, meta)) in listed.iter().enumerate() {
+                let selected = row == highlight;
+                let response = choice_row(ui, title, meta, selected, false);
+                if selected && (down || up) {
+                    response.scroll_to_me(Some(egui::Align::Center));
                 }
-                if up {
-                    chooser.move_cursor(-1);
+                if confirming {
+                    continue;
                 }
-                if chooser.pending_delete.is_none()
-                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                if response.hovered()
+                    && ui.input(|i| {
+                        i.events
+                            .iter()
+                            .any(|e| matches!(e, egui::Event::PointerMoved(_)))
+                    })
                 {
-                    pick = Some(chooser.selected_pick());
+                    hover_row = Some(row);
+                }
+                if response.clicked() {
+                    click_row = Some(row);
                 }
             }
-            let highlight = chooser.active_row();
-            egui::ScrollArea::vertical()
-                .id_salt("session-history")
-                .max_height(400.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for row in 0..rows {
-                        let selected = row == highlight;
-                        let (title, meta) = chooser.row_text(row);
-                        let response = egui::Frame::none()
-                            .fill(if selected { SOFT_ACCENT } else { PANEL_2 })
-                            .rounding(12.0)
-                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&title).size(14.0).color(TEXT),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText::new(&meta).size(11.5).color(MUTED),
-                                            );
-                                        },
-                                    );
-                                });
-                            })
-                            .response;
-                        if selected && (down || up) {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                        }
-                        let hit =
-                            ui.interact(response.rect, ui.id().with(row), egui::Sense::click());
-                        if chooser.pending_delete.is_none() && hit.hovered() {
-                            if ui.input(|i| {
-                                i.events
-                                    .iter()
-                                    .any(|e| matches!(e, egui::Event::PointerMoved(_)))
-                            }) {
-                                chooser.cursor = row;
-                            }
-                            if !selected {
-                                ui.painter().rect_stroke(
-                                    response.rect,
-                                    12.0,
-                                    egui::Stroke::new(1.5_f32, crate::theme::TEAL),
-                                );
-                            }
-                        }
-                        if chooser.pending_delete.is_none() && hit.clicked() {
-                            chooser.cursor = row;
-                            pick = Some(chooser.selected_pick());
-                        }
-                    }
-                });
-            if chooser.pending_delete.is_some() {
-                ui.separator();
-                ui.colored_label(
-                    crate::theme::RED,
-                    "Permanently delete this session and its history?",
-                );
+        })
+        .bottom(|ui| {
+            if confirming {
                 ui.horizontal(|ui| {
-                    if ui.button("Confirm delete").clicked() {
-                        pick = chooser.confirm_delete();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        chooser.pending_delete = None;
-                    }
+                    clicked_confirm = button(ui, "Confirm delete", ButtonKind::Danger).clicked();
+                    clicked_abort = button(ui, "Cancel", ButtonKind::Ghost).clicked();
+                });
+                ui.add_space(6.0);
+                error_line(ui, "Permanently delete this session and its history?");
+            } else {
+                if let Some(e) = &error {
+                    error_line(ui, e);
+                    ui.add_space(6.0);
+                }
+                ui.horizontal(|ui| {
+                    clicked_primary = button(ui, "Start a new session", ButtonKind::Primary).clicked();
+                    footnote(ui, "Esc keeps the welcome fresh");
                 });
             }
-            if let Some(e) = &chooser.error {
-                ui.colored_label(crate::theme::RED, e);
-            }
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Clicking a row resumes it; closing keeps the welcome fresh.")
-                    .size(11.5)
-                    .color(MUTED),
-            );
-            ui.add_space(2.0);
-        });
+        })
+        .show(open);
+
+    chooser.filter = filter;
+    if let Some(row) = hover_row {
+        chooser.cursor = row;
+    }
+    if let Some(row) = click_row {
+        chooser.cursor = row;
+        pick = Some(chooser.selected_pick());
+    }
+    if clicked_primary {
+        pick = Some(Pick::NewSession);
+    }
+    if clicked_abort {
+        chooser.pending_delete = None;
+    }
+    if clicked_confirm {
+        pick = chooser.confirm_delete();
+    }
     pick
 }
 

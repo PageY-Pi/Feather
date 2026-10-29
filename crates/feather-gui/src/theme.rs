@@ -48,6 +48,34 @@ pub const ERROR_BG: Color32 = Color32::from_rgb(0xFC, 0xED, 0xEE);
 pub const TOOL_ERROR_BG: Color32 = Color32::from_rgb(0xFA, 0xEE, 0xEF);
 
 // ---------------------------------------------------------------------------
+// dialog surfaces
+// ---------------------------------------------------------------------------
+
+/// Neutral wash behind hovered and keyboard-highlighted list rows. Kept free of
+/// the sage tint so a sage selected row never reads as "row on row".
+pub const HOVER: Color32 = Color32::from_rgb(0xF1, 0xEE, 0xE9);
+/// Hairline for `fade_rule`: slightly deeper than BORDER because both ends
+/// dissolve into the card, which costs a step of apparent contrast.
+pub const RULE: Color32 = Color32::from_rgb(0xDD, 0xD5, 0xC9);
+/// Text drawn on a solid INK-colored button or chip.
+pub const ON_INK: Color32 = Color32::from_rgb(0xFD, 0xFB, 0xF7);
+/// Destructive wash for a danger button's resting fill. Light enough that RED
+/// and MUTED both clear 4.5:1 on it.
+pub const DANGER_WASH: Color32 = Color32::from_rgb(0xF7, 0xE4, 0xE6);
+/// Destructive wash under the pointer: one visible step deeper, still legible.
+pub const DANGER_WASH_HOVER: Color32 = Color32::from_rgb(0xF2, 0xDE, 0xE1);
+/// Scrim behind a focused selection sheet. Deliberately light: it marks the
+/// frozen page without dimming it, matching the calm card look.
+pub const SCRIM_SOFT: Color32 = Color32::from_rgba_premultiplied(38, 47, 40, 30);
+/// Scrim behind a blocking confirmation. Darker, because the page underneath
+/// must read as unreachable, not merely inactive.
+pub const SCRIM_DEEP: Color32 = Color32::from_rgba_premultiplied(38, 47, 40, 66);
+/// Effort-bar gradient stops: cool at "off", warm at "max".
+pub const EFFORT_LOW: Color32 = Color32::from_rgb(0x6B, 0x8B, 0x78);
+pub const EFFORT_MID: Color32 = Color32::from_rgb(0x7B, 0x72, 0xB8);
+pub const EFFORT_HIGH: Color32 = Color32::from_rgb(0xA2, 0x6E, 0xA8);
+
+// ---------------------------------------------------------------------------
 // typography
 // ---------------------------------------------------------------------------
 
@@ -112,6 +140,17 @@ pub fn soft_shadow() -> Shadow {
         blur: 14.0,
         spread: 0.0,
         color: Color32::from_rgba_unmultiplied(0x5A, 0x51, 0x46, 15),
+    }
+}
+/// Dialog drop shadow: a wide, very transparent slab that lifts the card off
+/// the page without drawing a dark edge. The offset stays small so the shadow
+/// reads as depth, not as a second outline.
+pub fn dialog_shadow() -> Shadow {
+    Shadow {
+        offset: egui::vec2(0.0, 12.0),
+        blur: 40.0,
+        spread: 0.0,
+        color: Color32::from_rgba_unmultiplied(0x3A, 0x33, 0x2A, 46),
     }
 }
 
@@ -278,9 +317,10 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// Every light surface a text color may land on.
+/// Every light surface a text color may land on, including the dialog-only
+/// washes (hover rows, danger buttons, scrimmed cards).
 #[cfg(test)]
-pub fn surfaces() -> [Color32; 9] {
+pub fn surfaces() -> [Color32; 12] {
     [
         PANEL,
         PANEL_2,
@@ -291,6 +331,9 @@ pub fn surfaces() -> [Color32; 9] {
         SOFT_ACCENT,
         ERROR_BG,
         TOOL_ERROR_BG,
+        HOVER,
+        DANGER_WASH,
+        DANGER_WASH_HOVER,
     ]
 }
 
@@ -503,6 +546,47 @@ mod tests {
     fn status_colors_are_readable() {
         assert_readable("RED", RED);
         assert_readable("WARN", WARN);
+    }
+
+    #[test]
+    fn on_ink_is_readable_on_primary_buttons() {
+        let ratio = contrast_ratio(ON_INK, INK);
+        assert!(ratio >= 4.5, "ON_INK on INK is {ratio:.2}");
+        // A solid INK button must also separate from the card it sits on, or it
+        // reads as a floating label rather than a control.
+        let edge = contrast_ratio(INK, PANEL_2);
+        assert!(edge >= 9.0, "INK button on card is only {edge:.2}");
+    }
+
+    #[test]
+    fn destructive_marks_are_readable_on_danger_washes() {
+        for surface in [DANGER_WASH, DANGER_WASH_HOVER] {
+            let ratio = contrast_ratio(RED, surface);
+            assert!(ratio >= 4.5, "RED on {surface:?} is {ratio:.2}");
+        }
+    }
+
+    #[test]
+    fn dialog_rule_and_selection_stay_visible_without_pretending_to_be_text() {
+        // The hairline is decoration: it must differ from the card, but it is
+        // not required to reach text contrast.
+        let rule = contrast_ratio(RULE, PANEL_2);
+        assert!(rule > 1.08, "fade rule is invisible on the card: {rule:.2}");
+        let wash = contrast_ratio(HOVER, PANEL_2);
+        assert!(wash > 1.05, "row hover wash is invisible: {wash:.2}");
+        let selected = contrast_ratio(SOFT_ACCENT, PANEL_2);
+        assert!(
+            selected > wash,
+            "a selected row must out-weigh a hovered one"
+        );
+    }
+
+    #[test]
+    fn scrims_darken_the_page_without_killing_legibility() {
+        let soft = SCRIM_SOFT.to_array()[3] as f32 / 255.0;
+        let deep = SCRIM_DEEP.to_array()[3] as f32 / 255.0;
+        assert!(soft < deep, "a confirmation must dim more than a picker");
+        assert!(soft < 0.2 && deep < 0.4, "a scrim must stay translucent");
     }
 
     #[test]

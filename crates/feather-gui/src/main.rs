@@ -16,6 +16,7 @@ mod cards;
 mod chrome_tests;
 mod commands;
 mod context_menu;
+mod dialog;
 mod font_store;
 mod frame_pacing;
 mod gpu_fallback;
@@ -59,6 +60,10 @@ mod workspace;
 use theme::{
     apply_theme, install_fonts, soft_shadow, INK, MUTED, PANEL, PANEL_2, RED, SIDEBAR, SOFT_ACCENT,
     TEAL, TEXT,
+};
+use dialog::{
+    button, check_row, choice_row, effort_bar, error_line, field, footnote, hint, list_row, search,
+    segmented, sheet, tag, ButtonKind, Scrim,
 };
 
 use feather::oauth;
@@ -2635,200 +2640,146 @@ impl FeatherApp {
                     .collect()
             })
             .unwrap_or_default();
-        egui::Window::new("Choose a model")
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Type to search · ↑ / ↓ choose · Enter selects · Esc closes",
-                    )
-                    .size(12.5)
-                    .color(MUTED),
-                );
-                ui.add_sized(
-                    [ui.available_width(), 30.0],
-                    egui::TextEdit::singleline(&mut self.model_filter)
-                        .id(egui::Id::new("model-search"))
-                        .hint_text("Search models or providers…")
-                        .text_color(TEXT),
-                );
-                let query = self.model_filter.to_lowercase();
-                let flat: Vec<_> = self
-                    .catalog
-                    .as_ref()
-                    .map(|cat| {
-                        cat.providers
-                            .iter()
-                            .filter(|(pid, _)| available.contains(*pid))
-                            .flat_map(|(pid, p)| {
-                                p.models.iter().map(move |m| (pid.clone(), m.id.clone()))
-                            })
-                            .filter(|(pid, id)| {
-                                query.is_empty()
-                                    || format!("{pid}/{id}").to_lowercase().contains(&query)
-                            })
-                            .collect()
+
+        // Everything the rows need is computed before the sheet's region
+        // closures run, and every intent is recorded rather than applied while
+        // the card is being drawn.
+        let query = self.model_filter.to_lowercase();
+        let flat: Vec<(String, String)> = self
+            .catalog
+            .as_ref()
+            .map(|cat| {
+                cat.providers
+                    .iter()
+                    .filter(|(pid, _)| available.contains(*pid))
+                    .flat_map(|(pid, p)| p.models.iter().map(move |m| (pid.clone(), m.id.clone())))
+                    .filter(|(pid, id)| {
+                        query.is_empty() || format!("{pid}/{id}").to_lowercase().contains(&query)
                     })
-                    .unwrap_or_default();
-                self.model_cursor = self.model_cursor.min(flat.len().saturating_sub(1));
-                let down =
-                    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown));
-                let up = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
-                if !flat.is_empty() {
-                    if down {
-                        self.model_cursor = (self.model_cursor + 1) % flat.len();
-                    }
-                    if up {
-                        self.model_cursor = (self.model_cursor + flat.len() - 1) % flat.len();
-                    }
-                    if !self.running
-                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                    {
-                        picked = Some(flat[self.model_cursor].clone());
-                    }
-                }
-                let highlighted = flat.get(self.model_cursor).cloned();
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.model_cursor = self.model_cursor.min(flat.len().saturating_sub(1));
+
+        let (down, up, enter) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            )
+        });
+        if !flat.is_empty() {
+            if down {
+                self.model_cursor = (self.model_cursor + 1) % flat.len();
+            }
+            if up {
+                self.model_cursor = (self.model_cursor + flat.len() - 1) % flat.len();
+            }
+            if !self.running && enter {
+                picked = Some(flat[self.model_cursor].clone());
+            }
+        }
+        let current = self.settings.model.clone();
+        let context_window = self.settings.context_window;
+        let running = self.running;
+        let mut filter = std::mem::take(&mut self.model_filter);
+        let mut hover = None;
+        let mut clicked = None;
+
+        // Grouped by provider, so a long catalog still reads as a short list.
+        let groups: Vec<(String, Vec<(String, String)>)> = self
+            .catalog
+            .as_ref()
+            .map(|cat| {
+                cat.providers
+                    .iter()
+                    .filter(|(pid, _)| available.contains(*pid))
+                    .filter_map(|(pid, p)| {
+                        let rows: Vec<(String, String)> = p
+                            .models
+                            .iter()
+                            .filter(|m| {
+                                query.is_empty()
+                                    || format!("{pid}/{}", m.id).to_lowercase().contains(&query)
+                            })
+                            .map(|m| (m.id.clone(), context_label(context_window, m)))
+                            .collect();
+                        (!rows.is_empty()).then(|| (pid.clone(), rows))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        sheet(ctx, "model-picker", "Choose a model")
+            .width(520.0)
+            .scrim(Scrim::Soft)
+            .lead("Type to search · ↑ / ↓ choose · Enter selects")
+            .top(|ui| {
+                search(ui, "Search models or providers…", &mut filter, "model-search");
                 if flat.is_empty() {
-                    ui.label(
-                        egui::RichText::new(
-                            "No usable models match. Use +add to add an API or sign in.",
-                        )
-                        .color(MUTED),
-                    );
+                    ui.add_space(8.0);
+                    hint(ui, "No usable models match. Use +add to add an API or sign in.");
+                } else if running {
+                    ui.add_space(8.0);
+                    hint(ui, "Model changes are available after the current run.");
                 }
-                if self.running {
-                    ui.label(
-                        egui::RichText::new("Model changes are available after the current run.")
-                            .color(MUTED),
-                    );
-                }
-                ui.add_enabled_ui(!self.running, |ui| {
-                    if let Some(cat) = &self.catalog {
-                        egui::ScrollArea::vertical()
-                            .max_height(410.0)
-                            .show(ui, |ui| {
-                                for (pid, p) in &cat.providers {
-                                    if !available.contains(pid) {
-                                        continue;
-                                    }
-                                    let matching: Vec<_> = p
-                                        .models
-                                        .iter()
-                                        .filter(|m| {
-                                            query.is_empty()
-                                                || format!("{pid}/{}", m.id)
-                                                    .to_lowercase()
-                                                    .contains(&query)
-                                        })
-                                        .collect();
-                                    if matching.is_empty() {
-                                        continue;
-                                    }
-                                    ui.add_space(10.0);
-                                    ui.label(
-                                        egui::RichText::new(pid).size(12.5).strong().color(TEAL),
-                                    );
-                                    for m in matching {
-                                        let full = format!("{pid}/{}", m.id);
-                                        let selected =
-                                            highlighted.as_ref().is_some_and(|(provider, id)| {
-                                                provider == pid && id == &m.id
-                                            });
-                                        // Show what the agent will really use: the
-                                        // global context capped by the model window.
-                                        let effective = models::effective_context_window(
-                                            self.settings.context_window,
-                                            Some(m),
-                                        );
-                                        let context = match m.context_window {
-                                            Some(cap) if cap > effective => format!(
-                                                "{}k of {}k context",
-                                                effective / 1000,
-                                                cap / 1000
-                                            ),
-                                            _ => format!("{}k context", effective / 1000),
-                                        };
-                                        let response = egui::Frame::none()
-                                            .fill(if selected { SOFT_ACCENT } else { PANEL_2 })
-                                            .rounding(12.0)
-                                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                                            .show(ui, |ui| {
-                                                ui.set_width(ui.available_width());
-                                                ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(&m.id)
-                                                                .size(14.0)
-                                                                .color(TEXT),
-                                                        )
-                                                        .truncate(),
-                                                    );
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            ui.label(
-                                                                egui::RichText::new(context)
-                                                                    .size(11.5)
-                                                                    .color(MUTED),
-                                                            );
-                                                        },
-                                                    );
-                                                });
-                                            })
-                                            .response;
-                                        if selected && (down || up) {
-                                            response.scroll_to_me(Some(egui::Align::Center));
-                                        }
-                                        let hit = ui.interact(
-                                            response.rect,
-                                            ui.id().with(full),
-                                            egui::Sense::click(),
-                                        );
-                                        if hit.hovered() {
-                                            if ui.input(|i| {
-                                                i.events.iter().any(|e| {
-                                                    matches!(e, egui::Event::PointerMoved(_))
-                                                })
-                                            }) {
-                                                if let Some(index) = flat
-                                                    .iter()
-                                                    .position(|(p, id)| p == pid && id == &m.id)
-                                                {
-                                                    self.model_cursor = index;
-                                                }
-                                            }
-                                            if !selected {
-                                                ui.painter().rect_stroke(
-                                                    response.rect,
-                                                    12.0,
-                                                    egui::Stroke::new(1.5_f32, TEAL),
-                                                );
-                                            }
-                                        }
-                                        if hit.clicked() {
-                                            picked = Some((pid.clone(), m.id.clone()));
-                                        }
-                                    }
-                                }
-                            });
+            })
+            .body(|ui| {
+                ui.add_enabled_ui(!running, |ui| {
+                    for (pid, rows) in &groups {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(pid).size(12.0).color(theme::TEAL));
+                        ui.add_space(2.0);
+                        for (id, meta) in rows {
+                            let full = format!("{pid}/{id}");
+                            let selected =
+                                flat.get(self.model_cursor).is_some_and(|(p, i)| {
+                                    p == pid && i == id
+                                });
+                            let active = full == current;
+                            let response = choice_row(ui, id, meta, selected, active);
+                            if selected && (down || up) {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if response.hovered()
+                                && ui.input(|i| {
+                                    i.events.iter().any(|e| {
+                                        matches!(e, egui::Event::PointerMoved(_))
+                                    })
+                                })
+                            {
+                                hover = flat.iter().position(|(p, i)| p == pid && i == id);
+                            }
+                            if response.clicked() {
+                                clicked = Some((pid.clone(), id.clone()));
+                            }
+                        }
                     }
                 });
-            });
+            })
+            .bottom(|ui| {
+                if running {
+                    footnote(ui, "Stop the run to switch models");
+                } else {
+                    footnote(ui, "Esc closes");
+                }
+            })
+            .show(&mut open);
+
+        self.model_filter = filter;
+        if let Some(index) = hover {
+            self.model_cursor = index;
+        }
         self.show_models = open;
-        if let Some((pid, id)) = picked {
+        if let Some((pid, id)) = clicked.or(picked) {
             self.select_model(&pid, &id);
             self.show_models = false;
         }
     }
 
-    /// Slider popup for thinking effort (ChatGPT-web style).
+    /// The thinking-effort sheet: the level as a large sage numeral, the
+    /// gradient bar, and the two ends of the scale named underneath. Applies on
+    /// release, the way the arrow keys do.
     fn thinking_picker_window(&mut self, ctx: &egui::Context) {
         if !self.show_thinking_picker {
             return;
@@ -2838,72 +2789,80 @@ impl FeatherApp {
         self.thinking_slider = self.thinking_slider.min(max);
         let mut open = self.show_thinking_picker;
         let mut apply = None;
-        egui::Window::new("Thinking effort")
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(440.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("Give Feather a little more time to think.")
-                        .size(13.5)
-                        .color(MUTED),
-                );
-                ui.small("Manual effort presets · configure 'Reasoning not supported' in +add to disable.");
-                ui.add_space(10.0);
-                egui::Frame::none()
-                    .fill(SOFT_ACCENT)
-                    .rounding(16.0)
-                    .inner_margin(egui::Margin::same(16.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(&levels[self.thinking_slider])
-                                .size(21.0)
-                                .strong()
-                                .color(theme::TEAL_BRIGHT),
-                        );
-                        ui.add_space(6.0);
-                        ui.spacing_mut().slider_width = (ui.available_width() - 12.0).max(120.0);
-                        let response = ui.add_enabled(
-                            max > 0,
-                            egui::Slider::new(&mut self.thinking_slider, 0..=max)
-                                .show_value(false)
-                                .smart_aim(false),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&levels[0]).size(12.0).color(MUTED));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(&levels[max]).size(12.0).color(MUTED),
-                                    );
-                                },
-                            );
-                        });
-                        if (response.changed() && !response.dragged()) || response.drag_stopped() {
-                            apply = Some(levels[self.thinking_slider].clone());
-                        }
-                    });
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(if max == 0 {
-                        "This model has no adjustable thinking effort."
-                    } else {
-                        "Drag or use ← / → · release to apply · Esc or × to close"
-                    })
-                    .size(12.0)
-                    .color(MUTED),
-                );
-            });
-        self.show_thinking_picker = open;
-        if let Some(level) = apply {
-            if self.thinking_slider != self.thinking_applied {
-                self.thinking_applied = self.thinking_slider;
-                self.set_thinking(&level);
+        let (left, right) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+            )
+        });
+        if max > 0 {
+            let mut moved = false;
+            if left && self.thinking_slider > 0 {
+                self.thinking_slider -= 1;
+                moved = true;
             }
+            if right && self.thinking_slider < max {
+                self.thinking_slider += 1;
+                moved = true;
+            }
+            if moved {
+                apply = Some(levels[self.thinking_slider].clone());
+            }
+        }
+        let current = self.thinking_slider;
+        let numeric = max > 0;
+        let title = levels[current].clone();
+        let low = levels[0].clone();
+        let high = levels[max].clone();
+        let mut picked = None;
+
+        sheet(ctx, "thinking-picker", "Thinking effort")
+            .width(440.0)
+            .scrim(Scrim::Soft)
+            .lead("Give Feather a little more time to think.")
+            .top(|ui| {
+                tag(ui, &format!("{} of {}", current + 1, levels.len()), TEAL);
+            })
+            .body(|ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(&title)
+                        .size(26.0)
+                        .strong()
+                        .color(theme::TEAL_BRIGHT),
+                );
+                ui.add_space(12.0);
+                picked = effort_bar(ui, "thinking-effort", levels.len(), current, numeric);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&low).size(12.0).color(MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(&high).size(12.0).color(MUTED));
+                    });
+                });
+                ui.add_space(10.0);
+                if numeric {
+                    hint(ui, "Manual effort presets · configure 'Reasoning not supported' in +add to disable.");
+                } else {
+                    hint(ui, "This model has no adjustable thinking effort.");
+                }
+            })
+            .bottom(|ui| {
+                footnote(
+                    ui,
+                    if numeric {
+                        "← / → adjusts · release to apply"
+                    } else {
+                        "Esc closes"
+                    },
+                );
+            })
+            .show(&mut open);
+
+        self.show_thinking_picker = open;
+        if let Some(level) = picked.map(|index| levels[index].clone()).or(apply) {
+            self.thinking_applied = self.thinking_slider;
+            self.set_thinking(&level);
         }
     }
 
@@ -2911,68 +2870,101 @@ impl FeatherApp {
         if !self.show_settings {
             return;
         }
+        let mut open = self.show_settings;
         let mut reload = false;
-        egui::Window::new(egui::RichText::new("Keybindings (pi parity)").color(TEXT))
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(640.0)
-            .show(ctx, |ui| {
-                if ui.checkbox(&mut self.settings.auto_resume_latest, "Continue latest workspace session on startup").changed() {
-                    if let Err(e)=feather::preferences::save_settings_patch(&config::feather_home().join("config.redb"),&serde_json::json!({"autoResumeLatest":self.settings.auto_resume_latest})) {
-                        self.rows.push(ChatRow::new(RowKind::Error,e.to_string()));
-                    }
-                }
+        let mut toggle_resume = None;
+        let overrides = config::feather_home().join("config.redb");
+        let rows: Vec<(String, String, bool)> = self
+            .kb
+            .table()
+            .iter()
+            .map(|(id, combos)| {
+                let spec = if combos.is_empty() {
+                    "(disabled)".to_string()
+                } else {
+                    combos
+                        .iter()
+                        .map(|c| c.to_spec())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let overridden = self.kb.is_overridden(id);
+                (id.clone(), spec, overridden)
+            })
+            .collect();
+        let resume = self.settings.auto_resume_latest;
+
+        sheet(ctx, "keybindings", "Keybindings")
+            .width(640.0)
+            .scrim(Scrim::Deep)
+            .lead("Every action can be remapped in config.redb; an empty list disables it.")
+            .top(|ui| {
+                toggle_resume = Some(check_row(
+                    ui,
+                    resume,
+                    "Continue latest workspace session on startup",
+                ));
                 ui.add_space(8.0);
-                let path = config::feather_home().join("config.redb");
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Overrides: {}  — map an action to a key or a list of keys; an empty list disables it. Press F5 here to reload.",
-                        path.display()
-                    ))
-                    .size(11.0)
-                    .color(MUTED),
+                hint(
+                    ui,
+                    &format!("Overrides: {}", overrides.display()),
                 );
-                ui.add_space(4.0);
                 reload = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5));
-                ui.label(egui::RichText::new("F1 shortcuts · Ctrl+L models · Ctrl+Shift+T thinking · Ctrl+Shift+N new session").size(12.5).color(INK));
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
-                    egui::Grid::new("kb_grid")
-                        .num_columns(3)
-                        .spacing([16.0, 3.0])
-                        .show(ui, |ui| {
-                            for (id, combos) in self.kb.table() {
-                                ui.label(egui::RichText::new(id).size(11.0).color(TEXT));
-                                let spec = if combos.is_empty() {
-                                    "(disabled)".to_string()
-                                } else {
-                                    combos
-                                        .iter()
-                                        .map(|c| c.to_spec())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                };
-                                ui.label(
-                                    egui::RichText::new(spec)
-                                        .size(11.0)
-                                        .color(if self.kb.is_overridden(id) { TEAL } else { MUTED }),
-                                );
-                                if self.kb.is_overridden(id) {
+                if reload {
+                    hint(ui, "Reloading from config.redb…");
+                }
+            })
+            .body(|ui| {
+                for (id, spec, overridden) in &rows {
+                    let response = list_row(ui, false, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(id).size(12.0).color(TEXT),
+                                )
+                                .truncate(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if *overridden {
+                                        tag(ui, "override", TEAL);
+                                        ui.add_space(6.0);
+                                    }
                                     ui.label(
-                                        egui::RichText::new("override")
-                                            .size(10.0)
-                                            .color(TEAL),
+                                        egui::RichText::new(spec).size(11.5).color(if *overridden {
+                                            TEAL
+                                        } else {
+                                            MUTED
+                                        }),
                                     );
-                                } else {
-                                    ui.label(egui::RichText::new("default").size(10.0).color(MUTED));
-                                }
-                                ui.end_row();
-                            }
+                                },
+                            );
                         });
-                });
-            });
+                    });
+                    let _ = response;
+                }
+            })
+            .bottom(|ui| {
+                footnote(
+                    ui,
+                    "F1 shortcuts · Ctrl+L models · Ctrl+Shift+T thinking · Ctrl+Shift+N new",
+                );
+            })
+            .show(&mut open);
+
+        self.show_settings = open;
+        if let Some(value) = toggle_resume {
+            if value != resume {
+                self.settings.auto_resume_latest = value;
+                if let Err(e) = feather::preferences::save_settings_patch(
+                    &config::feather_home().join("config.redb"),
+                    &serde_json::json!({"autoResumeLatest": value}),
+                ) {
+                    self.rows.push(ChatRow::new(RowKind::Error, e.to_string()));
+                }
+            }
+        }
         if reload {
             self.kb = keybindings::Keybindings::load();
         }
@@ -3071,6 +3063,10 @@ impl FeatherApp {
         Ok(store)
     }
 
+    /// The add-API / sign-in sheet. One card, two modes: a compatible-endpoint
+    /// form or a list of built-in providers. The footer keeps Save/Clear and the
+    /// type-a-limit field out of the scrolling body, so an error never hides a
+    /// control the user needs.
     fn login_window(&mut self, ctx: &egui::Context) {
         if !self.show_login {
             return;
@@ -3083,258 +3079,257 @@ impl FeatherApp {
             Err(e) => Some(e),
         };
         let mut open = self.show_login;
-        egui::Window::new("Add API / manage models")
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(if ctx.screen_rect().width() < 900.0 {
-                500.0
-            } else {
-                540.0
+        let wide = ctx.screen_rect().width() >= 900.0;
+        let typing = ctx.wants_keyboard_input();
+        let (up, down, enter, delete, ctrl_o) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::O),
+            )
+        });
+        let compatible = self.model_manager.enabled;
+        if !compatible && !typing {
+            if down {
+                self.auth_selected = (self.auth_selected + 1) % oauth::PROVIDERS.len();
+            }
+            if up {
+                self.auth_selected =
+                    (self.auth_selected + oauth::PROVIDERS.len() - 1) % oauth::PROVIDERS.len();
+            }
+        }
+        let selected = oauth::PROVIDERS[self.auth_selected];
+        let pending = self.auth_pending.contains(selected.id);
+        // The sheet keeps its region closures in one struct, so they all capture
+        // at once: intents and the key draft are shared through cells, then
+        // applied once the card has been drawn.
+        let sign_in: std::cell::Cell<Option<&'static oauth::OAuthProvider>> =
+            std::cell::Cell::new(None);
+        let sign_out: std::cell::Cell<Option<&'static str>> = std::cell::Cell::new(None);
+        let manage: std::cell::Cell<Option<model_manager::Action>> = std::cell::Cell::new(None);
+        let save_key: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        let draft_init = self.api_key_drafts.remove(selected.id).unwrap_or_default();
+        let draft = std::cell::RefCell::new(draft_init.clone());
+        let mut mode = usize::from(!compatible);
+        let rows: Vec<(String, String, bool, bool)> = oauth::PROVIDERS
+            .iter()
+            .map(|p| {
+                let logged = self.auth.valid(p.id);
+                let waiting = self.auth_pending.contains(p.id);
+                let status = self
+                    .auth
+                    .get(p.id)
+                    .map(|a| {
+                        if a.kind == "api_key" {
+                            "API key saved".into()
+                        } else if logged {
+                            format_expires(a.expires)
+                        } else {
+                            "renew on next request".into()
+                        }
+                    })
+                    .unwrap_or_else(|| "not signed in".into());
+                (p.id.to_string(), status, logged, waiting)
             })
-            .default_height((ctx.screen_rect().height() - 180.0).clamp(240.0, 650.0))
-            .max_width((ctx.screen_rect().width() - 64.0).max(320.0))
-            .max_height((ctx.screen_rect().height() - 100.0).max(220.0))
-            .show(ctx, |ui| {
-                ui.spacing_mut().icon_width = 22.0;
-                ui.label(
-                    egui::RichText::new(
-                        "Connect a provider, then choose the models you want to use.",
-                    )
-                    .size(13.0)
-                    .color(MUTED),
-                );
-                ui.add_space(6.0);
+            .collect();
+        let highlight = self.auth_selected;
+        let key_id = egui::Id::new("login-api-key");
+        // The card's three regions are separate closures, so the mutable state
+        // they share moves out of `self` for the duration of the draw: a shared
+        // handle for the form, and a local string for the key draft.
+        let form = std::rc::Rc::new(std::cell::RefCell::new(std::mem::take(
+            &mut self.model_manager,
+        )));
+        let signed_in = self.auth.get(selected.id).is_some();
+        let hover: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+        let catalog = self.catalog.clone();
+        let home = self.home.clone();
+        let active_model = self.settings.model.clone();
+        let running = self.running;
+        let global = (
+            self.settings.context_window,
+            self.settings.compaction.reserve_tokens,
+            self.settings.compaction.keep_recent_tokens,
+        );
+        let provider_id = selected.id;
+
+        sheet(ctx, "add-api", "Add API · manage models")
+            .width(if wide { 540.0 } else { 500.0 })
+            .scrim(Scrim::Deep)
+            // A sign-in in flight can't be dismissed: closing the card would
+            // hide the only place its progress and errors are reported.
+            .closable(!pending)
+            .lead("Connect a provider, then choose the models you want to use.")
+            .top(|ui| {
                 if let Some(error) = &auth_error {
-                    ui.colored_label(RED, error);
+                    error_line(ui, error);
+                    ui.add_space(8.0);
                 }
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.model_manager.enabled,
-                        true,
-                        "Compatible API / models",
-                    );
-                    ui.selectable_value(
-                        &mut self.model_manager.enabled,
-                        false,
-                        "OAuth / built-in providers",
-                    );
-                });
-                if let Some(action) = self.model_manager.show_context_settings(
+                segmented(
                     ui,
-                    self.catalog.as_ref(),
-                    &self.settings.model,
-                    (
-                        self.settings.context_window,
-                        self.settings.compaction.reserve_tokens,
-                        self.settings.compaction.keep_recent_tokens,
-                    ),
-                    self.running,
-                ) {
-                    self.manage_model(action);
+                    "add-api-mode",
+                    &["Compatible API / models", "OAuth / built-in providers"],
+                    &mut mode,
+                );
+                ui.add_space(8.0);
+                if let Some(action) = form
+                    .borrow_mut()
+                    .show_context_settings(ui, catalog.as_ref(), &active_model, global, running)
+                {
+                    manage.set(Some(action));
                 }
-                ui.add_space(6.0);
-                ui.add_space(6.0);
-                if self.model_manager.enabled {
-                    if ctx.screen_rect().height() < 700.0 {
-                        ui.label(
-                            egui::RichText::new("Scroll for more settings ↓ · Save stays below")
-                                .size(12.0)
-                                .color(TEAL),
-                        );
-                    }
-                    let action = self.model_manager.show(
-                        ui,
-                        self.catalog.as_ref(),
-                        &self.home,
-                        &self.settings.model,
-                        self.running,
-                    );
-                    if let Some(action) = action {
-                        self.manage_model(action);
+            })
+            .body(|ui| {
+                if compatible {
+                    if let Some(action) = form.borrow_mut().show(ui, &home, &active_model, running) {
+                        manage.set(Some(action));
                     }
                     return;
                 }
-                ui.label(
-                    egui::RichText::new(
-                        "↑ / ↓ choose · Enter sign in · Delete sign out · Esc close",
-                    )
-                    .size(12.0)
-                    .color(MUTED),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "OAuth opens your browser. Credentials renew automatically.",
-                    )
-                    .size(12.0)
-                    .color(MUTED),
-                );
-                let key_id = egui::Id::new("login-api-key");
-                let editing = ui.memory(|m| m.has_focus(key_id));
-                let previous_selected = self.auth_selected;
-                if !editing {
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
-                    {
-                        self.auth_selected = (self.auth_selected + 1) % oauth::PROVIDERS.len();
-                    }
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
-                        self.auth_selected = (self.auth_selected + oauth::PROVIDERS.len() - 1)
-                            % oauth::PROVIDERS.len();
-                    }
-                }
-                let selected = oauth::PROVIDERS[self.auth_selected];
-                let pending = self.auth_pending.contains(selected.id);
-                if !editing && !pending && auth_error.is_none() {
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-                        && self.auth.get(selected.id).is_some()
-                    {
-                        self.spawn_auth_update(selected.id, None);
-                    }
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
-                        if selected.kind == oauth::Flow::ApiKey {
-                            ui.memory_mut(|m| m.request_focus(key_id));
-                        } else {
-                            self.spawn_login(selected);
-                        }
-                    }
-                }
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("auth-providers")
-                    .max_height((ctx.screen_rect().height() - 260.0).clamp(150.0, 340.0))
-                    .show(ui, |ui| {
-                        for (index, p) in oauth::PROVIDERS.iter().enumerate() {
-                            let selected = index == self.auth_selected;
-                            let logged = self.auth.valid(p.id);
-                            let pending = self.auth_pending.contains(p.id);
-                            let status = self
-                                .auth
-                                .get(p.id)
-                                .map(|a| {
-                                    if a.kind == "api_key" {
-                                        "API key saved".into()
-                                    } else if logged {
-                                        format_expires(a.expires)
-                                    } else {
-                                        "renew on next request".into()
-                                    }
-                                })
-                                .unwrap_or_else(|| "not signed in".into());
-                            let response = egui::Frame::none()
-                                .fill(if selected { SOFT_ACCENT } else { PANEL_2 })
-                                .rounding(12.0)
-                                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(8.0, 8.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(
-                                            rect.center(),
-                                            3.0,
-                                            if logged { TEAL } else { MUTED },
-                                        );
-                                        ui.label(egui::RichText::new(p.id).size(14.0).color(TEXT));
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if pending {
-                                                    ui.spinner();
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(status)
-                                                        .size(12.0)
-                                                        .color(MUTED),
-                                                );
-                                            },
-                                        );
-                                    });
-                                })
-                                .response;
-                            let hit = ui.interact(
-                                response.rect,
-                                ui.id().with(p.id),
-                                egui::Sense::click(),
+                for (index, (pid, status, logged, waiting)) in rows.iter().enumerate() {
+                    let response = list_row(ui, index == highlight, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                dot.center(),
+                                3.0,
+                                if *logged { TEAL } else { MUTED },
                             );
-                            if hit.hovered() {
-                                if ui.input(|i| {
-                                    i.events
-                                        .iter()
-                                        .any(|e| matches!(e, egui::Event::PointerMoved(_)))
-                                }) {
-                                    self.auth_selected = index;
-                                }
-                                if !selected {
-                                    ui.painter().rect_stroke(
-                                        response.rect,
-                                        12.0,
-                                        egui::Stroke::new(1.5_f32, TEAL),
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(pid).size(13.0).color(TEXT))
+                                    .truncate(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if *waiting {
+                                        ui.spinner();
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(status).size(11.5).color(MUTED),
                                     );
-                                }
-                            }
-                            if hit.clicked() {
-                                self.auth_selected = index;
-                            }
-                            if selected && self.auth_selected != previous_selected {
-                                response.scroll_to_me(Some(egui::Align::Center));
-                            }
-                        }
+                                },
+                            );
+                        });
                     });
-                let selected = oauth::PROVIDERS[self.auth_selected];
+                    if response.hovered()
+                        && ui.input(|i| {
+                            i.events
+                                .iter()
+                                .any(|e| matches!(e, egui::Event::PointerMoved(_)))
+                        })
+                    {
+                        hover.set(Some(index));
+                    }
+                    if response.clicked() {
+                        hover.set(Some(index));
+                    }
+                }
                 if selected.kind == oauth::Flow::ApiKey {
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(format!(
+                    hint(
+                        ui,
+                        &format!(
                             "{} · paste key, then Enter to save · Ctrl+O opens the key portal",
-                            selected.id
-                        ))
-                        .size(12.0)
-                        .color(MUTED),
+                            provider_id
+                        ),
                     );
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
-                        if let Err(error) = oauth::open_browser(selected.authorize_url) {
-                            self.rows.push(ChatRow::new(RowKind::Error, error));
+                    ui.add_space(4.0);
+                    ui.add_enabled_ui(!pending && auth_error.is_none(), |ui| {
+                        field(ui, "login-api-key", &mut draft.borrow_mut(), "Paste API key…");
+                    });
+                    if ui.memory(|m| m.has_focus(key_id)) && enter {
+                        let typed = draft.borrow().trim().to_owned();
+                        if !typed.is_empty() {
+                            save_key.set(Some(typed));
                         }
                     }
-                    let mut save = None;
-                    ui.add_enabled_ui(
-                        !self.auth_pending.contains(selected.id) && auth_error.is_none(),
-                        |ui| {
-                            let draft = self.api_key_drafts.entry(selected.id.into()).or_default();
-                            let enter = ui.memory(|m| m.has_focus(key_id))
-                                && ui.input_mut(|i| {
-                                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                                });
-                            ui.add_sized(
-                                [ui.available_width(), 30.0],
-                                egui::TextEdit::singleline(draft)
-                                    .id(key_id)
-                                    .hint_text("Paste API key…")
-                                    .password(true)
-                                    .text_color(TEXT),
-                            );
-                            if enter && !draft.trim().is_empty() {
-                                save = Some(draft.trim().to_string());
-                                draft.clear();
-                            }
-                        },
-                    );
-                    if let Some(key) = save {
-                        self.spawn_auth_update(
-                            selected.id,
-                            Some(oauth::OAuthAccount::api_key(key)),
-                        );
-                    }
+                } else {
+                    ui.add_space(8.0);
+                    hint(ui, "OAuth opens your browser. Credentials renew automatically.");
                 }
-            });
+            })
+            .bottom(|ui| {
+                if compatible {
+                    if let Some(action) = form.borrow_mut().show_footer(ui, running) {
+                        manage.set(Some(action));
+                    }
+                    footnote(ui, "Model changes apply to the next request");
+                } else if selected.kind == oauth::Flow::ApiKey {
+                    if button(ui, "Save key", ButtonKind::Primary).clicked() {
+                        let typed = draft.borrow().trim().to_owned();
+                        if !typed.is_empty() {
+                            save_key.set(Some(typed));
+                        }
+                    }
+                    footnote(ui, "↑ / ↓ provider · Esc closes");
+                } else {
+                    if button(ui, "Sign in", ButtonKind::Primary).clicked()
+                        || (!typing && enter && !pending && auth_error.is_none())
+                    {
+                        sign_in.set(Some(selected));
+                    }
+                    if signed_in && button(ui, "Sign out", ButtonKind::Danger).clicked() {
+                        sign_out.set(Some(provider_id));
+                    }
+                    if !typing && delete && signed_in {
+                        sign_out.set(Some(provider_id));
+                    }
+                    footnote(ui, "↑ / ↓ provider · Enter signs in · Del signs out");
+                }
+            })
+            .show(&mut open);
+
+        // Hand the form back, keeping whatever the user typed this frame.
+        let mut form = std::rc::Rc::try_unwrap(form)
+            .map(std::cell::RefCell::into_inner)
+            .unwrap_or_else(|shared| shared.borrow().clone());
+        form.enabled = mode == 0;
+        self.model_manager = form;
+        let typed = draft.into_inner();
+        if typed != draft_init {
+            self.api_key_drafts.insert(provider_id.to_owned(), typed);
+        }
+        if let Some(index) = hover.into_inner() {
+            self.auth_selected = index;
+        }
+        if let Some(provider) = sign_in.into_inner() {
+            self.spawn_login(provider);
+        }
+        if let Some(id) = sign_out.into_inner() {
+            self.spawn_auth_update(id, None);
+        }
+        if ctrl_o && !compatible && selected.kind == oauth::Flow::ApiKey {
+            if let Err(error) = oauth::open_browser(selected.authorize_url) {
+                self.rows.push(ChatRow::new(RowKind::Error, error));
+            }
+        }
+        if let Some(key) = save_key.into_inner() {
+            self.spawn_auth_update(provider_id, Some(oauth::OAuthAccount::api_key(key)));
+            self.api_key_drafts.remove(provider_id);
+        }
+        if let Some(action) = manage.into_inner() {
+            self.manage_model(action);
+        }
+        // The sheet owns the close state for this frame.
         self.show_login = open;
     }
 }
 
+/// The window a model really gets: the global context cap, clamped by the
+/// model's own limit. Shown on the picker row so the number matches the agent.
+fn context_label(global: u64, model: &models::ModelEntry) -> String {
+    let effective = models::effective_context_window(global, Some(model));
+    match model.context_window {
+        Some(cap) if cap > effective => {
+            format!("{}k of {}k context", effective / 1000, cap / 1000)
+        }
+        _ => format!("{}k context", effective / 1000),
+    }
+}
 fn format_expires(millis: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3739,27 +3734,7 @@ impl FeatherApp {
             )
             .show(ctx, |ui| self.chat_panel(ui));
 
-        if self.show_login
-            || self.show_models
-            || self.show_settings
-            || self.show_thinking_picker
-            || self.renderer_picker.is_some()
-            || self.request_picker.is_some()
-            || self.picker.is_some()
-        {
-            egui::Area::new(egui::Id::new("modal-scrim"))
-                .order(egui::Order::Middle)
-                .fixed_pos(egui::Pos2::ZERO)
-                .show(ctx, |ui| {
-                    let rect = ctx.screen_rect();
-                    ui.allocate_rect(rect, egui::Sense::hover());
-                    ui.painter().rect_filled(
-                        rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(38, 47, 40, 82),
-                    );
-                });
-        }
+        // Each sheet paints its own veil, so there is no page-wide scrim here.
         self.resume_window(ctx);
         self.requests_window(ctx);
         self.renderer_window(ctx);
@@ -3788,6 +3763,15 @@ fn main() -> anyhow::Result<()> {
         context_menu::uninstall().map_err(anyhow::Error::msg)?;
         println!("right-click menu removed");
         return Ok(());
+    }
+    // An update can leave the Explorer shortcut pointing at a binary that no
+    // longer exists (a moved install directory, or a throwaway verification
+    // copy that registered itself). Heal it from the running executable, but
+    // never during a preview/test run and never over a live registration.
+    if std::env::var("FEATHER_UI_PREVIEW").ok().as_deref() != Some("1") {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = context_menu::repair_if_stale(&exe);
+        }
     }
     // positional path = project root (Explorer passes the right-clicked dir)
     let root = args
