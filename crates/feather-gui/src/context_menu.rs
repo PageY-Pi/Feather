@@ -84,9 +84,94 @@ pub fn build_unreg_args() -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Location under the user's temp directory — where release-verification runs
+/// unpack a throwaway copy of the executables.
+pub fn is_transient(exe: &std::path::Path) -> bool {
+    let path = exe
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    if path.contains("\\appdata\\local\\temp\\") {
+        return true;
+    }
+    ["TEMP", "TMP"].iter().any(|var| {
+        std::env::var(var)
+            .ok()
+            .map(|value| value.replace('/', "\\").to_ascii_lowercase())
+            .filter(|value| value.len() > 3)
+            .is_some_and(|temp| path.starts_with(&(temp + "\\")))
+    })
+}
+
 /// Write the entries (idempotent). Returns joined output for error display.
+///
+/// A throwaway copy (a verification run unpacked under `%TEMP%`) refuses by
+/// default: registering it would repoint the user's real shell menu at a
+/// directory that is deleted when verification ends, so every later
+/// right-click would fail. `FEATHER_ALLOW_TRANSIENT_CONTEXT_MENU=1` is the
+/// explicit opt-in for tests that really want to exercise the registry.
 pub fn install(exe: &std::path::Path) -> Result<(), String> {
+    if is_transient(exe)
+        && std::env::var("FEATHER_ALLOW_TRANSIENT_CONTEXT_MENU")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        return Err(format!(
+            "refusing to register \"{MENU_LABEL}\" from a temporary copy: {}\n\
+             Run it from the installed feather-gui.exe instead. If this really is \
+             intended, set FEATHER_ALLOW_TRANSIENT_CONTEXT_MENU=1.",
+            exe.display()
+        ));
+    }
     run_all(build_reg_args(exe))
+}
+
+/// The executable inside a registered command line:
+/// `"C:\apps\feather-gui.exe" "%V"` -> `C:\apps\feather-gui.exe`.
+pub fn exe_from_command(command: &str) -> Option<std::path::PathBuf> {
+    let command = command.trim();
+    let exe = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or_default(),
+        None => command.split_whitespace().next().unwrap_or_default(),
+    };
+    (!exe.is_empty()).then(|| std::path::PathBuf::from(exe))
+}
+
+/// Read the command line a menu location currently runs.
+fn registered_command(key: &str) -> Option<String> {
+    let out = feather_core::process::command("reg")
+        .args(["query", key, "/ve"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let value = line.split_once("REG_SZ")?.1.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        })
+}
+
+/// Heal an update that moved or removed the executables: when a registered
+/// menu entry points at a file that no longer exists and we are running from a
+/// stable location, rewrite the entries to this executable. Returns the stale
+/// path that was replaced, if any. A live registration is never touched, so a
+/// menu deliberately pointed at another build stays where the user put it.
+pub fn repair_if_stale(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    if is_transient(exe) {
+        return None;
+    }
+    let stale = LOCATIONS.iter().find_map(|(suffix, _)| {
+        let key = format!("{REG_ROOT}\\{suffix}\\{MENU_KEY}\\command");
+        let command = registered_command(&key)?;
+        let target = exe_from_command(&command)?;
+        (!target.exists()).then_some(target)
+    })?;
+    install(exe).ok()?;
+    Some(stale)
 }
 
 /// Remove the entries (missing keys are fine — reg delete /f ignores them
@@ -166,5 +251,49 @@ mod tests {
             assert!(a[1].starts_with("HKCU\\Software\\Classes\\"));
             assert!(a[1].ends_with(MENU_KEY));
         }
+    }
+
+    #[test]
+    fn command_path_is_extracted_from_quoted_and_bare_lines() {
+        assert_eq!(
+            exe_from_command("\"C:\\apps\\feather-gui.exe\" \"%V\""),
+            Some(std::path::PathBuf::from("C:\\apps\\feather-gui.exe"))
+        );
+        assert_eq!(
+            exe_from_command("C:\\apps\\feather-gui.exe %1"),
+            Some(std::path::PathBuf::from("C:\\apps\\feather-gui.exe"))
+        );
+        assert_eq!(exe_from_command("   "), None);
+        assert_eq!(exe_from_command("\"\""), None);
+    }
+
+    #[test]
+    fn temp_copies_are_transient_but_installed_paths_are_not() {
+        // %TEMP% and %LOCALAPPDATA%\Temp copies are throwaway verify builds
+        assert!(is_transient(std::path::Path::new(
+            "C:/Users/Page/AppData/Local/Temp/feather-114-verify/feather-gui.exe"
+        )));
+        // stable install locations are accepted
+        assert!(!is_transient(std::path::Path::new(
+            "C:/Users/Page/AppData/Local/Programs/Feather/feather-gui.exe"
+        )));
+        assert!(!is_transient(std::path::Path::new(
+            "C:/Users/Page/Desktop/feather/target/release/feather-gui.exe"
+        )));
+    }
+
+    #[test]
+    fn transient_install_is_refused_without_the_opt_in() {
+        let temp = std::env::temp_dir().join("feather-transient-refusal-test.exe");
+        // Only exercise the guard: no registry write happens on the Err path.
+        if std::env::var("FEATHER_ALLOW_TRANSIENT_CONTEXT_MENU").is_ok() {
+            return; // the opt-in is exported; the guard is intentionally open
+        }
+        let error = install(&temp).expect_err("a %TEMP% copy must not touch the shell menu");
+        assert!(error.contains("temporary copy"), "{error}");
+        assert!(
+            error.contains("FEATHER_ALLOW_TRANSIENT_CONTEXT_MENU"),
+            "{error}"
+        );
     }
 }
