@@ -1,7 +1,6 @@
 //! Small session/model-style choosers for lazy skills and process-local proxies.
 use crate::theme::*;
 use eframe::egui;
-use crate::dialog::{button, choice_row, error_line, field, footnote, hint, search, sheet, tag, ButtonKind, Scrim};
 use feather::proxy::{self, Catalog};
 use feather_core::provider::transport::{self, Route};
 use std::{path::PathBuf, sync::mpsc};
@@ -127,305 +126,312 @@ pub fn window(
     limits: &Limits,
     open: &mut bool,
 ) -> Option<Choice> {
-    // Keys are read once, before the card is built, so a field that owns the
-    // keyboard keeps its own keys and Escape never leaks past a text edit.
-    let typing = ctx.wants_keyboard_input();
-    let (escape, up, down, enter, delete) = ctx.input_mut(|i| {
-        (
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
-        )
-    });
-    if escape && !typing {
-        *open = false;
-        return None;
-    }
-
-    match picker {
-        Picker::Skills {
-            resources,
-            filter,
-            cursor,
-        } => {
-            let query = filter.to_lowercase();
-            let rows: Vec<(String, String)> = resources
-                .skills
-                .iter()
-                .filter(|s| {
-                    s.name.to_lowercase().contains(&query)
-                        || s.description.to_lowercase().contains(&query)
-                })
-                .map(|s| (s.name.clone(), s.description.clone()))
-                .collect();
-            if !rows.is_empty() {
-                *cursor = (*cursor).min(rows.len() - 1);
-                if down {
-                    *cursor = (*cursor + 1) % rows.len();
-                }
-                if up {
-                    *cursor = (*cursor + rows.len() - 1) % rows.len();
-                }
+    let mut choice = None;
+    let mut close_requested = false;
+    let title = match picker {
+        Picker::Skills { .. } => "Choose a skill",
+        Picker::Proxy { .. } => "Choose proxy",
+        Picker::RateLimit { .. } => "Network rate limit",
+    };
+    egui::Window::new(title)
+        .open(open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(480.0)
+        .max_width((ctx.screen_rect().width() - 80.0).max(280.0))
+        .show(ctx, |ui| {
+            // Escape dismisses the popup, matching the other pickers. While a
+            // text field owns the keyboard the first Escape surrenders that
+            // focus instead of closing outright, so a typo is never lost.
+            if !ui.ctx().wants_keyboard_input()
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                close_requested = true;
             }
-            let highlight = *cursor;
-            let keyboard_pick = (enter && !typing && !rows.is_empty())
-                .then(|| rows[highlight].0.clone());
-            let diagnostics: Vec<String> = resources
-                .diagnostics
-                .iter()
-                .take(3)
-                .map(|d| d.message.clone())
-                .collect();
-            let mut chosen: Option<String> = None;
-            let mut hover = None;
-
-            sheet(ctx, "skill-picker", "Choose a skill")
-                .width(480.0)
-                .scrim(Scrim::Soft)
-                .lead("Only descriptions are listed. Instructions load when invoked.")
-                .top(|ui| {
-                    search(ui, "Search skills…", filter, "skill-search");
-                    if rows.is_empty() {
-                        ui.add_space(8.0);
-                        hint(ui, "No skills found. Add .feather/skills/<name>/SKILL.md.");
-                    }
-                })
-                .body(|ui| {
-                    for (index, (name, description)) in rows.iter().enumerate() {
-                        let response = choice_row(ui, name, description, index == highlight, false);
-                        if index == highlight && (up || down) {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                        }
-                        if response.hovered() {
-                            hover = Some(index);
-                        }
-                        if response.clicked() {
-                            chosen = Some(name.clone());
-                        }
-                    }
-                })
-                .bottom(|ui| {
-                    for message in &diagnostics {
-                        hint(ui, message);
-                    }
-                    footnote(ui, "↑ / ↓ choose · Enter runs · Esc closes");
-                })
-                .show(open);
-
-            if let Some(index) = hover {
-                *cursor = index;
-            }
-            keyboard_pick.or(chosen).map(Choice::Skill)
-        }
-        Picker::Proxy {
-            address,
-            cursor,
-            changed,
-        } => {
-            let routes: Vec<Route> = std::iter::once(Route::Direct)
-                .chain(
-                    proxies
-                        .catalog
-                        .entries
-                        .iter()
-                        .map(|e| e.endpoint.route.clone()),
-                )
-                .collect();
-            *cursor = (*cursor).min(routes.len() - 1);
-            if down {
-                *cursor = (*cursor + 1) % routes.len();
-            }
-            if up {
-                *cursor = (*cursor + routes.len() - 1) % routes.len();
-            }
-            let highlight = *cursor;
-            let removable = routes
-                .get(highlight)
-                .filter(|route| matches!(route, Route::Proxy { .. }))
-                .cloned();
-            let labels: Vec<(String, String)> = routes
-                .iter()
-                .enumerate()
-                .map(|(n, route)| {
-                    if n == 0 {
-                        ("Off · direct connection".to_string(), String::new())
-                    } else {
-                        let entry = &proxies.catalog.entries[n - 1];
-                        (
-                            route.to_string(),
-                            if entry.active { "detected" } else { "saved" }.to_string(),
-                        )
-                    }
-                })
-                .collect();
-            let current = proxies.catalog.selected.clone();
-            let scanning = proxies.scanning();
-            let proxy_error = proxies.error.clone();
-            let mut chosen: Option<Choice> = None;
-            let mut apply_address = false;
-            let mut hover = None;
-            let mut remove = None;
-            let mut scan = false;
-
-            sheet(ctx, "proxy-picker", "Choose proxy")
-                .width(480.0)
-                .scrim(Scrim::Soft)
-                .lead("Applies to Feather requests only. No VPN or system settings change.")
-                .top(|ui| {
-                    for (index, (label, meta)) in labels.iter().enumerate() {
-                        let active = routes[index] == current;
-                        let response = choice_row(ui, label, meta, index == highlight, active);
-                        if index == highlight && (up || down) {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                        }
-                        if response.hovered() {
-                            hover = Some(index);
-                        }
-                        if response.clicked() {
-                            chosen = Some(Choice::Proxy(routes[index].clone()));
-                        }
-                    }
-                })
-                .body(|ui| {
-                    ui.add_space(8.0);
-                    if button(
-                        ui,
-                        if scanning {
-                            "Scanning localhost…"
-                        } else {
-                            "Scan common proxy ports"
-                        },
-                        ButtonKind::Ghost,
+            match picker {
+                Picker::Skills {
+                    resources,
+                    filter,
+                    cursor,
+                } => {
+                    ui.label(
+                    egui::RichText::new(
+                        "Only descriptions are listed. Instructions load when a skill is invoked.",
                     )
-                    .clicked()
+                    .small()
+                    .color(MUTED),
+                );
+                    ui.add_space(8.0);
+                    ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::TextEdit::singleline(filter).hint_text("Search skills…"),
+                    );
+                    let query = filter.to_lowercase();
+                    let skills: Vec<_> = resources
+                        .skills
+                        .iter()
+                        .filter(|s| {
+                            s.name.to_lowercase().contains(&query)
+                                || s.description.to_lowercase().contains(&query)
+                        })
+                        .collect();
+                    if skills.is_empty() {
+                        ui.label("No skills found. Add .feather/skills/<name>/SKILL.md.");
+                    } else {
+                        *cursor = (*cursor).min(skills.len() - 1);
+                        if ui.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                        }) {
+                            *cursor = (*cursor + 1) % skills.len();
+                        }
+                        if ui
+                            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+                        {
+                            *cursor = (*cursor + skills.len() - 1) % skills.len();
+                        }
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                        {
+                            choice = Some(Choice::Skill(skills[*cursor].name.clone()));
+                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(340.0)
+                            .show(ui, |ui| {
+                                for (n, skill) in skills.iter().enumerate() {
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 40.0],
+                                            egui::SelectableLabel::new(
+                                                n == *cursor,
+                                                egui::RichText::new(format!(
+                                                    "{} · {}",
+                                                    skill.name, skill.description
+                                                ))
+                                                .color(INK),
+                                            ),
+                                        )
+                                        .on_hover_text(skill.file_path.display().to_string())
+                                        .clicked()
+                                    {
+                                        choice = Some(Choice::Skill(skill.name.clone()));
+                                    }
+                                }
+                            });
+                    }
+                    for d in resources.diagnostics.iter().take(3) {
+                        ui.label(egui::RichText::new(&d.message).small().color(MUTED));
+                    }
+                }
+                Picker::Proxy {
+                    address,
+                    cursor,
+                    changed,
+                } => {
+                    ui.label(
+                    egui::RichText::new(
+                        "Applies to Feather requests only. No VPN or system settings are changed.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                    ui.label(
+                        egui::RichText::new(
+                            "↑ / ↓ select · Enter use · DEL removes saved proxy · Esc closes",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    let routes: Vec<_> = std::iter::once(Route::Direct)
+                        .chain(
+                            proxies
+                                .catalog
+                                .entries
+                                .iter()
+                                .map(|e| e.endpoint.route.clone()),
+                        )
+                        .collect();
+                    *cursor = (*cursor).min(routes.len() - 1);
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
                     {
-                        scan = true;
+                        *cursor = (*cursor + 1) % routes.len();
                     }
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+                        *cursor = (*cursor + routes.len() - 1) % routes.len();
+                    }
+                    if !ui.ctx().wants_keyboard_input()
+                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                    {
+                        choice = Some(Choice::Proxy(routes[*cursor].clone()));
+                    }
+                    if !ui.ctx().wants_keyboard_input()
+                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+                        && matches!(routes[*cursor], Route::Proxy { .. })
+                    {
+                        choice = Some(Choice::Remove(routes[*cursor].clone()));
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for (n, route) in routes.iter().enumerate() {
+                                let label = if n == 0 {
+                                    "Off · direct connection".into()
+                                } else {
+                                    let entry = &proxies.catalog.entries[n - 1];
+                                    format!(
+                                        "{} · {}",
+                                        route,
+                                        if entry.active { "detected" } else { "saved" }
+                                    )
+                                };
+                                let label = format!(
+                                    "{label}{}",
+                                    if route == &proxies.catalog.selected {
+                                        " · current"
+                                    } else {
+                                        ""
+                                    }
+                                );
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 36.0],
+                                        egui::SelectableLabel::new(n == *cursor, label),
+                                    )
+                                    .clicked()
+                                {
+                                    choice = Some(Choice::Proxy(route.clone()));
+                                }
+                            }
+                        });
+                    if let Some(selected) = routes.get(*cursor) {
+                        if matches!(selected, Route::Proxy { .. })
+                            && ui.button("Remove highlighted saved proxy").clicked()
+                        {
+                            choice = Some(Choice::Remove(selected.clone()));
+                        }
+                    }
+                    ui.add_space(10.0);
+                    if ui
+                        .add_enabled(
+                            !proxies.scanning(),
+                            egui::Button::new(if proxies.scanning() {
+                                "Scanning localhost…"
+                            } else {
+                                "Scan common proxy ports"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        choice = Some(Choice::Scan);
+                    }
+                    let edit = ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::TextEdit::singleline(address)
+                            .hint_text("http://127.0.0.1:7890 or socks5h://127.0.0.1:1080"),
+                    );
+                    if edit.changed() {
+                        *changed = true;
+                    }
+                    if *changed
+                        && edit.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        choice = Some(match Route::proxy(address.as_str()) {
+                            Ok(route) => Choice::Proxy(route),
+                            Err(e) => Choice::Error(e.to_string()),
+                        });
+                    }
+                    if ui.button("Add and use").clicked() {
+                        choice = Some(match Route::proxy(address.as_str()) {
+                            Ok(route) => Choice::Proxy(route),
+                            Err(e) => Choice::Error(e.to_string()),
+                        });
+                    }
+                    if let Some(error) = &proxies.error {
+                        ui.label(egui::RichText::new(error).small().color(RED));
+                    }
+                }
+                Picker::RateLimit { input, selected } => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Caps the bandwidth Feather uses for model requests and replies. \
+                         Applies from the next request; nothing outside Feather is affected.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    let current = limits.limit;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Current: {}",
+                            if current.bytes_per_second == 0 {
+                                "Off · no limit".to_string()
+                            } else {
+                                format!(
+                                    "{} per second ({} upload + download)",
+                                    feather::netlimit::human(current.bytes_per_second),
+                                    feather::netlimit::human(current.bytes_per_second)
+                                )
+                            }
+                        ))
+                        .size(12.0)
+                        .color(TEAL),
+                    );
                     ui.add_space(6.0);
-                    field(ui, "proxy-address", address, "http://127.0.0.1:7890 or socks5h://…");
-                    if let Some(error) = &proxy_error {
-                        ui.add_space(6.0);
-                        error_line(ui, error);
-                    }
-                })
-                .bottom(|ui| {
-                    if let Some(route) = &removable {
-                        if button(ui, "Remove saved proxy", ButtonKind::Danger).clicked() {
-                            remove = Some(route.clone());
-                        }
-                        ui.add_space(6.0);
-                    }
-                    // The typed address wins over the highlighted row; a
-                    // malformed one reports instead of picking a proxy.
-                    if button(ui, "Add and use", ButtonKind::Primary).clicked() {
-                        apply_address = true;
-                    }
-                    footnote(ui, "↑ / ↓ choose · Del removes · Esc closes");
-                })
-                .show(open);
 
-            let _ = changed;
-            if let Some(index) = hover {
-                *cursor = index;
-            }
-            if !typing && enter && chosen.is_none() {
-                chosen = Some(Choice::Proxy(routes[highlight].clone()));
-            }
-            if !typing && delete && removable.is_some() {
-                remove = removable.clone();
-            }
-            if scan {
-                return Some(Choice::Scan);
-            }
-            if remove.is_some() {
-                return remove.map(Choice::Remove);
-            }
-            if apply_address {
-                return Some(match Route::proxy(address.as_str()) {
-                    Ok(route) => Choice::Proxy(route),
-                    Err(e) => Choice::Error(e.to_string()),
-                });
-            }
-            chosen
-        }
-        Picker::RateLimit { input, selected } => {
-            if *selected != usize::MAX {
-                *selected = (*selected).min(feather::netlimit::SUGGESTED.len() - 1);
-            }
-            let current = &limits.limit;
-            let current_label = if current.bytes_per_second == 0 {
-                "Off · no limit".to_string()
-            } else {
-                format!(
-                    "{} per second",
-                    feather::netlimit::human(current.bytes_per_second)
-                )
-            };
-            let presets: Vec<String> = feather::netlimit::SUGGESTED
-                .iter()
-                .enumerate()
-                .map(|(n, (label, _))| {
-                    format!("{label}{}", if n == 0 { " · no limit" } else { "" })
-                })
-                .collect();
-            let highlight = *selected;
-            let rate_error = limits.error.clone();
-            let mut chosen_preset = None;
-            let mut hover = None;
-            let mut apply = None;
+                    // Presets: one click sets the limit, mirroring the proxy
+                    // picker's selectable rows.
+                    // `usize::MAX` marks "custom value, no preset selected"; only a
+                    // real index is clamped into range.
+                    if *selected != usize::MAX {
+                        *selected = (*selected).min(feather::netlimit::SUGGESTED.len() - 1);
+                    }
+                    for (n, (label, _)) in feather::netlimit::SUGGESTED.iter().enumerate() {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 32.0],
+                                egui::SelectableLabel::new(
+                                    n == *selected,
+                                    format!("{label}{}", if n == 0 { " · no limit" } else { "" }),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            *selected = n;
+                            *input = (*label).to_string();
+                        }
+                    }
 
-            sheet(ctx, "rate-limit", "Network rate limit")
-                .width(480.0)
-                .scrim(Scrim::Soft)
-                .lead("Caps the bandwidth Feather uses for model requests and replies.")
-                .top(|ui| {
-                    tag(ui, &format!("now {current_label}"), TEAL);
-                    ui.add_space(8.0);
-                    for (index, label) in presets.iter().enumerate() {
-                        let response = choice_row(ui, label, "", index == highlight, false);
-                        if index == highlight && (up || down) {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                        }
-                        if response.hovered() {
-                            hover = Some(index);
-                        }
-                        if response.clicked() {
-                            chosen_preset = Some(index);
-                        }
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Or type a limit: 256 KB/s · 1.5 MB · 20 MB · Off (B, KB, MB, GB)",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    let edit = ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::TextEdit::singleline(input).hint_text("512 KB/s"),
+                    );
+                    let submitted =
+                        edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Apply limit").clicked() || submitted {
+                        choice = Some(match feather::netlimit::parse(input) {
+                            Ok(bytes) => Choice::RateLimit(bytes),
+                            Err(message) => Choice::Error(message),
+                        });
                     }
-                })
-                .body(|ui| {
-                    ui.add_space(8.0);
-                    hint(ui, "Or type a limit: 256 KB/s · 1.5 MB · 20 MB · Off (B, KB, MB, GB)");
-                    ui.add_space(4.0);
-                    field(ui, "rate-limit-value", input, "512 KB/s");
-                    if let Some(error) = &rate_error {
-                        ui.add_space(6.0);
-                        error_line(ui, error);
+                    if let Some(error) = &limits.error {
+                        ui.label(egui::RichText::new(error).small().color(RED));
                     }
-                })
-                .bottom(|ui| {
-                    let pressed = button(ui, "Apply limit", ButtonKind::Primary).clicked()
-                        || (!typing && enter);
-                    if pressed {
-                        apply = Some(());
-                    }
-                    footnote(ui, "Applies from the next request");
-                })
-                .show(open);
-
-            if let Some(index) = chosen_preset {
-                *selected = index;
-                *input = feather::netlimit::SUGGESTED[index].0.to_string();
-            } else if let Some(index) = hover {
-                *selected = index;
+                }
             }
-            apply.map(|_| match feather::netlimit::parse(input) {
-                Ok(bytes) => Choice::RateLimit(bytes),
-                Err(message) => Choice::Error(message),
-            })
-        }
+        });
+    if close_requested {
+        *open = false;
     }
+    choice
 }
