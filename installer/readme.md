@@ -1,14 +1,23 @@
-# Feather 1.1.4 Windows installer
+# Feather 1.2.0 Windows installer
 
-Share `dist/Feather-1.1.4-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.2.0-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
 - Installs CLI + GUI under `%LOCALAPPDATA%\Programs\Feather`.
-- Adds this folder to the **user PATH**, preserving existing entries.
+- Puts this folder **first** on the **user PATH**, preserving existing entries.
+  Appending let an older per-user copy (for example
+  `%USERPROFILE%\.cargo\bin\feather.exe`) keep winning after an update; an entry
+  an earlier release appended at the end is moved to the front.
 - Creates Start-menu and desktop shortcuts.
 - Registers **Open Feather here** for folders, folder backgrounds and desktop.
   On Windows 11 it may appear under **Show more options**.
+- Repairs that menu automatically: when Feather starts and the registered
+  executable no longer exists (an update that moved it, or a verification copy
+  that registered itself), the entry is repointed at the running install. A copy
+  launched from `%TEMP%` refuses to register at all unless
+  `FEATHER_ALLOW_TRANSIENT_CONTEXT_MENU=1` is set, so a release check can never
+  hijack a user's shortcut.
 - Offers to launch Feather; each friend adds their own URL/key/models via **+ Add API**.
 - Uninstall removes its PATH entry when the installer added it and removes menu
   entries. It preserves the user's `.feather` data/configuration.
@@ -77,6 +86,14 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.2.0 rebuilds every dialog on one native card shell. Picker, settings and
+  form windows now share a 16px-radius sheet with a wide soft shadow, fade-ended
+  hairlines instead of hard borders, hover-washed rows with check marks, and a
+  pinned footer that keeps its actions inside the card at every supported window
+  size. The page-wide scrim is gone: each sheet paints its own veil, so stacked
+  dialogs no longer double-dim. Behaviour is unchanged — the same labels,
+  keybindings and flows, plus one fix: dismissing the Add API card mid sign-in is
+  blocked, because that card is the only place its progress and errors appear.
 - 1.1.4 fixes why 1.1.3 still compacted on every turn. 1.1.3 changed the kept-span
   arithmetic, but the cut point itself was wrong in three ways. (1) The budget cut
   was clamped back to the newest plain answer, so a session whose only answer sat

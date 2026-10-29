@@ -1,5 +1,5 @@
 param(
-    [string]$Installer = 'dist/Feather-1.1.4-Setup-x64.exe',
+    [string]$Installer = 'dist/Feather-1.2.0-Setup-x64.exe',
     [switch]$BinariesOnly
 )
 # Developer/local deployment only. Keep any running GUI alive; a locked EXE can
@@ -42,6 +42,13 @@ foreach ($dir in $dirs) {
 }
 $pathOk = [Environment]::GetEnvironmentVariable('Path','User').Split(';') -contains $app
 Write-Output "User PATH contains installed app: $pathOk"
+# An older per-user shim (e.g. %USERPROFILE%\.cargo\bin\feather.exe) earlier on
+# PATH would keep running after an update. The installer puts {app} first; say
+# so loudly when this machine still resolves elsewhere.
+$shadow = $env:Path.Split(';') | Where-Object {
+    $_ -and ($_.TrimEnd('\') -ne $app.TrimEnd('\')) -and (Test-Path (Join-Path $_ 'feather.exe'))
+} | Select-Object -First 1
+if ($shadow) {Write-Output "WARNING: another feather.exe is on PATH: $shadow"} else {Write-Output 'No shadowing feather.exe on PATH'}
 $explorerCommand = (Get-Item 'HKCU:/Software/Classes/Directory/Background/shell/FeatherGUI/command').GetValue('')
 Write-Output "Explorer command: $explorerCommand"
 if (-not $BinariesOnly) {Get-FileHash $Installer | Format-List}

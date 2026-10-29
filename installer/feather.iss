@@ -1,6 +1,6 @@
 ; Build with Inno Setup 6: ISCC installer\Feather.iss
 ; Strict allowlist: no home directory, databases, models, auth or sessions.
-#define AppVersion "1.1.4"
+#define AppVersion "1.2.0"
 [Setup]
 AppId={{BA63A0FA-5EDB-4C50-923B-56FEA51D6168}
 AppName=Feather
@@ -201,16 +201,50 @@ begin
   for I := 0 to GetArrayLength(Parts)-1 do
     if CompareText(RemoveBackslashUnlessRoot(Trim(Parts[I])), RemoveBackslashUnlessRoot(Entry)) = 0 then begin Result := True; Exit; end;
 end;
+
+function PathStartsWith(Value, Entry: String): Boolean;
+var First: String;
+begin
+  First := Value;
+  if Pos(';', First) > 0 then First := Copy(First, 1, Pos(';', First) - 1);
+  Result := CompareText(RemoveBackslashUnlessRoot(Trim(First)),
+    RemoveBackslashUnlessRoot(Entry)) = 0;
+end;
+
+function RemovePathEntry(Value, Entry: String): String;
+var Parts: TArrayOfString; I: Integer;
+begin
+  Result := '';
+  Parts := SplitString(Value, ';');
+  for I := 0 to GetArrayLength(Parts)-1 do
+    if CompareText(RemoveBackslashUnlessRoot(Trim(Parts[I])),
+      RemoveBackslashUnlessRoot(Entry)) <> 0 then begin
+      if Trim(Parts[I]) <> '' then begin
+        if Result <> '' then Result := Result + ';';
+        Result := Result + Trim(Parts[I]);
+      end;
+    end;
+end;
+
+{ Put the install directory first on the user PATH. Appending let an older
+  per-user shim (for example a `cargo install` copy in %USERPROFILE%\.cargo\bin,
+  which is normally early on PATH) keep shadowing the freshly installed binaries:
+  after an update, `feather` still ran the stale build. Prepending makes the
+  release win regardless of what else is on PATH, including an entry an earlier
+  version appended at the end. }
 procedure CurStepChanged(CurStep: TSetupStep);
-var Value, AppDir: String;
+var Value, AppDir: String; HadEntry: Boolean;
 begin
   if CurStep = ssPostInstall then begin
     AppDir := ExpandConstant('{app}');
     RegQueryStringValue(HKCU, 'Environment', 'Path', Value);
-    if not ContainsPath(Value, AppDir) then begin
-      if (Value <> '') and (Value[Length(Value)] <> ';') then Value := Value + ';';
-      if RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Value + AppDir) then
-        RegWriteStringValue(HKCU, 'Software\Feather\Installer', 'AddedPath', AppDir);
+    HadEntry := ContainsPath(Value, AppDir);
+    if not PathStartsWith(Value, AppDir) then begin
+      Value := RemovePathEntry(Value, AppDir);
+      if Value <> '' then Value := ';' + Value;
+      if RegWriteExpandStringValue(HKCU, 'Environment', 'Path', AppDir + Value) then
+        if not HadEntry then
+          RegWriteStringValue(HKCU, 'Software\Feather\Installer', 'AddedPath', AppDir);
     end;
     { The prereq page allows "skip": say plainly, at the end, what will not
       work — before the user meets it as a failed tool call. Silent installs

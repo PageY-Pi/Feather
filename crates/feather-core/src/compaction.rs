@@ -290,6 +290,104 @@ pub fn without_thinking(messages: &[Message]) -> Vec<Message> {
         })
         .collect()
 }
+
+/// Text a repaired context puts where a result is missing. Short on purpose:
+/// it is a bookkeeping row, not a finding.
+pub const REPAIRED_RESULT: &str = "(result missing: context repaired)";
+
+/// Force tool-call/tool-result pairing back to something a provider accepts.
+///
+/// Every OpenAI-compatible API requires each `tool` message to answer the
+/// `tool_calls` assistant directly before it, and Anthropic requires each
+/// `tool_use` to be answered by the next message. A linear context can lose
+/// that shape — a cut between a call and its result, a compaction that opened
+/// the kept span on a result, a resume of a session written by a buggy build —
+/// and then every request 400s: "Messages with role 'tool' must be a response
+/// to a preceding message with 'tool_calls'". The failure is permanent, model
+/// switches do not help, and the session looks bricked.
+///
+/// Repairs in one pass, dropping nothing else:
+/// * a tool result whose call is gone is **removed** (its content is already
+///   summarized or was never part of a call the model can see),
+/// * a call that never got a result before the next message is **closed** with
+///   a synthetic error result so the call is not left dangling.
+///
+/// Returns the number of messages changed. The durable raw audit is not
+/// touched; callers report the count instead of failing silently.
+pub fn repair_tool_pairs(messages: &mut Vec<Message>) -> usize {
+    // Ordered, not a set: synthetic results must land in call order, and the
+    // repaired list has to hash the same way on every run (prompt cache).
+    let mut open: Vec<(String, String)> = Vec::new(); // (call id, tool name)
+    let mut keep: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut repaired = 0usize;
+    for message in std::mem::take(messages) {
+        if message.role != Role::ToolResult && !open.is_empty() {
+            for (id, name) in std::mem::take(&mut open) {
+                keep.push(Message::tool_result(id, name, REPAIRED_RESULT, true));
+                repaired += 1;
+            }
+        }
+        match message.role {
+            Role::ToolResult => {
+                let id = message.tool_call_id.clone().unwrap_or_default();
+                match open.iter().position(|(call, _)| *call == id) {
+                    Some(index) => {
+                        open.remove(index);
+                        keep.push(message);
+                    }
+                    // call summarized away or never existed: the result alone
+                    // is what providers reject
+                    None => repaired += 1,
+                }
+            }
+            Role::Assistant => {
+                for call in message.iter_tool_calls() {
+                    open.push((call.id.clone(), call.name.clone()));
+                }
+                keep.push(message);
+            }
+            _ => keep.push(message),
+        }
+    }
+    // A context that ends on an unanswered call is the same 400 one message
+    // later, so close the tail too.
+    for (id, name) in open.drain(..) {
+        keep.push(Message::tool_result(id, name, REPAIRED_RESULT, true));
+        repaired += 1;
+    }
+    *messages = keep;
+    repaired
+}
+
+/// Read-only pre-check for [`repair_tool_pairs`]: `true` when the context would
+/// change. Allocates nothing but the call stack, so hot paths (every prompt,
+/// every model switch) can skip taking ownership of a valid history.
+pub fn has_broken_tool_pairs(messages: &[Message]) -> bool {
+    let mut open: Vec<&str> = Vec::new();
+    for message in messages {
+        if message.role != Role::ToolResult && !open.is_empty() {
+            return true;
+        }
+        match message.role {
+            Role::ToolResult => {
+                let id = message.tool_call_id.as_deref().unwrap_or_default();
+                match open.iter().position(|call| *call == id) {
+                    Some(index) => {
+                        open.remove(index);
+                    }
+                    None => return true,
+                }
+            }
+            Role::Assistant => {
+                for call in message.iter_tool_calls() {
+                    open.push(call.id.as_str());
+                }
+            }
+            _ => {}
+        }
+    }
+    !open.is_empty()
+}
 /// Find the cut point: the index of the first message of the kept span.
 ///
 /// Walks backwards accumulating token estimates; when the budget is hit the
@@ -426,6 +524,20 @@ fn plan_cut_with(
         if clamped > 0 && (protect_answer_span || added) {
             cut = clamped;
         }
+    }
+    // A kept span may never open on a tool result: the `tool_calls` assistant
+    // that owns it would stay behind in the summarized prefix, and providers
+    // reject a `tool` message with no assistant `tool_calls` before it
+    // (OpenAI-compatible APIs 400 the session from then on). Snap back onto the
+    // owning assistant message — the pair then stays whole inside the kept
+    // span. Reaching index 0 means no owning call is left in the list; callers
+    // treat a zero cut as "nothing to summarize".
+    while cut > 0
+        && messages
+            .get(cut)
+            .is_some_and(|m| matches!(m.role, Role::ToolResult))
+    {
+        cut -= 1;
     }
     cut
 }
@@ -819,5 +931,165 @@ mod tests {
             "kept context {kept} is not a working context (budget {keep}, ceiling {ceiling}, cut={cut} of {})",
             msgs.len()
         );
+    }
+
+    /// Every tool result in the kept span must have its call inside the span too.
+    fn assert_pairs_whole(messages: &[Message], cut: usize, keep: &str) {
+        let mut open = std::collections::HashSet::new();
+        for (offset, m) in messages[cut..].iter().enumerate() {
+            match m.role {
+                Role::Assistant => {
+                    for c in m.iter_tool_calls() {
+                        open.insert(c.id.clone());
+                    }
+                }
+                Role::ToolResult => {
+                    let id = m.tool_call_id.clone().unwrap_or_default();
+                    assert!(
+                        open.remove(&id),
+                        "{keep}: kept span opens with tool result {id} at +{offset} (cut={cut}); \\
+                         providers reject a `tool` message without its `tool_calls` assistant"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The budget cut walks backwards until the keep budget is spent and then
+    /// used to stop exactly where it landed. In a tool loop that is half the
+    /// time a tool result, so the rewritten context started with a `tool`
+    /// message whose `tool_calls` assistant had just been summarized away.
+    /// OpenAI-compatible providers reject that body ("Messages with role 'tool'
+    /// must be a response to a preceding message with 'tool_calls'") — the
+    /// session then 400s on every later turn, including after a model switch.
+    #[test]
+    fn budget_cut_never_opens_on_a_tool_result() {
+        let mut msgs = vec![Message::user_text("old question"), asst("EARLY ANSWER")];
+        for round in 0..6 {
+            msgs.push(Message::user_text(format!("job {round}")));
+            for q in 0..12 {
+                msgs.push(Message::assistant(
+                    vec![ContentBlock::ToolCall(crate::message::ToolCall {
+                        id: format!("c{round}-{q}"),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "x".repeat(120)}),
+                    })],
+                    "m",
+                    Api::Faux,
+                    Usage::default(),
+                    StopReason::ToolUse,
+                ));
+                msgs.push(Message::tool_result(
+                    format!("c{round}-{q}"),
+                    "bash",
+                    "y".repeat(600),
+                    false,
+                ));
+            }
+        }
+        for keep in (0..40_000).step_by(97) {
+            let cut = plan_cut_budget(&msgs, keep);
+            // the checker and the repair must agree: callers skip the copy on
+            // the strength of this one pass alone
+            assert!(!has_broken_tool_pairs(&msgs[cut..]), "budget keep={keep}");
+            assert_pairs_whole(&msgs, cut, &format!("budget keep={keep}"));
+        }
+        for keep in (0..40_000).step_by(997) {
+            let cut = plan_cut_without_thinking(&msgs, keep);
+            assert!(
+                !has_broken_tool_pairs(&msgs[cut..]),
+                "display-first keep={keep}"
+            );
+            assert_pairs_whole(&msgs, cut, &format!("display-first keep={keep}"));
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolCall(crate::message::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+        })
+    }
+
+    /// A healthy context is left byte-for-byte alone — the repair must never
+    /// rewrite history just for passing through.
+    #[test]
+    fn repair_leaves_paired_context_untouched() {
+        let mut msgs = vec![
+            Message::user_text("go"),
+            Message::assistant(
+                vec![tool_call("a", "read"), tool_call("b", "read")],
+                "m",
+                Api::Faux,
+                Usage::default(),
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("a", "read", "first", false),
+            Message::tool_result("b", "read", "second", false),
+            asst("done"),
+        ];
+        let before = msgs.clone();
+        assert!(!has_broken_tool_pairs(&msgs));
+        assert_eq!(repair_tool_pairs(&mut msgs), 0);
+        assert_eq!(msgs.len(), before.len());
+        for (after, before) in msgs.iter().zip(before.iter()) {
+            assert_eq!(after.to_string(), before.to_string());
+        }
+    }
+
+    /// The session state one compaction bug left behind: the summary is in
+    /// front, the assistant that made the call was summarized away, and the
+    /// result is still there. Every request 400s until this is dropped.
+    #[test]
+    fn repair_drops_tool_results_whose_call_is_gone() {
+        let mut msgs = vec![
+            summary_message("summary", &[], &[]),
+            Message::tool_result("call_00_gone", "bash", "395: chosen_preset = ...", false),
+            asst("carrying on"),
+        ];
+        assert!(has_broken_tool_pairs(&msgs));
+        assert_eq!(repair_tool_pairs(&mut msgs), 1);
+        assert!(!msgs.iter().any(|m| m.role == Role::ToolResult));
+        assert!(!has_broken_tool_pairs(&msgs));
+        // and it is stable: repairing a repaired context changes nothing
+        assert_eq!(repair_tool_pairs(&mut msgs), 0);
+    }
+
+    /// A call the model never got a result for is the mirror-image 400
+    /// (Anthropic: `tool_use` without `tool_result`), so the repair closes it
+    /// in call order instead of leaving it dangling.
+    #[test]
+    fn repair_closes_calls_that_never_got_a_result() {
+        let mut msgs = vec![
+            Message::user_text("go"),
+            Message::assistant(
+                vec![tool_call("a", "read"), tool_call("b", "bash")],
+                "m",
+                Api::Faux,
+                Usage::default(),
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("b", "bash", "ran", false),
+            Message::user_text("next"),
+        ];
+        assert!(has_broken_tool_pairs(&msgs));
+        assert_eq!(repair_tool_pairs(&mut msgs), 1);
+        assert!(!has_broken_tool_pairs(&msgs));
+        let ids: Vec<String> = msgs
+            .iter()
+            .filter(|m| m.role == Role::ToolResult)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["b".to_string(), "a".to_string()]);
+        // the synthetic row is marked as an error, never as content
+        let synthetic = msgs
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("a"))
+            .unwrap();
+        assert!(synthetic.is_error);
+        assert_eq!(synthetic.text(), REPAIRED_RESULT);
+        assert_eq!(repair_tool_pairs(&mut msgs), 0);
     }
 }

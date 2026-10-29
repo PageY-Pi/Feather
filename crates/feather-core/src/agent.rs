@@ -524,6 +524,11 @@ impl Agent {
         self.config = config;
         self.provider = provider;
         self.tools = tools;
+        // A model switch is exactly when a broken pairing surfaces: the next
+        // request goes to a provider that rejects a `tool` message with no
+        // `tool_calls` parent, and the session looks permanently bricked. Repair
+        // here so switching models can never carry the defect forward.
+        self.session.repair_context("model switch");
     }
 
     /// pi's /fork: continue in a copy of the session (fresh id, same
@@ -576,6 +581,11 @@ impl Agent {
     /// Supervisor has reset abort before accepting the prompt. Do not reset
     /// again: an abort received between acceptance and first poll must survive.
     pub async fn prompt_message_prepared(&mut self, msg: Message) -> Result<RunResult, AgentError> {
+        // Before the new prompt lands: the context must end on a complete
+        // call/result pair. Repairing after this message would push a tool
+        // result behind a user message, which providers reject in the opposite
+        // direction. One cheap pass, and a no-op when the context is valid.
+        self.session.repair_context("prompt");
         self.session.push(msg)?;
         let mut result = self.run_inner().await?;
         // follow-up queue: run each queued message as its own run
@@ -1105,6 +1115,10 @@ impl Agent {
         let turn = self.session.commit_turn()?;
         for diagnostic in self.session.take_runtime_diagnostics() {
             let _ = self.events.send(AgentEvent::Notice(diagnostic));
+        }
+        // Repairs are user-facing only: never fed back to the model.
+        for note in self.session.take_notes() {
+            let _ = self.events.send(AgentEvent::Notice(note));
         }
         if let Some(store) = self.session.transcript_store() {
             if let Ok(count) = store.raw_len() {

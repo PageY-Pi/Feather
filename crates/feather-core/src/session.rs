@@ -39,7 +39,14 @@ pub struct Session {
     first_prompt: String,
     /// Cumulative usage across the whole session (incl. compaction calls).
     total_usage: Usage,
+    /// Host-side problems the *model* has to know about (skipped checkpoint
+    /// paths). Injected into the context as a `<feather-runtime-diagnostic>`
+    /// user message on the next turn.
     runtime_diagnostics: Vec<String>,
+    /// Repair bookkeeping the *user* has to know about. Never enters the model
+    /// context: a repaired call/result pairing is not something to instruct a
+    /// model about, it is a notice that the session was healed.
+    notes: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +63,17 @@ pub enum SessionError {
     Catalog(String),
     #[error("git checkpoint: {0}")]
     Git(String),
+}
+
+/// One-line note for a repaired context. It rides [`Session::notes`], which is
+/// flushed to the UI as a Notice on the next committed turn — user-visible,
+/// never fed back to the model — so a repaired session is not silently
+/// rewritten.
+fn repaired_context_diagnostic(changed: usize, source: &str) -> String {
+    format!(
+        "context repaired ({source}): {changed} tool message(s) re-paired so the next request is \
+         accepted; the raw transcript keeps everything"
+    )
 }
 
 impl Session {
@@ -95,6 +113,7 @@ impl Session {
             first_prompt: String::new(),
             total_usage: Usage::default(),
             runtime_diagnostics: Vec::new(),
+            notes: Vec::new(),
         };
         session.register_catalog()?;
         Ok(session)
@@ -131,6 +150,7 @@ impl Session {
             first_prompt: String::new(),
             total_usage: Usage::default(),
             runtime_diagnostics: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -192,7 +212,7 @@ impl Session {
         let turn = snapshots.current_turn()?;
         // Rebuild the linear list from the durable current snapshot when
         // available (crash-resume: the tail after the snapshot is discarded).
-        let messages = if turn > 0 {
+        let mut messages = if turn > 0 {
             match snapshots.load(turn) {
                 Ok(m) => m,
                 Err(e) => {
@@ -208,6 +228,15 @@ impl Session {
         } else {
             Vec::new()
         };
+        // A snapshot written by a build whose compaction cut between a tool
+        // call and its result reopens every request as a 400 (a `tool` message
+        // with no `tool_calls` assistant before it). Repair on load, once, so
+        // the session is usable instead of bricked.
+        let mut notes = Vec::new();
+        let repaired = crate::compaction::repair_tool_pairs(&mut messages);
+        if repaired > 0 {
+            notes.push(repaired_context_diagnostic(repaired, "resume"));
+        }
         let mut total_usage = Usage::default();
         for m in &messages {
             if let Some(u) = m.usage {
@@ -233,6 +262,7 @@ impl Session {
             first_prompt,
             total_usage,
             runtime_diagnostics: Vec::new(),
+            notes,
         };
         session.refresh_context_metrics();
         session.register_catalog()?;
@@ -336,6 +366,12 @@ impl Session {
 
     pub fn take_runtime_diagnostics(&mut self) -> Vec<String> {
         std::mem::take(&mut self.runtime_diagnostics)
+    }
+    /// User-facing notes (currently: a repaired context). Never injected into
+    /// the model context — see [`Session::runtime_diagnostics`] for the
+    /// provider-visible channel.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
     /// Append a message to the linear list and the raw redb audit history.
     pub fn push(&mut self, msg: Message) -> Result<(), SessionError> {
@@ -482,6 +518,11 @@ impl Session {
         // prompt) restores `turn`, not the newest snapshot the store still
         // holds for forward history.
         snapshots.set_current(turn)?;
+        // A snapshot from before the repair fix can carry a tool result whose
+        // call is gone. Rewind restores the snapshot verbatim (that is its
+        // contract, and `/rewind N` must show exactly what turn N held); the
+        // repair runs before the next request instead — see
+        // [`Session::repair_context`] and its call sites.
         let discarded = std::mem::replace(&mut self.messages, std::sync::Arc::new(msgs));
         self.refresh_context_metrics();
         self.turn = turn;
@@ -499,8 +540,42 @@ impl Session {
 
     /// Kernel-internal seam used by compaction: swap the linear list without
     /// touching the raw audit history (originals stay durable in redb).
-    pub fn set_messages_for_compaction(&mut self, msgs: Vec<Message>) {
+    pub fn set_messages_for_compaction(&mut self, mut msgs: Vec<Message>) {
+        // Compaction is the one place that rewrites the whole context. Install
+        // it only in a shape providers accept: a kept span that opens on a tool
+        // result (call summarized away) makes every later request a 400.
+        let repaired = crate::compaction::repair_tool_pairs(&mut msgs);
+        if repaired > 0 {
+            self.notes
+                .push(repaired_context_diagnostic(repaired, "compaction"));
+        }
         self.messages = std::sync::Arc::new(msgs);
+        self.refresh_context_metrics();
+    }
+
+    /// Repair tool call/result pairing on the live context. Idempotent, and a
+    /// no-op that does not touch the messages when they are already valid, so
+    /// callers can run it before every request.
+    pub fn repair_context(&mut self, source: &str) {
+        if !crate::compaction::has_broken_tool_pairs(&self.messages) {
+            return;
+        }
+        // Only pay for the copy when there is something to repair: the live
+        // history is shared with in-flight requests, and cloning it on every
+        // prompt is exactly the copy-on-write this list is designed to avoid.
+        let mut messages = match std::sync::Arc::try_unwrap(std::mem::replace(
+            &mut self.messages,
+            std::sync::Arc::new(Vec::new()),
+        )) {
+            Ok(owned) => owned,
+            Err(shared) => shared.as_ref().clone(),
+        };
+        let repaired = crate::compaction::repair_tool_pairs(&mut messages);
+        self.messages = std::sync::Arc::new(messages);
+        if repaired > 0 {
+            self.notes
+                .push(repaired_context_diagnostic(repaired, source));
+        }
         self.refresh_context_metrics();
     }
 
