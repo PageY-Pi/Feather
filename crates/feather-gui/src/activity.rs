@@ -36,6 +36,42 @@ pub fn orbit(ui: &mut egui::Ui, size: f32, now: f64) {
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(33));
 }
+/// A quiet breathing marker for a live reasoning section. The pulse stays in the
+/// header so expanding/collapsing never causes layout jitter.
+pub fn pulse_in(ui: &mut egui::Ui, rect: egui::Rect, now: f64, color: egui::Color32) {
+    let phase = (now.rem_euclid(1.25) / 1.25 * TAU as f64) as f32;
+    let breath = (phase.sin() + 1.0) * 0.5;
+    let center = egui::pos2(rect.right() - 12.0, rect.center().y);
+    let radius = 2.2 + breath * 1.6;
+    ui.painter()
+        .circle_filled(center, radius, color.gamma_multiply(0.72 + breath * 0.28));
+    ui.painter().circle_stroke(
+        center,
+        radius + 2.0 + breath * 2.0,
+        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.18 + breath * 0.22)),
+    );
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+}
+/// A restrained moving highlight along a running tool card. This is more
+/// informative than blinking the whole card and does not change its height.
+pub fn sweep(ui: &mut egui::Ui, rect: egui::Rect, now: f64, color: egui::Color32) {
+    let left = rect.left() + 12.0;
+    let right = rect.right() - 12.0;
+    if right <= left {
+        return;
+    }
+    let phase = (now.rem_euclid(1.8) / 1.8) as f32;
+    let x = egui::lerp(left..=right, phase);
+    let y = rect.top() + 1.5;
+    ui.painter().line_segment(
+        [egui::pos2(left, y), egui::pos2(right, y)],
+        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.18)),
+    );
+    ui.painter().circle_filled(egui::pos2(x, y), 2.0, color);
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+}
 
 pub fn waiting_card(ui: &mut egui::Ui, now: f64) {
     egui::Frame::none()

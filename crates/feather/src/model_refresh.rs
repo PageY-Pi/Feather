@@ -7,12 +7,19 @@
 //! `config.redb` so a normal start makes no request.
 //!
 //! Ark's OpenAI-compatible `GET /api/coding/v3/models` answers with the whole
-//! platform catalog (137 ids, including retired builds, video, 3D and embedding
-//! models). It is filtered to callable text-generation models:
-//! `status` must not be `Shutdown`/`Retiring`, and the entry must advertise
-//! `TextGeneration`. Measured against a live Coding Plan key, this keeps the
-//! chat models the plan serves — including new releases such as
-//! `deepseek-v4-1-flash-economy` — while dropping media/non-chat entries.
+//! platform catalog (55 ids measured, including retired builds, video, 3D and
+//! embedding models). It is filtered to callable text-generation models:
+//! `status` must not be `Shutdown`/`Retiring`, the entry must advertise a text
+//! generation task, and its id must fold onto a documented plan model.
+//!
+//! Two quirks of that payload are load-bearing and were both wrong once:
+//! * The chat models are split across two `domain` values. `LLM` holds the
+//!   older families; `VLM` holds every `deepseek-v4.1-flash*` build (including
+//!   `-economy`) and the `doubao-seed-2.x` models. Accepting `LLM` alone hid
+//!   the entire v4.1 family from the picker.
+//! * `task_type` casing varies between entries in the *same* response
+//!   (`TextGeneration` and `text_generation`), so it is compared after folding
+//!   to lowercase alphanumerics.
 //!
 //! Discovery is deliberately conservative:
 //! * Only providers with a known list endpoint are contacted; nothing else is
@@ -47,14 +54,33 @@ struct Endpoint {
     provider: &'static str,
     /// Model-list path appended to the provider's base URL.
     path: &'static str,
+    /// Where this provider keeps the fields in the payload.
+    shape: Shape,
     /// Platform domains that are chat models. Anything else (video, 3D,
     /// embedding, translation) is not selectable as an agent model.
     domains: &'static [&'static str],
     /// Model names the subscription documents as callable, used to collapse a
     /// dated platform build onto the name a client must send. A family with no
     /// documented name is dropped: the platform list is far wider than any one
-    /// subscription.
+    /// subscription. Empty means the platform ids are already callable as-is.
     plan_names: &'static [&'static str],
+}
+
+/// Where a `/models` payload keeps the fields Feather needs.
+///
+/// Every provider invents its own envelope. Inferring the shape from the keys
+/// present looks tempting and fails quietly: a payload that matches nothing
+/// yields an empty catalog, which the refresh treats as "keep what we have".
+/// Declaring the shape per endpoint keeps that failure visible in the source.
+enum Shape {
+    /// Volcengine Ark Coding Plan:
+    /// `token_limits.{context_window,max_output_token_length}`,
+    /// `modalities.input_modalities`, and `domain`/`task_type` for filtering.
+    Ark,
+    /// OpenCode Zen: `limit.{context,output}`, `modalities.input`,
+    /// `type: "chat"`, and a nested `api` map naming the wire endpoint per
+    /// model. Ids there are already the callable names, dated builds included.
+    OpenCode,
 }
 
 /// Ark Coding Plan model names, from the plan's own "模型配置" documentation.
@@ -77,12 +103,32 @@ const ARK_CODING_PLAN: &[&str] = &[
     "kimi-k3",
 ];
 
-const ENDPOINTS: &[Endpoint] = &[Endpoint {
-    provider: "volcengine-plan",
-    path: "/models",
-    domains: &["LLM"],
-    plan_names: ARK_CODING_PLAN,
-}];
+const ENDPOINTS: &[Endpoint] = &[
+    Endpoint {
+        provider: "volcengine-plan",
+        path: "/models",
+        shape: Shape::Ark,
+        // Ark files its multimodal text models under `VLM`, not `LLM`: every
+        // `deepseek-v4.1-flash*` build (including `-economy`) and the
+        // `doubao-seed-2.x` chat models report `VLM`. Filtering on `LLM` alone
+        // hid them, which is why the economy tier never reached the picker.
+        domains: &["LLM", "VLM"],
+        plan_names: ARK_CODING_PLAN,
+    },
+    Endpoint {
+        // The Go tier answers `/models` and `/chat/completions` on the same
+        // base; the console-inference tier (`/inference/...`) has no model list
+        // and rejects a Go key, so this is the only usable base URL.
+        provider: "opencode-go",
+        path: "/models",
+        shape: Shape::OpenCode,
+        domains: &[],
+        // Zen ids are already the callable names (`deepseek-v4.1-flash`), with
+        // no dated build suffix to fold, so nothing may be dropped for being
+        // undocumented — a new tier model must appear without a Feather release.
+        plan_names: &[],
+    },
+];
 
 /// One discovered model. Limits come from the provider response when present;
 /// everything else uses Feather's provider-wide defaults.
@@ -158,6 +204,10 @@ pub fn cached_models(home: &std::path::Path, provider: &str) -> Vec<models::Mode
 
 /// Whether a `/models` entry is a chat model Feather can drive.
 fn is_chat_model(item: &serde_json::Value, endpoint: &Endpoint) -> bool {
+    match endpoint.shape {
+        Shape::OpenCode => return is_opencode_chat(item),
+        Shape::Ark => {}
+    }
     if matches!(item["status"].as_str(), Some("Shutdown" | "Retiring")) {
         return false;
     }
@@ -167,14 +217,61 @@ fn is_chat_model(item: &serde_json::Value, endpoint: &Endpoint) -> bool {
         }
     }
     // `task_type` is absent on a few older entries that are still callable, so
-    // only reject when it is present and excludes text generation.
+    // only reject when it is present and excludes text generation. Ark mixes
+    // shapes across entries in one response — `TextGeneration` on some,
+    // `text_generation` on others — so compare on a normalized form.
     match item["task_type"].as_array() {
-        Some(tasks) if !tasks.is_empty() => tasks
-            .iter()
-            .filter_map(|t| t.as_str())
-            .any(|t| t == "TextGeneration" || t == "VisualQuestionAnswering"),
+        Some(tasks) if !tasks.is_empty() => tasks.iter().filter_map(|t| t.as_str()).any(|t| {
+            matches!(
+                task_kind(t).as_str(),
+                "textgeneration" | "visualquestionanswering"
+            )
+        }),
         _ => true,
     }
+}
+
+/// Zen classifies its own entries, and only some of them speak Chat Completions.
+///
+/// `type` separates chat from image/video/embedding entries. The nested `api`
+/// map then names the wire endpoint per model: the OpenAI SDK package there is
+/// `@ai-sdk/openai` for Responses-only entries and
+/// `@ai-sdk/openai-compatible` for Chat Completions ones. Feather drives
+/// OpenAI-compatible chat, so a model without a `chat-completions` entry would
+/// be offered and then fail on first use.
+fn is_opencode_chat(item: &serde_json::Value) -> bool {
+    if let Some(kind) = item["type"].as_str().filter(|t| !t.is_empty()) {
+        if kind != "chat" {
+            return false;
+        }
+    }
+    item["api"]["chat-completions"].is_object()
+}
+
+/// Fold a published input modality onto Feather's coarse vocabulary.
+///
+/// Ark already publishes `text`/`image`, so this is a no-op there; Zen
+/// publishes MIME types (`image/jpeg`, `image/webp`), which the rest of the
+/// codebase would not recognize as image support.
+fn normalize_modality(value: &str) -> String {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.starts_with("image") {
+        "image".to_string()
+    } else if lower.starts_with("text") {
+        "text".to_string()
+    } else {
+        lower
+    }
+}
+
+/// Fold a `task_type` value to a comparable form: lowercase, no separators, so
+/// `TextGeneration`, `text_generation` and `textGeneration` all agree.
+fn task_kind(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// Compare two model names ignoring dashes, dots and case, so a platform's
@@ -219,17 +316,19 @@ fn accept(payload: &serde_json::Value, endpoint: &Endpoint) -> Vec<Discovered> {
         .unwrap_or_default();
     let mut out: Vec<Discovered> = Vec::new();
     for item in items.iter().filter(|i| is_chat_model(i, endpoint)) {
-        let Some(id) = item["id"].as_str().filter(|id| !id.is_empty()) else {
+        let Some(raw_id) = item["id"].as_str().filter(|id| !id.is_empty()) else {
             continue;
         };
         // A platform entry carries a dated, dash-separated build suffix
         // (`deepseek-v4-1-flash-economy-261017`). Returned ids must be the
         // callable model name the provider accepts, and one family must appear
         // once: dated builds are folded into their family name and the newest
-        // build wins.
-        let family = family_name(id, endpoint.plan_names);
-        let Some(id) = family else {
-            continue;
+        // build wins. An endpoint that documents no names takes ids verbatim —
+        // those already are the callable names.
+        let id = match family_name(raw_id, endpoint.plan_names) {
+            Some(family) => family,
+            None if endpoint.plan_names.is_empty() => raw_id.to_string(),
+            None => continue,
         };
         // Ark reuses the platform id as the display name for some models
         // (`deepseek-v4-1-flash-economy`), which reads poorly beside the named
@@ -244,20 +343,44 @@ fn accept(payload: &serde_json::Value, endpoint: &Endpoint) -> Vec<Discovered> {
         } else {
             id.clone()
         };
-        let limits = &item["token_limits"];
-        let build = limits["context_window"].as_u64().unwrap_or(0);
+        // Where the limits and input modalities live depends on the provider.
+        let (context_window, max_tokens) = match endpoint.shape {
+            Shape::Ark => (
+                item["token_limits"]["context_window"].as_u64(),
+                item["token_limits"]["max_output_token_length"].as_u64(),
+            ),
+            Shape::OpenCode => (
+                item["limit"]["context"].as_u64(),
+                item["limit"]["output"].as_u64(),
+            ),
+        };
+        let published = match endpoint.shape {
+            Shape::Ark => &item["modalities"]["input_modalities"],
+            Shape::OpenCode => &item["modalities"]["input"],
+        };
+        let build = context_window.unwrap_or(0);
+        // Feather's `input` vocabulary is coarse (`text`, `image`) and the rest
+        // of the codebase tests those exact strings. Zen publishes MIME types
+        // (`image/jpeg`), so a folded set is the only one that keeps vision
+        // detection working.
+        let mut input: Vec<String> = Vec::new();
+        for value in published
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+        {
+            let modality = normalize_modality(value);
+            if !input.contains(&modality) {
+                input.push(modality);
+            }
+        }
         let entry = Discovered {
             id,
             name: Some(name),
-            context_window: limits["context_window"].as_u64(),
-            max_tokens: limits["max_output_token_length"].as_u64(),
-            input: item["modalities"]["input_modalities"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.as_str())
-                .map(str::to_string)
-                .collect(),
+            context_window,
+            max_tokens,
+            input,
         };
         match out.iter_mut().find(|existing| existing.id == entry.id) {
             Some(existing) => {
@@ -358,29 +481,39 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const ENDPOINT: Endpoint = Endpoint {
-        provider: "volcengine-plan",
-        path: "/models",
-        domains: &["LLM"],
-        plan_names: ARK_CODING_PLAN,
-    };
+    /// The production endpoint, not a copy: a duplicated literal here is how a
+    /// wrong `domains` list kept the suite green while the real catalog hid the
+    /// whole v4.1 family.
+    fn endpoint() -> &'static Endpoint {
+        &ENDPOINTS[0]
+    }
 
     /// Trimmed from a live `/api/coding/v3/models` response: retired builds, a
     /// video model, an embedding model and two builds of one family are all
     /// present, as they are upstream.
+    ///
+    /// Field shapes are copied from the live payload rather than tidied up:
+    /// Ark files `deepseek-v4.1-flash*` and the `doubao-seed-2.x` chat models
+    /// under `VLM`, and it mixes `TextGeneration` with `text_generation` across
+    /// entries in the same response. A cleaner fixture hid both quirks and let
+    /// the whole v4.1 family disappear from the real catalog unnoticed.
     fn payload() -> serde_json::Value {
         json!({"data":[
-            {"id":"deepseek-v4-1-flash-economy-261017","name":"deepseek-v4-1-flash-economy","domain":"LLM",
-             "task_type":["TextGeneration"],"modalities":{"input_modalities":["text"]},
+            // Economy tier: VLM domain, snake_case task types.
+            {"id":"deepseek-v4-1-flash-economy-261017","name":"deepseek-v4-1-flash-economy","domain":"VLM",
+             "status":"Published","task_type":["text_generation"],
+             "modalities":{"input_modalities":["text","image"]},
              "token_limits":{"context_window":1048576,"max_output_token_length":393216}},
-            {"id":"deepseek-v4-1-flash-260910","name":"deepseek-v4-1-flash","domain":"LLM",
-             "task_type":["TextGeneration"],"modalities":{"input_modalities":["text"]},
+            {"id":"deepseek-v4-1-flash-260910","name":"deepseek-v4-1-flash","domain":"VLM",
+             "status":"Published","task_type":["text_generation"],
+             "modalities":{"input_modalities":["text"]},
              "token_limits":{"context_window":524288,"max_output_token_length":32768}},
-            {"id":"deepseek-v4-1-flash-261017","name":"deepseek-v4-1-flash","domain":"LLM",
-             "task_type":["TextGeneration"],"modalities":{"input_modalities":["text"]},
+            {"id":"deepseek-v4-1-flash-261017","name":"deepseek-v4-1-flash","domain":"VLM",
+             "status":"Published","task_type":["text_generation"],
+             "modalities":{"input_modalities":["text"]},
              "token_limits":{"context_window":1048576,"max_output_token_length":393216}},
-            {"id":"doubao-seed-2-1-pro-260915","name":"doubao-seed-2-1-pro","domain":"LLM",
-             "task_type":["VisualQuestionAnswering","TextGeneration"],
+            {"id":"doubao-seed-2-1-pro-260915","name":"doubao-seed-2-1-pro","domain":"VLM",
+             "status":"Published","task_type":["text_generation","visual_question_answering"],
              "modalities":{"input_modalities":["text","image"]},
              "token_limits":{"context_window":1048576,"max_output_token_length":262144}},
             {"id":"glm-5-3-flash-260828","name":"glm-5-3-flash","domain":"LLM",
@@ -404,7 +537,7 @@ mod tests {
 
     #[test]
     fn keeps_callable_plan_models_and_drops_retired_media_and_undocumented_ones() {
-        let models = accept(&payload(), &ENDPOINT);
+        let models = accept(&payload(), endpoint());
         // Retired builds, media models and ids the plan does not document
         // (`glm-4-5-air`) are gone; dated builds are folded onto one family.
         assert_eq!(
@@ -426,7 +559,7 @@ mod tests {
 
     #[test]
     fn newest_build_of_a_family_wins() {
-        let models = accept(&payload(), &ENDPOINT);
+        let models = accept(&payload(), endpoint());
         let flash = models
             .iter()
             .find(|m| m.id == "deepseek-v4.1-flash")
@@ -455,9 +588,9 @@ mod tests {
 
     #[test]
     fn unknown_shape_yields_nothing_so_the_cache_is_kept() {
-        assert!(accept(&json!({"data":[]}), &ENDPOINT).is_empty());
-        assert!(accept(&json!({"error":{"code":"AuthenticationError"}}), &ENDPOINT).is_empty());
-        assert!(accept(&json!("not json"), &ENDPOINT).is_empty());
+        assert!(accept(&json!({"data":[]}), endpoint()).is_empty());
+        assert!(accept(&json!({"error":{"code":"AuthenticationError"}}), endpoint()).is_empty());
+        assert!(accept(&json!("not json"), endpoint()).is_empty());
     }
 
     fn cached_home(models: Vec<Discovered>) -> std::path::PathBuf {
@@ -477,7 +610,7 @@ mod tests {
 
     #[test]
     fn cached_models_become_reasoning_catalog_entries() {
-        let home = cached_home(accept(&payload(), &ENDPOINT));
+        let home = cached_home(accept(&payload(), endpoint()));
         let entries = cached_models(&home, "volcengine-plan");
         assert_eq!(entries.len(), 4);
         assert!(entries.iter().all(|m| m.reasoning));
@@ -496,7 +629,7 @@ mod tests {
             "volcengine-plan",
             Cached {
                 at: now_secs() - MAX_AGE_SECS - 1,
-                models: accept(&payload(), &ENDPOINT),
+                models: accept(&payload(), endpoint()),
             },
         )
         .unwrap();
@@ -504,5 +637,83 @@ mod tests {
         // no request and must not clear what is already cached.
         assert!(refresh_if_stale(&home, false).is_empty());
         assert_eq!(cached_models(&home, "volcengine-plan").len(), 4);
+    }
+
+    /// Trimmed from a live `https://opencode.ai/zen/go/v1/models` response.
+    ///
+    /// Zen's envelope shares nothing with Ark's: limits are under `limit`, input
+    /// modalities under `modalities.input`, and each entry names its wire
+    /// endpoint in a nested `api` map. The Responses-only entry is kept in the
+    /// fixture because Feather cannot drive it and must not offer it.
+    fn opencode_payload() -> serde_json::Value {
+        json!({"object":"list","data":[
+            {
+                "id":"deepseek-v4.1-flash","object":"model","type":"chat",
+                "name":"DeepSeek V4.1 Flash","owned_by":"opencode",
+                "canonical_id":"deepseek/deepseek-v4.1-flash",
+                "api":{"chat-completions":{
+                    "base_url":"https://opencode.ai/inference/go/openai/v1",
+                    "compatibility":{"reasoning_field":"reasoning_content"},
+                    "sdk":{"aisdk":"@ai-sdk/openai-compatible"}
+                }},
+                "capabilities":{"reasoning":{"effort":["low","high","max"],"supported":true}},
+                "limit":{"context":1000000,"output":384000},
+                "modalities":{"input":["text","image/jpeg"],"output":["text"]}
+            },
+            {
+                "id":"muse-spark-1.3-contributor-free","object":"model","type":"chat",
+                "name":"Muse Spark 1.3 Contributor Free","owned_by":"opencode",
+                "api":{"responses":{"sdk":{"aisdk":"@ai-sdk/openai"}}},
+                "limit":{"context":131072,"output":8192},
+                "modalities":{"input":["text"],"output":["text"]}
+            },
+            {
+                "id":"some-image-model","object":"model","type":"image",
+                "name":"Some Image Model","owned_by":"opencode",
+                "api":{"chat-completions":{"sdk":{"aisdk":"@ai-sdk/openai-compatible"}}},
+                "limit":{"context":8192,"output":4096},
+                "modalities":{"input":["text"],"output":["image/png"]}
+            }
+        ]})
+    }
+
+    fn opencode_endpoint() -> &'static Endpoint {
+        ENDPOINTS
+            .iter()
+            .find(|e| e.provider == "opencode-go")
+            .expect("opencode-go must be discovered")
+    }
+
+    #[test]
+    fn opencode_models_are_read_from_zen_fields_and_ids_are_kept_verbatim() {
+        let models = accept(&opencode_payload(), opencode_endpoint());
+        // Only the chat-completions entry survives: the Responses-only model has
+        // no `chat-completions` endpoint and the image model is not `type: chat`.
+        assert_eq!(ids(&models), ["deepseek-v4.1-flash"]);
+        let model = &models[0];
+        // Ids are already the callable names; no documented-name filter may drop
+        // a model the tier actually serves.
+        assert_eq!(model.id, "deepseek-v4.1-flash");
+        assert_eq!(model.name.as_deref(), Some("DeepSeek V4.1 Flash"));
+        assert_eq!(model.context_window, Some(1000000));
+        assert_eq!(model.max_tokens, Some(384000));
+        // Zen publishes MIME types; Feather's rest-of-code vocabulary is
+        // `text`/`image`, so they must be folded or vision reads as unsupported.
+        assert_eq!(model.input, ["text", "image"]);
+    }
+
+    #[test]
+    fn opencode_ids_are_not_folded_onto_a_documented_family() {
+        // An endpoint with no documented names must accept ids verbatim, or a
+        // newly launched model disappears until Feather ships a release.
+        let payload = json!({"data":[{
+            "id":"brand-new-model-261017","type":"chat","name":"Brand New Model",
+            "api":{"chat-completions":{}},"limit":{"context":1000,"output":100},
+            "modalities":{"input":["text"]}
+        }]});
+        assert_eq!(
+            ids(&accept(&payload, opencode_endpoint())),
+            ["brand-new-model-261017"]
+        );
     }
 }

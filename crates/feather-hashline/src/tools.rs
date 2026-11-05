@@ -45,6 +45,32 @@ fn parse_anchor(v: &Value, key: &str) -> Result<Anchor, ToolOutcome> {
     })
 }
 
+/// Prefix for the first output line that names the edited file.
+///
+/// The GUI rebuilds tool cards from the persisted transcript, where the
+/// structured `details` side-channel does not survive. Keeping the path in the
+/// text itself lets a reloaded card name the file exactly like a live one.
+/// The prefix is explicit so parsing is a prefix match, never a guess about
+/// whether a line "looks like a path".
+const FILE_HEADER: &str = "file: ";
+
+/// Name the edited file in the first output line, then the diff body.
+fn with_file_header(path: &std::path::Path, body: String) -> String {
+    format!("{FILE_HEADER}{}\n{body}", path.display())
+}
+
+/// A successful edit outcome that also reports which file it touched.
+///
+/// `details` is a structured side-channel the GUI reads to label a tool card
+/// with the real path — the anchor arguments alone (`remove_from ab3cd`) say
+/// nothing a user can recognize. It is never sent to the model, so the same
+/// path is also written into the text for transcript reloads.
+fn edited(path: &std::path::Path, diff: &[crate::engine::DiffRow]) -> ToolOutcome {
+    let mut out = ToolOutcome::ok(with_file_header(path, render_diff(diff)));
+    out.details = Some(serde_json::json!({ "path": path.display().to_string() }));
+    out
+}
+
 fn render_diff(rows: &[crate::engine::DiffRow]) -> String {
     let mut out = String::new();
     for r in rows {
@@ -179,7 +205,7 @@ Path resolution is anchor-only. Same-file calls in one message batch share one u
             };
             let replacement = get_str(&args, "replacement_lines").unwrap_or_default();
             match self.store.replace_anchors(from, to, &replacement) {
-                Ok((_path, diff)) => ToolOutcome::ok(render_diff(&diff)),
+                Ok((path, diff)) => edited(&path, &diff),
                 Err(e) => engine_out(Err(e)),
             }
         })
@@ -237,7 +263,7 @@ impl AgentTool for ReplaceWithinTool {
             };
             let new = get_str(&args, "replace_new").unwrap_or_default();
             match self.store.replace_within_anchors(from, to, &old, &new) {
-                Ok((_path, diff)) => ToolOutcome::ok(render_diff(&diff)),
+                Ok((path, diff)) => edited(&path, &diff),
                 Err(e) => engine_out(Err(e)),
             }
         })
@@ -292,7 +318,7 @@ Never include the anchor line. Compare both edges of the inserted block in the p
             };
             let lines = get_str(&args, "lines").unwrap_or_default();
             match self.store.insert_anchors(anchor, direction, &lines) {
-                Ok((_path, diff)) => ToolOutcome::ok(render_diff(&diff)),
+                Ok((path, diff)) => edited(&path, &diff),
                 Err(e) => engine_out(Err(e)),
             }
         })
@@ -348,7 +374,7 @@ The source lines stay in place, and the copied lines are written exactly as the 
                 Err(e) => return e,
             };
             match self.store.copy_anchors(sf, st, ia) {
-                Ok((_src, _dst, diff)) => ToolOutcome::ok(render_diff(&diff)),
+                Ok((_src, dst, diff)) => edited(&dst, &diff),
                 Err(e) => engine_out(Err(e)),
             }
         })
@@ -404,8 +430,13 @@ impl AgentTool for MoveTool {
                 Err(e) => return e,
             };
             match self.store.move_anchors(sf, st, ia) {
-                Ok((_src, _dst, removed, added)) => {
-                    ToolOutcome::ok(format!("{}{}", render_diff(&removed), render_diff(&added)))
+                Ok((_src, dst, removed, added)) => {
+                    let mut out = ToolOutcome::ok(with_file_header(
+                        &dst,
+                        format!("{}{}", render_diff(&removed), render_diff(&added)),
+                    ));
+                    out.details = Some(serde_json::json!({ "path": dst.display().to_string() }));
+                    out
                 }
                 Err(e) => engine_out(Err(e)),
             }
@@ -534,7 +565,7 @@ Use it when an edit removed or changed the wrong lines. If the file changed sinc
             };
             let undo_path = crate::store::norm_key(std::path::Path::new(&path));
             match self.store.undo(&undo_path) {
-                Ok(diff) => ToolOutcome::ok(render_diff(&diff)),
+                Ok(diff) => edited(&undo_path, &diff),
                 Err(e) => engine_out(Err(e)),
             }
         })
@@ -583,7 +614,12 @@ Prefer hashline edit tools for changing part of an existing file."
             };
             let write_path = crate::store::norm_key(std::path::Path::new(&path));
             match self.store.write(&write_path, &content) {
-                Ok(rows) => ToolOutcome::ok(rows.join("\n")),
+                Ok(rows) => {
+                    let mut out = ToolOutcome::ok(with_file_header(&write_path, rows.join("\n")));
+                    out.details =
+                        Some(serde_json::json!({ "path": write_path.display().to_string() }));
+                    out
+                }
                 Err(e) => ToolOutcome::err(e.to_string()),
             }
         })
@@ -685,6 +721,22 @@ mod tests {
             .await;
         assert!(!out.is_error, "{out:?}");
         assert!(std::fs::read_to_string(&f).unwrap().contains("new line"));
+        // The anchor arguments carry no path, so the GUI can only name the file
+        // if the outcome reports it. Losing this is invisible in the diff text.
+        let reported = out
+            .details
+            .as_ref()
+            .and_then(|d| d.get("path"))
+            .and_then(|p| p.as_str())
+            .expect("edit outcomes must report the edited path");
+        assert!(reported.ends_with("t.txt"), "reported path was {reported}");
+        // The same path must also be in the text: `details` is not persisted,
+        // so a reloaded card reads the file from line one instead.
+        let first = out.text.lines().next().unwrap();
+        assert!(
+            first.starts_with("file: ") && first.ends_with("t.txt"),
+            "first output line was {first:?}"
+        );
 
         // grep finds the new content and serves an editable row
         let out = reg

@@ -328,3 +328,72 @@ fn compaction_notice_is_not_an_answer_and_new_turn_never_reuses_prior_row() {
     assert_eq!(app.rows[1].text, "NEW FINAL");
     assert!(app.rows.iter().all(|r| !r.streaming));
 }
+
+/// A model switch rebuilds the agent, and the inbox lives inside the agent.
+/// Losing the queue there is invisible until the user notices their queued
+/// prompts never start — which is exactly the reported bug.
+#[test]
+fn queued_prompts_survive_an_agent_rebuild() {
+    let mut app = crate::tests::fixture();
+    app.running = true;
+    app.input = "follow up please".into();
+    app.submit();
+    assert_eq!(app.input_queue.pending(), 1);
+    assert_eq!(app.queued_hint, 1);
+
+    let agent = make_agent(ToolRegistry::new(), FauxScript::new().with_text("hi"));
+    let dir = std::env::temp_dir().join(format!(
+        "feather-rebuild-{}-{}",
+        std::process::id(),
+        feather_core::message::now_millis()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    app.install_agent(agent, Arc::new(feather::tasks::TaskStore::open(&dir)));
+
+    assert_eq!(
+        app.input_queue.pending(),
+        1,
+        "the rebuilt agent must inherit the pending prompt"
+    );
+    assert_eq!(
+        app.queued_hint, 1,
+        "the hint must mirror the real inbox, not a stale counter"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A run that dies (exhausted quota, for instance) deliberately does not retry,
+/// so the queue must stay intact *and* the user must be told why nothing
+/// started. Silence here reads as "the app dropped my message".
+#[test]
+fn a_failed_run_keeps_the_queue_and_reports_it() {
+    let mut app = crate::tests::fixture();
+    app.running = true;
+    app.input = "queued while running".into();
+    app.submit();
+    assert_eq!(app.queued_hint, 1);
+
+    app.ev_tx
+        .send(UiEvent::RunDone(Ok(RunResult {
+            stop_reason: StopReason::Error,
+            turns: 1,
+            usage: Default::default(),
+            final_text: String::new(),
+        })))
+        .unwrap();
+    app.drain_events();
+
+    assert!(!app.running);
+    assert_eq!(
+        app.input_queue.pending(),
+        1,
+        "a failed run must not consume queued prompts"
+    );
+    assert!(
+        app.rows
+            .iter()
+            .any(|r| r.text.contains("Kept 1 queued prompt")),
+        "rows were {:?}",
+        app.rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+    );
+}

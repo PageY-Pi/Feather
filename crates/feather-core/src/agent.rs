@@ -92,6 +92,10 @@ pub enum AgentEvent {
         call: ToolCall,
         text: String,
         is_error: bool,
+        /// Structured side-channel from the tool (never sent to the model).
+        /// The GUI reads `path` from it to label an edit card with the file it
+        /// actually touched, which the anchor arguments alone never convey.
+        details: Option<serde_json::Value>,
     },
     CompactionDone {
         tokens_before: u64,
@@ -189,6 +193,47 @@ struct QueuedInput {
     follow_up_all: bool,
 }
 impl InputQueue {
+    /// How many messages are still waiting to be delivered.
+    ///
+    /// Callers should read this instead of keeping their own counter: the queue
+    /// is authoritative, and a mirror counter silently drifts whenever the
+    /// agent is rebuilt or the queue is drained elsewhere.
+    pub fn pending(&self) -> usize {
+        let q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        q.steering.len() + q.follow_up.len()
+    }
+
+    /// Move every pending message from `other` into `self`, preserving order and
+    /// the steering/follow-up split.
+    ///
+    /// The inbox lives inside `Agent`, so rebuilding the agent (a model switch,
+    /// for example) would otherwise discard input the user already submitted.
+    /// After a failed run the queued prompts are deliberately left undelivered;
+    /// losing them at that point looks like the app silently ate the message.
+    pub fn adopt(&self, other: &InputQueue) {
+        if std::ptr::eq(self, other) {
+            return;
+        }
+        let (steering, follow_up, steering_all, follow_up_all) = {
+            let mut o = other.0.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                std::mem::take(&mut o.steering),
+                std::mem::take(&mut o.follow_up),
+                o.steering_all,
+                o.follow_up_all,
+            )
+        };
+        let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        q.steering.extend(steering);
+        q.follow_up.extend(follow_up);
+        if steering_all {
+            q.steering_all = true;
+        }
+        if follow_up_all {
+            q.follow_up_all = true;
+        }
+    }
+
     pub fn push(&self, message: Message, steering: bool) {
         let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if steering {
@@ -1368,6 +1413,7 @@ async fn execute_progress(
         call,
         text: outcome.text.clone(),
         is_error: outcome.is_error,
+        details: outcome.details.clone(),
     });
     outcome
 }

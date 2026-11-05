@@ -1,6 +1,6 @@
-# Feather 1.2.0 Windows installer
+# Feather 1.3.0 Windows installer
 
-Share `dist/Feather-1.2.0-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.3.0-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -86,6 +86,12 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.3.0 adds the OpenCode Go subscription provider, and makes tool cards say
+  what the call does instead of what the program is called. Cards carry a ✅/❎
+  icon instead of Done/Error chips, an error no longer washes the whole card
+  red (colour stays on the left rail), and `bash` now *requires* a one-line
+  `description` — a call without one is refused with a retry prompt, and the
+  collapsed card shows that sentence rather than the raw command.
 - 1.2.0 rebuilds every dialog on one native card shell. Picker, settings and
   form windows now share a 16px-radius sheet with a wide soft shadow, fade-ended
   hairlines instead of hard borders, hover-washed rows with check marks, and a

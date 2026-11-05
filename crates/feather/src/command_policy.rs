@@ -2,11 +2,101 @@
 //! This is not a Bash sandbox: unknown programs can have side effects. The gate
 //! blocks known violations before spawning, and returns a normal tool error so
 //! the model can correct it instead of aborting the agent.
+//!
+//! It also refuses commands that would terminate Feather itself. The agent runs
+//! *inside* the GUI process, so an unguarded `taskkill /IM feather-gui.exe` or
+//! `kill <own pid>` would take out the runtime mid-turn with no chance to save
+//! state — the same failure mode as pulling the power cord.
 pub fn check(command: &str) -> Result<(), String> {
     check_depth(command, 0)
 }
 fn illegal(reason: &str) -> Result<(), String> {
     Err(format!("[ILLEGAL_COMMAND] Blocked before execution: {reason}. Use the anchor file tools or an allowed inspection command. This is a recoverable tool error; continue with a safe alternative."))
+}
+
+/// Process names that ARE Feather's own runtime. Killing any of these from a
+/// tool call tears down the agent that issued the call.
+const SELF_NAMES: &[&str] = &["feather-gui", "feather"];
+
+fn self_pid() -> u32 {
+    std::process::id()
+}
+
+/// Whether `name` (already lowercase, extension stripped) is Feather itself.
+fn is_self_name(name: &str) -> bool {
+    SELF_NAMES.contains(&name)
+}
+
+/// Refuse terminations aimed at Feather's own processes.
+///
+/// Covers the shapes that actually reach a kill:
+///   taskkill /IM feather-gui.exe        taskkill /PID <own pid>
+///   Stop-Process -Name feather-gui      kill -9 <own pid>
+///   pkill feather-gui                   killall feather
+///
+/// A `--` separator, an explicit different PID, or a differently named target
+/// is left alone so deliberate process management still works.
+fn check_self_kill(program: &str, args: &[String]) -> Result<(), String> {
+    let target = |value: &str| {
+        let name = value
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(".exe")
+            .to_ascii_lowercase();
+        is_self_name(&name)
+    };
+    let own_pid = self_pid().to_string();
+    match program {
+        "taskkill" => {
+            for (n, arg) in args.iter().enumerate() {
+                let value = args.get(n + 1).map(String::as_str).unwrap_or("");
+                match arg.to_ascii_lowercase().as_str() {
+                    // /IM feather-gui.exe : match by image name.
+                    "/im" | "-im" if target(value) => {
+                        return illegal("taskkill would terminate Feather's own process");
+                    }
+                    // /PID <n> : match by PID, including our own.
+                    "/pid" | "-pid" if value == own_pid => {
+                        return illegal("taskkill would terminate Feather's own process");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // `kill <pid>` / `kill -9 <pid>`. Only the single-argument form is
+        // matched; named targets are handled by pkill/killall below.
+        "kill" => {
+            for arg in args.iter().filter(|a| !a.starts_with('-')) {
+                if arg == &own_pid {
+                    return illegal("kill would terminate Feather's own process");
+                }
+            }
+        }
+        "pkill" | "killall" => {
+            for arg in args.iter().filter(|a| !a.starts_with('-')) {
+                if target(arg) {
+                    return illegal("this would terminate Feather's own process");
+                }
+            }
+        }
+        "stop-process" => {
+            for (n, arg) in args.iter().enumerate() {
+                let value = args.get(n + 1).map(String::as_str).unwrap_or("");
+                match arg.to_ascii_lowercase().as_str() {
+                    "-name" | "/name" if target(value) => {
+                        return illegal("Stop-Process would terminate Feather's own process");
+                    }
+                    "-id" | "/id" if value == own_pid => {
+                        return illegal("Stop-Process would terminate Feather's own process");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 fn check_depth(command: &str, depth: usize) -> Result<(), String> {
     if depth > 4 {
@@ -38,6 +128,8 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
             .trim_end_matches(".exe")
             .to_ascii_lowercase();
         let args = &words[index + 1..];
+        // Never let a tool call terminate the runtime that issued it.
+        check_self_kill(&program, args)?;
         match program.as_str() {
             "eval" => return illegal("eval cannot be safely preflighted"),
             "bash" | "sh" | "zsh" => {
@@ -219,6 +311,40 @@ mod tests {
             "cargo test 2>&1 | tail -12",
             "python -c \"print('hello')\"",
             "for n in A B; do printf '%s' \"$n\"; done",
+        ] {
+            assert!(check(command).is_ok(), "{command}");
+        }
+    }
+
+    #[test]
+    fn commands_that_would_kill_feather_itself_are_refused() {
+        let own = std::process::id().to_string();
+        for command in [
+            "taskkill /IM feather-gui.exe /F".to_string(),
+            "taskkill /F /IM feather-gui.exe".to_string(),
+            "taskkill /IM feather.exe /T /F".to_string(),
+            format!("taskkill /PID {own} /F"),
+            "Stop-Process -Name feather-gui -Force".to_string(),
+            format!("kill -9 {own}"),
+            "pkill feather-gui".to_string(),
+            "killall feather".to_string(),
+            // Nested shells must be inspected too, or `bash -c` becomes a bypass.
+            "bash -c 'taskkill /IM feather-gui.exe /F'".to_string(),
+        ] {
+            let err = check(&command).unwrap_err();
+            assert!(err.contains("ILLEGAL_COMMAND"), "{command} -> {err}");
+        }
+    }
+
+    #[test]
+    fn terminating_other_processes_stays_allowed() {
+        for command in [
+            // A pid that is not ours, and a name that is not Feather.
+            "taskkill /PID 999999 /F",
+            "taskkill /IM notepad.exe /F",
+            "Stop-Process -Name notepad",
+            "pkill notepad",
+            "kill 999999",
         ] {
             assert!(check(command).is_ok(), "{command}");
         }

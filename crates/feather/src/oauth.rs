@@ -167,6 +167,25 @@ pub const ZAI_CODING_CN: OAuthProvider = OAuthProvider {
     scopes: "",
 };
 
+/// OpenCode Zen "Go" subscription: an API key against a Go-scoped gateway.
+///
+/// It is not a browser OAuth flow. The subscription is activated in the OpenCode
+/// console, which issues a key; Feather stores it exactly like the other
+/// API-key providers. The gateway is the `/zen/go/v1` tier, not the general
+/// `/zen/v1` or console-inference `/inference/openai/v1` tiers — a Go key is
+/// rejected there (measured: 402 "Insufficient account funds"), so the base URL
+/// is part of the contract, not a preference.
+pub const OPENCODE_GO: OAuthProvider = OAuthProvider {
+    id: "opencode-go",
+    kind: Flow::ApiKey,
+    authorize_url: "https://opencode.ai/auth",
+    token_url: "",
+    client_id: "",
+    redirect_port: 0,
+    redirect_path: "",
+    scopes: "",
+};
+
 /// Volcengine Ark Coding Plan uses an API key and OpenAI-compatible Chat Completions.
 pub const VOLCENGINE_PLAN: OAuthProvider = OAuthProvider {
     id: "volcengine-plan",
@@ -190,6 +209,7 @@ pub const PROVIDERS: &[&OAuthProvider] = &[
     &RADIUS,
     &ZAI,
     &VOLCENGINE_PLAN,
+    &OPENCODE_GO,
     &ZAI_CODING_CN,
 ];
 
@@ -1873,5 +1893,42 @@ mod tests {
             assert!(raw.contains("device_code=device"));
         }
         server.finish();
+    }
+
+    /// Every sign-in-able provider must also exist in the bundled catalog, or
+    /// the credential gets stored under an id nothing can route to.
+    #[test]
+    fn every_login_provider_has_a_bundled_catalog_entry() {
+        let catalog = crate::models::builtin_catalog().expect("bundled catalog");
+        for provider in PROVIDERS {
+            assert!(
+                catalog.providers.contains_key(provider.id),
+                "{} is in PROVIDERS but not builtin-models.json",
+                provider.id
+            );
+        }
+    }
+
+    /// A Go subscription key only works against the Go tier. This pins the ids
+    /// apart so a later "simplification" cannot point Feather at `/zen/v1` or
+    /// the console-inference tier, where the same key is rejected.
+    #[test]
+    fn opencode_go_is_an_api_key_provider_on_the_go_gateway() {
+        let provider = provider("opencode-go").expect("opencode-go must be sign-in-able");
+        assert!(matches!(provider.kind, Flow::ApiKey));
+
+        let catalog = crate::models::builtin_catalog().expect("bundled catalog");
+        let entry = catalog.providers.get("opencode-go").expect("catalog entry");
+        assert_eq!(
+            entry.base_url.as_deref(),
+            Some("https://opencode.ai/zen/go/v1")
+        );
+        // The gateway rejects a request without this header, and its value must
+        // come from the conversation, not the config.
+        let headers = entry.headers.as_ref().expect("session header");
+        assert_eq!(
+            headers["x-opencode-session"].as_str(),
+            Some(feather_core::provider::credentials::SESSION_PLACEHOLDER)
+        );
     }
 }

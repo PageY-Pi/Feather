@@ -79,11 +79,13 @@ fn tool_completions_match_ids_not_latest_row() {
         call: call("a"),
         text: "first".into(),
         is_error: false,
+        details: None,
     });
     app.on_agent_event(AgentEvent::ToolEnd {
         call: call("b"),
         text: "second".into(),
         is_error: true,
+        details: None,
     });
     assert_eq!(app.rows[0].tool_output.as_deref(), Some("first"));
     assert_eq!(app.rows[1].tool_output.as_deref(), Some("second"));
@@ -348,6 +350,7 @@ fn tool_progress_streams_into_the_row_without_finalizing() {
         call: call("a"),
         text: "final".into(),
         is_error: false,
+        details: None,
     });
     assert_eq!(app.rows[0].tool_output.as_deref(), Some("final"));
     assert!(!app.rows[0].streaming);
@@ -1680,4 +1683,255 @@ fn temp_shake_repaint_causes() {
         t += 1.0 / 60.0;
         run(&mut app, t, vec![], "running");
     }
+}
+
+#[test]
+fn edit_cards_name_the_file_instead_of_dumping_anchors() {
+    let args = serde_json::json!({
+        "remove_from": "ab3cd",
+        "remove_to": "xy9zw",
+        "replacement_lines": "changed",
+    });
+
+    // Before the tool reports back there is no path, so the card shows no
+    // argument line at all rather than five-letter anchors.
+    assert_eq!(
+        tool_subject("replace", &args, None, None).as_deref(),
+        Some(""),
+        "anchors must never reach the card"
+    );
+
+    // The tool's side-channel supplies the real file.
+    let details = serde_json::json!({"path": "./crates/feather-gui/src/cards.rs"});
+    assert_eq!(
+        tool_subject("replace", &args, Some(&details), None).as_deref(),
+        Some("crates/feather-gui/src/cards.rs")
+    );
+
+    // Every anchor-addressed tool behaves the same way.
+    for tool in [
+        "replace_within",
+        "insert",
+        "copy",
+        "move",
+        "undo_last_change",
+    ] {
+        assert_eq!(
+            tool_subject(tool, &args, Some(&details), None).as_deref(),
+            Some("crates/feather-gui/src/cards.rs"),
+            "{tool}"
+        );
+    }
+}
+
+#[test]
+fn bash_cards_show_the_intent_and_nothing_else() {
+    // The intent is the whole collapsed line.
+    let with_intent = serde_json::json!({
+        "command": "cd /w && cargo test -p feather-gui --bins 2>&1 | tail -5",
+        "description": "  run the gui tests  ",
+    });
+    assert_eq!(
+        tool_subject("bash", &with_intent, None, None).as_deref(),
+        Some("run the gui tests"),
+        "intent is trimmed and shown on its own"
+    );
+
+    // Without an intent the header stays bare. Falling back to the command is
+    // what buried every card under `cd … && …` shell text.
+    let command = serde_json::json!({"command": "cargo test -p feather-gui --bins 2>&1 | tail -5"});
+    assert_eq!(
+        tool_subject("bash", &command, None, None).as_deref(),
+        Some(""),
+        "no intent means no second line, never the raw command"
+    );
+
+    // A blank intent counts as absent.
+    let blank = serde_json::json!({"command": "ls", "description": "   "});
+    assert_eq!(
+        tool_subject("bash", &blank, None, None).as_deref(),
+        Some("")
+    );
+
+    // The command is still reachable, under COMMAND on expand.
+    assert_eq!(
+        tool_detail("bash", &with_intent),
+        "cd /w && cargo test -p feather-gui --bins 2>&1 | tail -5"
+    );
+}
+
+/// The card must not turn red as a whole: that made the status mark unreadable
+/// against its own background. Error is carried by the left rail and the cross.
+#[test]
+fn an_errored_card_is_not_washed_red() {
+    let failed = ChatRow {
+        tool_error: true,
+        ..ChatRow::new(RowKind::Tool, "bash")
+    };
+    let ok = ChatRow::new(RowKind::Tool, "bash");
+    let failed = crate::cards::tool_card_look(&failed);
+    let ok = crate::cards::tool_card_look(&ok);
+    assert_eq!(
+        failed.fill, ok.fill,
+        "the card body is the same colour whether the call failed or not"
+    );
+    assert_eq!(
+        failed.output_fill, ok.output_fill,
+        "the output well stays neutral too"
+    );
+    assert_ne!(failed.rail, ok.rail, "the rail is what carries the error");
+    assert_eq!(failed.rail, crate::theme::RED);
+
+    // The mark itself: cross on failure, check on success.
+    assert_eq!(failed.status, Some(false));
+    assert_eq!(ok.status, Some(true));
+
+    // A running call shows the spinner, so it has no mark at all.
+    let running = ChatRow {
+        streaming: true,
+        ..ChatRow::new(RowKind::Tool, "bash")
+    };
+    assert_eq!(crate::cards::tool_card_look(&running).status, None);
+}
+
+/// Each tool family gets a recognisable mark; the terminal glyph stays as-is.
+#[test]
+fn tools_carry_an_icon_that_matches_what_they_do() {
+    assert_eq!(
+        crate::cards::tool_visuals("bash").1,
+        ">_",
+        "the terminal glyph is unchanged"
+    );
+    assert_eq!(crate::cards::tool_visuals("read").1, "👓");
+    for editor in [
+        "replace",
+        "replace_within",
+        "insert",
+        "copy",
+        "move",
+        "undo_last_change",
+        "write",
+    ] {
+        assert_eq!(
+            crate::cards::tool_visuals(editor).1,
+            "✏",
+            "{editor} writes to a file"
+        );
+    }
+}
+
+/// The label a card shows is always title-cased words: never a raw tool id,
+/// never `web search`, never `Anchor Grep` beside `Web Search`.
+#[test]
+fn every_card_label_is_title_cased_words() {
+    assert_eq!(crate::cards::tool_visuals("web_search").0, "Web Search");
+    assert_eq!(crate::cards::tool_visuals("web_fetch").0, "Web Fetch");
+    // Search keeps the short hand-written label, not the core table's
+    // "Anchor Grep": the id is an implementation word, not a name.
+    assert_eq!(crate::cards::tool_visuals("anchor_grep").0, "Grep");
+    assert_eq!(crate::cards::tool_visuals("read").0, "Read");
+    assert_eq!(crate::cards::tool_visuals("bash").0, "Bash");
+
+    // Anything else falls back to readable words rather than `task_create`.
+    assert_eq!(crate::cards::tool_visuals("task_create").0, "Task Create");
+    assert_eq!(
+        crate::cards::tool_visuals("subagent_models").0,
+        "Subagent Models"
+    );
+    // A single word is capitalized, and the editor family keeps its shared
+    // "Edit" label rather than one per operation.
+    assert_eq!(crate::cards::tool_visuals("purge").0, "Purge");
+    assert_eq!(crate::cards::tool_visuals("undo_last_change").0, "Edit");
+}
+
+/// Both web tools reach the internet, so they share the globe; searching is not
+/// what `web_fetch` does and a magnifier would mislabel it.
+#[test]
+fn the_web_tools_share_a_globe() {
+    assert_eq!(crate::cards::tool_visuals("web_search").1, "🌎");
+    assert_eq!(crate::cards::tool_visuals("web_fetch").1, "🌎");
+    assert_ne!(
+        crate::cards::tool_visuals("anchor_grep").1,
+        crate::cards::tool_visuals("web_search").1,
+        "local grep is not a network call"
+    );
+}
+
+#[test]
+fn unrelated_tools_keep_the_default_summary() {
+    // `read` already names its file, so it must not be overridden.
+    let args = serde_json::json!({"path": "src/main.rs", "limit": 3});
+    assert_eq!(tool_subject("read", &args, None, None), None);
+}
+
+/// The `details` side-channel is not persisted, so a card rebuilt from the
+/// transcript must recover the file from the tool's own output text. Otherwise
+/// the path vanishes on reload and the card regresses to opaque anchors.
+#[test]
+fn a_reloaded_edit_card_recovers_the_path_from_the_output() {
+    let call = ToolCall {
+        id: "t-edit".into(),
+        name: "replace".into(),
+        arguments: serde_json::json!({
+            "remove_from": "ab3cd",
+            "remove_to": "xy9zw",
+            "replacement_lines": "changed",
+        }),
+    };
+    let messages = vec![
+        Message::assistant(
+            vec![ContentBlock::ToolCall(call)],
+            "fixture",
+            Api::Faux,
+            Usage::default(),
+            StopReason::ToolUse,
+        ),
+        Message::tool_result(
+            "t-edit",
+            "replace",
+            "file: crates/feather-gui/src/cards.rs\n-ab3cd│old\n+xy9zw│changed",
+            false,
+        ),
+    ];
+
+    let rows = rows_from_messages(&messages);
+    let tool = rows.iter().find(|r| r.kind == RowKind::Tool).unwrap();
+    assert_eq!(tool.tool_args, "crates/feather-gui/src/cards.rs");
+
+    // The header line is UI metadata, not part of the diff body.
+    assert_eq!(tool_output_path("file: a/b.rs\n-ab3cd│x"), Some("a/b.rs"));
+    assert_eq!(
+        tool_output_path("-ab3cd│x"),
+        None,
+        "plain diffs have no path"
+    );
+    assert_eq!(tool_output_path(""), None);
+}
+
+#[test]
+fn the_raw_command_stays_available_below_the_intent() {
+    // The header shows the model's intent, so the real command must survive in
+    // the expandable body instead of being thrown away.
+    let args = serde_json::json!({
+        "command": "cargo test -p feather-gui --bins",
+        "description": "run the gui tests",
+    });
+    assert_eq!(
+        tool_subject("bash", &args, None, None).as_deref(),
+        Some("run the gui tests")
+    );
+    assert_eq!(
+        tool_detail("bash", &args),
+        "cargo test -p feather-gui --bins"
+    );
+
+    // Anchor edits keep their anchors, but only below the fold.
+    let anchors = serde_json::json!({"remove_from": "ab3cd", "remove_to": "xy9zw"});
+    let detail = tool_detail("replace", &anchors);
+    assert!(detail.contains("ab3cd"), "{detail}");
+    assert!(detail.contains("xy9zw"), "{detail}");
+
+    // Tools whose header is already self-explanatory stay single-line.
+    let read = serde_json::json!({"path": "src/main.rs"});
+    assert_eq!(tool_detail("read", &read), "");
 }

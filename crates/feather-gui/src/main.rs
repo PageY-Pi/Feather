@@ -97,7 +97,12 @@ struct ChatRow {
     tool_error: bool,
     streaming: bool,
     tool_id: Option<String>,
+    /// One-line subject shown in the card header (file path, or the model's
+    /// stated intent). Avoids dumping opaque anchors at the user.
     tool_args: String,
+    /// The raw command or arguments, revealed when the card is expanded. Empty
+    /// when the header already shows the only thing worth reading.
+    tool_detail: String,
     started_at: Option<f64>,
     elapsed: Option<f64>,
     expanded: bool,
@@ -116,6 +121,7 @@ impl ChatRow {
             streaming: false,
             tool_id: None,
             tool_args: String::new(),
+            tool_detail: String::new(),
             started_at: None,
             elapsed: None,
             expanded: false,
@@ -603,6 +609,11 @@ impl FeatherApp {
         self.rewind_turns = Default::default();
         let old = self.agent.take();
         drop(old);
+        if new_session {
+            // Prompts queued for the abandoned conversation must not follow the
+            // user into a fresh one; `install_agent` adopts the inbox as-is.
+            self.input_queue.clear();
+        }
         let result = if new_session {
             wiring::make_agent(&self.root.clone(), &self.settings, false)
                 .map_err(anyhow::Error::from)
@@ -741,6 +752,9 @@ impl FeatherApp {
         self.rewind_turns = Default::default();
         let old = self.agent.take();
         drop(old);
+        // A different conversation must not inherit prompts queued for the
+        // previous one; `install_agent` adopts whatever is still in the inbox.
+        self.input_queue.clear();
         self.session_dir = dir;
         match self.reopen_session_with_retry() {
             Ok((agent, tasks)) => {
@@ -820,7 +834,11 @@ impl FeatherApp {
         let agent = Arc::new(tokio::sync::Mutex::new(agent));
         {
             let guard = agent.blocking_lock();
+            // The new agent owns a brand-new inbox. Carry over anything the
+            // user already queued, or a model switch mid-run silently eats it.
+            let pending = std::mem::take(&mut self.input_queue);
             self.input_queue = guard.input_queue();
+            self.input_queue.adopt(&pending);
             self.abort_tx = guard.abort_sender();
             self.session_dir = guard.session().dir().to_path_buf();
             self.rewind_turns
@@ -831,6 +849,16 @@ impl FeatherApp {
         }
         self.agent = Some(agent);
         self.auth_changed = false;
+        self.sync_queued_hint();
+    }
+
+    /// Mirror the inbox's real depth into the UI counter.
+    ///
+    /// Everything that queues or delivers a prompt funnels through here. Keeping
+    /// a hand-maintained counter instead let the hint advertise follow-ups that
+    /// no longer existed — which reads as "queued messages never start".
+    fn sync_queued_hint(&mut self) {
+        self.queued_hint = self.input_queue.pending();
     }
 
     fn reconfigure_auth(&mut self) -> Result<(), String> {
@@ -978,7 +1006,7 @@ impl FeatherApp {
             // The thread-safe inbox remains writable while run() owns Agent.
             self.input_queue
                 .push(feather_core::message::Message::user_text(text), false);
-            self.queued_hint += 1;
+            self.sync_queued_hint();
             return;
         }
         if self.agent.is_some() && self.auth_changed {
@@ -1474,7 +1502,7 @@ impl FeatherApp {
                     self.input_queue
                         .push(feather_core::message::Message::user_text(text), false);
                     self.input.clear();
-                    self.queued_hint += 1;
+                    self.sync_queued_hint();
                 }
             }
             "app.exit" => {
@@ -1556,11 +1584,27 @@ impl FeatherApp {
                                 && !matches!(r.stop_reason, StopReason::Aborted | StopReason::Error)
                             {
                                 if let Some(message) = self.input_queue.pop_follow_up() {
-                                    self.queued_hint = self.queued_hint.saturating_sub(1);
+                                    self.sync_queued_hint();
                                     let draft = std::mem::replace(&mut self.input, message.text());
                                     self.submit();
                                     self.input = draft;
                                 }
+                            }
+                            // A failed run deliberately does not retry: hammering
+                            // an exhausted quota would just fail again. Say so, or
+                            // the still-queued prompts look dropped.
+                            if matches!(r.stop_reason, StopReason::Error)
+                                && self.input_queue.pending() > 0
+                            {
+                                let count = self.input_queue.pending();
+                                self.rows.push(ChatRow::new(
+                                    RowKind::Notice,
+                                    format!(
+                                        "Kept {count} queued prompt(s). They will start \
+                                         automatically after your next successful turn — \
+                                         switch model or send a message to continue."
+                                    ),
+                                ));
                             }
                         }
                         Err(e) => {
@@ -1665,7 +1709,7 @@ impl FeatherApp {
                     // Core emits queued prompts only on delivery, after the
                     // current final assistant message has been persisted.
                     self.rows.push(ChatRow::new(RowKind::User, m.text()));
-                    self.queued_hint = self.queued_hint.saturating_sub(1);
+                    self.sync_queued_hint();
                     return;
                 }
                 let tokens = m.usage.map(|u| u.output).unwrap_or(0);
@@ -1694,7 +1738,11 @@ impl FeatherApp {
                     }
                 }
                 let mut row = ChatRow::new(RowKind::Tool, &call.name);
-                row.tool_args = tool_summary(&call.arguments);
+                // No `details` yet; anchor tools hide their opaque anchors here
+                // and get the real path once ToolEnd reports it.
+                row.tool_args = tool_subject(&call.name, &call.arguments, None, None)
+                    .unwrap_or_else(|| tool_summary(&call.arguments));
+                row.tool_detail = tool_detail(&call.name, &call.arguments);
                 row.expanded = self.expand_tools;
                 row.tool_id = Some(call.id);
                 row.started_at = Some(now);
@@ -1705,8 +1753,14 @@ impl FeatherApp {
                 call,
                 text,
                 is_error,
+                details,
             } => {
                 let text = truncate_utf8(&text, 20_000);
+                // The tool reports the file it edited; the anchor arguments in
+                // `tool_args` cannot name a file, so the card would otherwise
+                // show only opaque anchors.
+                let resolved =
+                    tool_subject(&call.name, &call.arguments, details.as_ref(), Some(&text));
                 if let Some(row) = self
                     .rows
                     .iter_mut()
@@ -1717,10 +1771,16 @@ impl FeatherApp {
                     row.tool_error = is_error;
                     row.streaming = false;
                     row.elapsed = row.started_at.map(|start| (now - start).max(0.0));
+                    // ToolStart ran before the tool knew its target, so upgrade
+                    // the summary now that the real subject is known.
+                    if let Some(subject) = &resolved {
+                        row.tool_args = subject.clone();
+                    }
                 } else {
                     let mut row = ChatRow::new(RowKind::Tool, &call.name);
                     row.tool_id = Some(call.id);
-                    row.tool_args = tool_summary(&call.arguments);
+                    row.tool_args = resolved.unwrap_or_else(|| tool_summary(&call.arguments));
+                    row.tool_detail = tool_detail(&call.name, &call.arguments);
                     row.tool_output = Some(text);
                     row.tool_error = is_error;
                     self.rows.push(row);
@@ -3421,6 +3481,103 @@ fn tool_summary(args: &serde_json::Value) -> String {
     feather_core::tool::tool_args_summary(args, 180)
 }
 
+/// Must match `FILE_HEADER` in `feather-hashline`: the first line of an
+/// editing tool's output names the file it touched.
+const TOOL_FILE_HEADER: &str = "file: ";
+
+/// The edited file, read back out of a tool's output text.
+///
+/// Editing tools name the file on line one so a card rebuilt from the persisted
+/// transcript can still say *which* file changed — the anchor arguments never
+/// carry a path, and the `details` side-channel is not stored.
+fn tool_output_path(output: &str) -> Option<&str> {
+    let first = output.lines().next()?;
+    first
+        .strip_prefix(TOOL_FILE_HEADER)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+}
+
+/// What a tool call is actually about, in words a reader recognizes.
+///
+/// Returns `None` when the plain argument summary is already the clearest
+/// thing to show. Two cases need help:
+///
+/// * Anchor-addressed edits (`replace`, `replace_within`, `insert`, `copy`,
+///   `move`, `undo_last_change`) carry only 5-letter anchors, so the default
+///   summary reads `remove_from ab3cd, remove_to xy9zw` — it never names the
+///   file. The tool now reports the resolved path in `details`.
+/// * `bash` commands are often long; collapsing them to the first line and
+///   appending an ellipsis keeps the card one row tall without hiding that
+///   more text exists.
+fn tool_subject(
+    name: &str,
+    args: &serde_json::Value,
+    details: Option<&serde_json::Value>,
+    output: Option<&str>,
+) -> Option<String> {
+    let reported = details
+        .and_then(|d| d.get("path"))
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty())
+        // The structured channel is absent when a card is rebuilt from the
+        // transcript, but the tool writes the same path into its first line.
+        .or_else(|| output.and_then(tool_output_path));
+
+    match name {
+        // Anchor tools: the file is the useful subject, anchors are not.
+        "replace" | "replace_within" | "insert" | "copy" | "move" | "undo_last_change" => {
+            let Some(path) = reported.map(str::to_string).or_else(|| {
+                args.get("path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            }) else {
+                // Path unknown yet (ToolStart, or a failed edit). Show nothing
+                // rather than dumping `remove_from ab3cd, remove_to xy9zw`.
+                return Some(String::new());
+            };
+            Some(truncate_utf8(path.trim_start_matches("./"), 180))
+        }
+        // Only the model's stated intent is shown; the command itself is not.
+        "bash" | "shell" => {
+            let intent = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match intent {
+                Some(intent) => Some(truncate_utf8(intent, 180)),
+                // The tool now refuses a call without an intent, so this is only
+                // reached by rows recorded before that rule existed. Showing the
+                // raw command here is what made collapsed cards unreadable, so an
+                // old row shows its tool name and nothing else; the command stays
+                // one click away under COMMAND.
+                None => Some(String::new()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Raw arguments worth revealing under the card, paired with [`tool_subject`].
+///
+/// The header can only hold one line, so it shows the *meaning* (the file, or
+/// the model's stated intent). The full command or anchor list is still
+/// available on demand rather than lost.
+fn tool_detail(name: &str, args: &serde_json::Value) -> String {
+    match name {
+        "bash" | "shell" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| c.trim().to_string())
+            .unwrap_or_default(),
+        "replace" | "replace_within" | "insert" | "copy" | "move" | "undo_last_change" => {
+            feather_core::tool::tool_args_summary(args, 300)
+        }
+        _ => String::new(),
+    }
+}
+
 /// Render an original audit page (or an in-memory test fixture), NOT the
 /// compacted LLM context. Tool results may straddle a page boundary; history
 /// merges the orphan with its original call when the older page is loaded.
@@ -3449,7 +3606,11 @@ fn rows_from_messages(messages: &[feather_core::message::Message]) -> Vec<ChatRo
                 for call in message.tool_calls() {
                     let mut row = ChatRow::new(RowKind::Tool, &call.name);
                     row.tool_id = Some(call.id.clone());
-                    row.tool_args = tool_summary(&call.arguments);
+                    // The result text arrives in a later message; it carries the
+                    // path, so this is filled in again when ToolResult is seen.
+                    row.tool_args = tool_subject(&call.name, &call.arguments, None, None)
+                        .unwrap_or_else(|| tool_summary(&call.arguments));
+                    row.tool_detail = tool_detail(&call.name, &call.arguments);
                     rows.push(row);
                 }
             }
@@ -3461,6 +3622,13 @@ fn rows_from_messages(messages: &[feather_core::message::Message]) -> Vec<ChatRo
                     .rev()
                     .find(|row| row.tool_id == id && row.tool_output.is_none())
                 {
+                    // The result names the edited file on its first line; use it
+                    // so a reloaded card shows the path exactly like a live one.
+                    if let Some(path) = tool_output_path(&output) {
+                        if row.tool_args.is_empty() {
+                            row.tool_args = truncate_utf8(path.trim_start_matches("./"), 180);
+                        }
+                    }
                     row.tool_output = Some(output);
                     row.tool_error = message.is_error;
                 } else {

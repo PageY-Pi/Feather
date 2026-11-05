@@ -680,6 +680,7 @@ impl EventMapper {
                 call,
                 text,
                 is_error,
+                details: _,
             } => {
                 let result = json!({"content":[{"type":"text","text":text}]});
                 let message =
@@ -755,6 +756,7 @@ fn absorb_event(event: &AgentEvent, cached: &mut Vec<Message>) {
             call,
             text,
             is_error,
+            details: _,
         } => cached.push(Message::tool_result(
             call.id.clone(),
             call.name.clone(),

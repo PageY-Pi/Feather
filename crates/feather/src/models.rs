@@ -323,7 +323,7 @@ pub fn clamp_thinking(
     feather_core::provider::ThinkingLevel::parse(chosen)
         .unwrap_or(feather_core::provider::ThinkingLevel::Off)
 }
-fn builtin_catalog() -> Option<&'static ModelsFile> {
+pub(crate) fn builtin_catalog() -> Option<&'static ModelsFile> {
     // The builtin catalog is baked in at compile time and immutable: parse the
     // 434 KB JSON once per process instead of on every `load()` (it is hit per
     // transcript entry in RPC `get_entries`).

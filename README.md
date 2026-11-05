@@ -11,7 +11,7 @@ Feather is a standalone coding assistant for your workspace. It combines a nativ
 parallel subtasks, recoverable history and anchor-verified file editing. No browser
 shell, Electron, Node.js runtime or dynamically loaded plugin engine is required.
 
-**Version 1.2.0** · Windows x64 is the release-tested platform. Rust sources contain
+**Version 1.3.0** · Windows x64 is the release-tested platform. Rust sources contain
 other-platform support, but those builds are not claimed to be release-validated.
 
 ## Why Feather?
@@ -38,7 +38,7 @@ other-platform support, but those builds are not claimed to be release-validated
 
 ## Install on Windows
 
-Use `Feather-1.2.0-Setup-x64.exe` from the project's published release assets, or
+Use `Feather-1.3.0-Setup-x64.exe` from the project's published release assets, or
 build it locally following the instructions below. The per-user installer needs
 no administrator privileges. It installs the two executables, adds Feather to
 your user PATH, and provides an **Open Feather here** Explorer menu.
@@ -81,6 +81,14 @@ builds, video and embedding models — so entries are filtered to callable chat
 models and folded onto the plan's documented model names, newest build first.
 Retired (`Shutdown`/`Retiring`) entries are dropped, and so is anything the plan
 does not document, because the platform list is far wider than any subscription.
+
+It also covers the OpenCode Go subscription (`opencode-go`). That gateway's
+`GET /models` already reports ids that are callable as-is, so they are kept
+verbatim rather than folded onto a plan's documented names. Only entries with
+`type: "chat"` **and** a `chat-completions` mapping are kept: Zen lists a
+`muse-spark` model that is chat-typed but served only over the Responses API,
+and offering it here would fail on the first prompt.
+
 A discovered model is added next to the bundled ones, never in place of them: if
 the endpoint changes shape, disappears or the machine is offline, the shipped
 list stays and nothing is removed.
@@ -256,7 +264,7 @@ Build the Windows installer with **Inno Setup 6**:
 ISCC installer/Feather.iss
 ```
 
-Output: `dist/Feather-1.2.0-Setup-x64.exe`. See
+Output: `dist/Feather-1.3.0-Setup-x64.exe`. See
 [installer instructions](installer/README.md) for local deployment details.
 Native Windows smoke tests are in `scripts/cpu-smoke.ps1` and
 `scripts/renderer-restart-smoke.ps1`; they control isolated synthetic preview

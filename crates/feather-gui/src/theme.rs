@@ -45,7 +45,9 @@ pub const WARN: Color32 = Color32::from_rgb(0x7C, 0x56, 0x0F);
 /// Whisper-soft edge tint. Used instead of harsh outlines.
 pub const BORDER: Color32 = Color32::from_rgb(0xE8, 0xE2, 0xD9);
 pub const ERROR_BG: Color32 = Color32::from_rgb(0xFC, 0xED, 0xEE);
-pub const TOOL_ERROR_BG: Color32 = Color32::from_rgb(0xFA, 0xEE, 0xEF);
+// A whole-card error tint used to live here. It washed the card red and made the
+// error chip unreadable against its own background; the card is now neutral and
+// the error reads from the left rail plus the right-hand icon.
 
 // ---------------------------------------------------------------------------
 // typography
@@ -280,7 +282,7 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 
 /// Every light surface a text color may land on.
 #[cfg(test)]
-pub fn surfaces() -> [Color32; 9] {
+pub fn surfaces() -> [Color32; 8] {
     [
         PANEL,
         PANEL_2,
@@ -290,7 +292,6 @@ pub fn surfaces() -> [Color32; 9] {
         LAVENDER,
         SOFT_ACCENT,
         ERROR_BG,
-        TOOL_ERROR_BG,
     ]
 }
 

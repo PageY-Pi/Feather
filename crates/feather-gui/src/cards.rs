@@ -49,51 +49,124 @@ pub fn render_row(ui: &mut egui::Ui, row: &mut ChatRow, now: f64, show_thinking:
             });
         }
         RowKind::Assistant => {
-            ui.horizontal(|ui| {
-                mascot(ui, 24.0);
-                ui.label(
-                    egui::RichText::new("Feather")
-                        .size(12.5)
-                        .strong()
-                        .color(INK),
-                );
-                if row.streaming {
-                    crate::activity::orbit(ui, 20.0, now);
-                    ui.label(egui::RichText::new("writing…").size(12.0).color(MUTED));
-                }
-            });
-            ui.add_space(1.0);
-            egui::Frame::none()
+            // Codex-style response surface: one quiet frame, a compact identity
+            // row, and deliberate dividers instead of a stack of nested bubbles.
+            let card = egui::Frame::none()
                 .fill(PANEL_2)
-                .rounding(20.0)
-                .inner_margin(egui::Margin::symmetric(20.0, 15.0))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .rounding(egui::Rounding::same(13.0))
+                .inner_margin(egui::Margin::symmetric(16.0, 13.0))
                 .show(ui, |ui| {
-                    ui.set_width((ui.available_width() - 1.0).max(120.0));
+                    let width = ui.available_width();
+                    ui.set_width((width - 1.0).max(120.0));
+                    ui.horizontal(|ui| {
+                        mascot(ui, 22.0);
+                        ui.add_space(1.0);
+                        ui.label(
+                            egui::RichText::new("Feather")
+                                .size(12.5)
+                                .strong()
+                                .color(INK),
+                        );
+                        if row.streaming {
+                            ui.add_space(7.0);
+                            status_badge(ui, "Working", TEAL, SOFT_ACCENT);
+                        }
+                        if row.streaming {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    crate::activity::orbit(ui, 18.0, now);
+                                },
+                            );
+                        }
+                    });
+
                     if !row.thinking.is_empty() {
+                        ui.add_space(8.0);
                         // Global toggle applies once per row, including virtualized
                         // rows revisited later. Header clicks remain independently usable.
                         let mode_id = ui.id().with("thinking-global-mode");
                         let previous = ui.data(|d| d.get_temp::<bool>(mode_id));
                         let force = (previous != Some(show_thinking)).then_some(show_thinking);
                         ui.data_mut(|d| d.insert_temp(mode_id, show_thinking));
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new("Thoughts").size(12.5).color(TEAL),
+                        // `header_response.rect` only spans the label text
+                        // (`collapsing_header_frame` defaults to false), so
+                        // anchoring the pulse to it drew the dot on top of the
+                        // word "Thoughts". Keep the header's vertical band so
+                        // the dot stays baseline-aligned, but widen it to the
+                        // card so it parks at the right edge.
+                        let card_right = ui.available_rect_before_wrap().right();
+                        let header = egui::CollapsingHeader::new(
+                            egui::RichText::new("Thoughts").size(12.0).color(TEAL),
                         )
                         .id_salt("thinking")
                         .default_open(true)
                         .open(force)
+                        .show_background(false)
+                        .icon(|ui, openness, response| {
+                            let center = response.rect.center();
+                            let stroke = egui::Stroke::new(1.4_f32, TEAL);
+                            ui.painter().circle_stroke(center, 4.0, stroke);
+                            if openness > 0.5 {
+                                ui.painter().line_segment(
+                                    [
+                                        center + egui::vec2(-2.0, 0.0),
+                                        center + egui::vec2(2.0, 0.0),
+                                    ],
+                                    stroke,
+                                );
+                            } else {
+                                ui.painter().line_segment(
+                                    [
+                                        center + egui::vec2(0.0, -2.0),
+                                        center + egui::vec2(0.0, 2.0),
+                                    ],
+                                    stroke,
+                                );
+                            }
+                        })
                         .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            thinking_text(ui, &row.thinking, row.streaming);
+                            egui::Frame::none()
+                                .fill(SIDEBAR)
+                                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                                .rounding(egui::Rounding::same(9.0))
+                                .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    thinking_text(ui, &row.thinking, row.streaming);
+                                });
                         });
+                        if row.streaming {
+                            let band = header.header_response.rect;
+                            let pulse_rect = egui::Rect::from_min_max(
+                                egui::pos2(band.left(), band.top()),
+                                egui::pos2(card_right, band.bottom()),
+                            );
+                            crate::activity::pulse_in(ui, pulse_rect, now, TEAL);
+                        }
                     }
                     if !row.text.is_empty() {
+                        if !row.thinking.is_empty() {
+                            ui.add_space(9.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                        }
                         prose(ui, &row.text, row.streaming);
                     }
                     if row.streaming {
-                        crate::activity::orbit(ui, 20.0, now);
+                        ui.add_space(5.0);
+                        crate::activity::orbit(ui, 18.0, now);
                     }
                 });
+            let rail = egui::Rect::from_min_max(
+                egui::pos2(card.response.rect.left(), card.response.rect.top() + 12.0),
+                egui::pos2(
+                    card.response.rect.left() + 3.0,
+                    card.response.rect.bottom() - 12.0,
+                ),
+            );
+            ui.painter().rect_filled(rail, 1.5, TEAL);
         }
         RowKind::Tool => render_tool(ui, row, now),
         RowKind::Notice => {
@@ -120,122 +193,338 @@ pub fn render_row(ui: &mut egui::Ui, row: &mut ChatRow, now: f64, show_thinking:
     }
 }
 
-fn render_tool(ui: &mut egui::Ui, row: &mut ChatRow, now: f64) {
-    let tint = if row.tool_error {
-        crate::theme::TOOL_ERROR_BG
+fn status_badge(ui: &mut egui::Ui, label: &str, color: egui::Color32, fill: egui::Color32) {
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(egui::Rounding::same(7.0))
+        .inner_margin(egui::Margin::symmetric(7.0, 3.0))
+        .show(ui, |ui| {
+            // `Extend` keeps the badge on one line: in the right-to-left header
+            // layout a narrow remaining width otherwise wrapped mid-word,
+            // stacking "Error" into a vertical column of letters.
+            ui.add(
+                egui::Label::new(egui::RichText::new(label).size(10.5).strong().color(color))
+                    .wrap_mode(egui::TextWrapMode::Extend),
+            );
+        });
+}
+
+/// The settled-state mark: a check for success, a cross for failure.
+///
+/// These replace the `Done` / `Error` word chips. The words needed a pill to be
+/// legible, and that pill disappeared against the old red card. A bare glyph
+/// needs no background of its own, so it stays readable on any card and cannot
+/// be mistaken for one.
+fn status_icon(ui: &mut egui::Ui, ok: bool) {
+    let (glyph, color) = if ok { ("✅", TEAL) } else { ("❎", RED) };
+    ui.add(
+        egui::Label::new(egui::RichText::new(glyph).size(12.5).color(color))
+            .wrap_mode(egui::TextWrapMode::Extend),
+    );
+}
+
+pub fn tool_visuals(name: &str) -> (String, &'static str, egui::Color32) {
+    match name {
+        "read" => ("Read".into(), "👓", TEAL),
+        // The hashline editor, in all its forms: each one rewrites the file.
+        "edit" | "write" | "apply_patch" | "replace" | "replace_within" | "insert" | "copy"
+        | "move" | "undo_last_change" => ("Edit".into(), "✏", TEAL_BRIGHT),
+        "bash" | "shell" => ("Bash".into(), ">_", INK),
+        // Search reads as a search: the magnifier is the action itself.
+        "anchor_grep" | "grep" => ("Grep".into(), "🔍", TEAL),
+        // The network, not the tool: both calls reach out to the internet, and a
+        // globe says that at a glance where a magnifier would promise a search.
+        "web_search" => ("Web Search".into(), "🌎", TEAL),
+        "web_fetch" => ("Web Fetch".into(), "🌎", TEAL),
+        _ => (display_label(name), "{}", TEAL),
+    }
+}
+
+/// A readable label for a tool that has no hand-written one.
+///
+/// The exact-name table in `feather_core` covers the hashline tools; anything
+/// else would fall through as its raw id (`task_create`, `subagent_models`),
+/// which reads as plumbing rather than a name. `snake_case` is turned into
+/// words so every card has a label a person would recognize.
+fn display_label(name: &str) -> String {
+    let known = feather_core::tool::tool_display_label(name);
+    // `tool_display_label` still reports the raw id when nothing matched, so a
+    // different string means the table had an answer — including multi-word
+    // ones ("Undo Last Change"), which get the same title-casing as the rest.
+    if known != name {
+        return title_case(known);
+    }
+    title_case(name)
+}
+
+/// Capitalize the first letter of every word.
+///
+/// Every card label goes through this — hand-written ones already match, so
+/// they pass through unchanged, and the rule stays uniform: a card never shows
+/// `web search`, `Web search` or `Anchor Grep` beside `Web Search`.
+fn title_case(text: &str) -> String {
+    text.split(['_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Paint a tool's glyph inside its 24px badge.
+///
+/// ASCII glyphs (`>_`, `{}`) are drawn in the monospace face so they keep the
+/// terminal look. Icon glyphs are emoji, which the monospace face only reaches
+/// through the emoji fallback and renders undersized, so they get the
+/// proportional face and a slightly larger size.
+fn paint_tool_glyph(painter: &egui::Painter, rect: egui::Rect, glyph: &str, color: egui::Color32) {
+    let icon = !glyph.is_ascii();
+    let font = if icon {
+        egui::FontId::proportional(13.5)
     } else {
-        TOOL_BG
+        egui::FontId::monospace(10.5)
     };
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        font,
+        color,
+    );
+}
+
+/// The colours and status mark a tool card derives from its state.
+///
+/// Kept apart from the drawing code so the visual rules can be asserted without
+/// a UI: "a failed call must not repaint the card" is a rule, not a pixel.
+pub struct ToolCardLook {
+    pub fill: egui::Color32,
+    pub output_fill: egui::Color32,
+    pub rail: egui::Color32,
+    /// `Some(ok)` once the call settles; `None` while it is still running, which
+    /// is when the spinner speaks for itself.
+    pub status: Option<bool>,
+}
+
+pub fn tool_card_look(row: &ChatRow) -> ToolCardLook {
+    ToolCardLook {
+        // Neutral in every state. Washing the card red made the error colour
+        // meaningless (everything was red) and left the status mark invisible
+        // against its own background, so the colour lives on the rail alone.
+        fill: PANEL_2,
+        output_fill: TOOL_BG,
+        rail: if row.tool_error { RED } else { TEAL },
+        status: (!row.streaming).then_some(!row.tool_error),
+    }
+}
+
+fn render_tool(ui: &mut egui::Ui, row: &mut ChatRow, now: f64) {
+    let look = tool_card_look(row);
+    // Resolved once: the label owns a `String`, and the header, the glyph and
+    // the sweep all need the same triple.
+    let (label, glyph, accent_color) = tool_visuals(&row.text);
+    let tint = look.fill;
+    let output_fill = look.output_fill;
+    let accent = look.rail;
     let seconds = row
         .elapsed
         .or_else(|| row.started_at.map(|start| (now - start).max(0.0)));
-    let status = if row.streaming {
-        "Running"
-    } else if row.tool_error {
-        "Not found / error"
-    } else {
-        "Done"
-    };
-    let color = if row.tool_error { RED } else { TEAL };
-    egui::Frame::none()
+    // Tool calls are compact activity rows in Codex: the command is primary,
+    // status is secondary, and the expensive output only appears on demand.
+    let card = egui::Frame::none()
         .fill(tint)
-        .rounding(16.0)
-        .inner_margin(egui::Margin::symmetric(15.0, 11.0))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .rounding(egui::Rounding::same(11.0))
+        .inner_margin(egui::Margin::symmetric(13.0, 10.0))
         .show(ui, |ui| {
             let width = ui.available_width();
-            let header = ui
-                .horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 7.0, PANEL_2);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if row.text == "bash" { ">_" } else { "{}" },
-                        egui::FontId::monospace(11.0),
-                        INK,
-                    );
-                    ui.label(
-                        egui::RichText::new(&row.text)
-                            .size(13.5)
-                            .strong()
-                            .color(TEXT),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(14.0, 16.0), egui::Sense::hover());
-                        let c = rect.center();
-                        let dy = if row.expanded { -2.0 } else { 2.0 };
-                        ui.painter().add(egui::Shape::line(
-                            vec![
-                                c + egui::vec2(-4.0, -dy),
-                                c + egui::vec2(0.0, dy),
-                                c + egui::vec2(4.0, -dy),
-                            ],
-                            egui::Stroke::new(1.4_f32, MUTED),
-                        ));
-                        ui.add_space(5.0);
-                        if let Some(seconds) = seconds {
-                            ui.label(
-                                egui::RichText::new(format!("{seconds:.1}s"))
-                                    .size(11.5)
-                                    .color(MUTED),
+            let header_top = ui.cursor().min.y;
+            let header_left = ui.cursor().min.x;
+            let header = ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 7.0, TOOL_BG);
+                ui.painter()
+                    .rect_stroke(rect, 7.0, egui::Stroke::new(1.0_f32, BORDER));
+
+                paint_tool_glyph(ui.painter(), rect, glyph, INK);
+                ui.add_space(9.0);
+                // Keep the command column flexible; the metadata column owns only
+                // its measured width so narrow windows never push the title off-canvas.
+                ui.allocate_ui_with_layout(
+                    // Auto height: a long bash command wraps to a second line
+                    // instead of being cut off at a fixed 26px box.
+                    egui::vec2((width - 150.0).max(72.0), 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&label).size(13.0).strong().color(TEXT),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                        if !row.tool_args.is_empty() {
+                            // `Label` has no row limit in egui 0.29, so build the
+                            // layout by hand: wrap to at most two rows and let the
+                            // galley elide the rest. A long bash command stays
+                            // readable without pushing the card arbitrarily tall.
+                            let mut job = egui::text::LayoutJob::simple(
+                                row.tool_args.clone(),
+                                egui::FontId::monospace(11.5),
+                                MUTED,
+                                ui.available_width(),
                             );
+                            job.wrap.max_rows = 2;
+                            job.wrap.break_anywhere = true;
+                            ui.add(egui::Label::new(job));
                         }
-                        if row.streaming {
-                            crate::activity::orbit(ui, 18.0, now);
-                        }
-                        ui.label(egui::RichText::new(status).size(11.5).color(color));
-                    });
-                })
-                .response;
+                    },
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
+
+                    let center = rect.center();
+                    let dy = if row.expanded { -2.0 } else { 2.0 };
+                    ui.painter().add(egui::Shape::line(
+                        vec![
+                            center + egui::vec2(-4.0, -dy),
+                            center + egui::vec2(0.0, dy),
+                            center + egui::vec2(4.0, -dy),
+                        ],
+                        egui::Stroke::new(1.4_f32, MUTED),
+                    ));
+                    ui.add_space(7.0);
+                    if let Some(seconds) = seconds {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{seconds:.1}s"))
+                                    .size(11.0)
+                                    .color(MUTED),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                        ui.add_space(7.0);
+                    }
+                    if row.streaming {
+                        crate::activity::orbit(ui, 16.0, now);
+                        ui.add_space(6.0);
+                    }
+                    // A running card shows the spinner instead; a settled one
+                    // gets a check or a cross. Icons read at a glance without
+                    // needing a label, which is what fit badly in this slot.
+                    if let Some(ok) = look.status {
+                        status_icon(ui, ok);
+                    }
+                });
+            });
+            let header_rect = egui::Rect::from_min_size(
+                egui::pos2(header_left, header_top),
+                egui::vec2(width, header.response.rect.height().max(26.0)),
+            );
             let hit = ui.interact(
-                header.rect,
+                header_rect,
                 ui.id().with("tool-header"),
                 egui::Sense::click(),
             );
             if hit.clicked() {
                 row.expanded = !row.expanded;
             }
-            hit.on_hover_cursor(egui::CursorIcon::PointingHand);
-            if !row.tool_args.is_empty() {
-                // `Label::truncate()` already shows the full text as a tooltip
-                // when the text elides (egui `label.rs`: `if galley.elided {
-                // response.on_hover_text(galley.text()) }`). Adding our own
-                // `.on_hover_text(&row.tool_args)` on top of it produced TWO
-                // identical tooltips stacked vertically on any cut-off command.
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&row.tool_args)
-                            .monospace()
-                            .size(12.0)
-                            .color(MUTED),
-                    )
-                    .truncate(),
-                );
-            }
+            let hit = hit.on_hover_cursor(egui::CursorIcon::PointingHand);
+
             if row.streaming && matches!(row.text.as_str(), "subagent" | "agent") {
                 if let Some(progress) = &row.tool_output {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(
-                                progress.lines().take(4).collect::<Vec<_>>().join("\n"),
-                            )
-                            .size(12.0)
-                            .color(TEAL),
-                        )
-                        .wrap(),
-                    );
+                    ui.add_space(8.0);
+                    egui::Frame::none()
+                        .fill(SIDEBAR)
+                        .rounding(egui::Rounding::same(7.0))
+                        .inner_margin(egui::Margin::symmetric(9.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    progress.lines().take(4).collect::<Vec<_>>().join("\n"),
+                                )
+                                .size(11.5)
+                                .color(TEAL),
+                            );
+                        });
                 }
             }
-            if row.expanded {
+            let tool_state_id = ui.id().with("tool-output-collapsible");
+            let mut tool_state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                tool_state_id,
+                row.expanded,
+            );
+            if tool_state.is_open() != row.expanded {
+                tool_state.set_open(row.expanded);
+                ui.ctx().request_repaint();
+            }
+            let _ = tool_state.show_body_unindented(ui, |ui| {
+                // The header carries only the meaning; reveal the raw command
+                // or anchor list here so nothing is hidden from the user.
+                if !row.tool_detail.is_empty() {
+                    ui.add_space(9.0);
+                    ui.label(
+                        egui::RichText::new(if matches!(row.text.as_str(), "bash" | "shell") {
+                            "COMMAND"
+                        } else {
+                            "ARGS"
+                        })
+                        .size(10.5)
+                        .strong()
+                        .color(MUTED),
+                    );
+                    ui.add_space(5.0);
+                    egui::Frame::none()
+                        .fill(SIDEBAR)
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.set_width((width - 20.0).max(100.0));
+                            let mut job = egui::text::LayoutJob::simple(
+                                row.tool_detail.clone(),
+                                egui::FontId::monospace(12.0),
+                                TEXT,
+                                ui.available_width(),
+                            );
+                            job.wrap.max_rows = 6;
+                            job.wrap.break_anywhere = true;
+                            ui.add(egui::Label::new(job));
+                        });
+                }
+                ui.add_space(9.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(if row.streaming {
+                            "LIVE OUTPUT"
+                        } else {
+                            "OUTPUT"
+                        })
+                        .size(10.5)
+                        .strong()
+                        .color(MUTED),
+                    );
+                    if row.streaming {
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("streaming").size(10.5).color(TEAL));
+                    }
+                });
                 ui.add_space(5.0);
                 egui::Frame::none()
-                    .fill(PANEL_2)
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::same(11.0))
+                    .fill(output_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
-                        ui.set_width((width - 22.0).max(100.0));
+                        ui.set_width((width - 20.0).max(100.0));
                         egui::ScrollArea::vertical()
                             .id_salt("tool-output")
                             .max_height(230.0)
@@ -249,15 +538,27 @@ fn render_tool(ui: &mut egui::Ui, row: &mut ChatRow, now: f64) {
                                     egui::Label::new(
                                         egui::RichText::new(text)
                                             .monospace()
-                                            .size(13.0)
+                                            .size(12.5)
                                             .color(TEXT),
                                     )
                                     .wrap(),
                                 );
                             });
                     });
-            }
+            });
+            hit
         });
+    if row.streaming {
+        crate::activity::sweep(ui, card.response.rect, now, accent_color);
+    }
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(card.response.rect.left(), card.response.rect.top() + 10.0),
+        egui::pos2(
+            card.response.rect.left() + 3.0,
+            card.response.rect.bottom() - 10.0,
+        ),
+    );
+    ui.painter().rect_filled(rail, 1.5, accent);
 }
 
 /// Bytes of a live stream kept in the last, still-growing label.
@@ -921,6 +1222,56 @@ mod tests {
         }
         assert!(heights[0] > heights[1]);
         assert!(heights[2] > heights[1]);
+    }
+    #[test]
+    fn clicked_tool_header_toggles_expansion_and_layout_height() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let mut row = ChatRow::new(RowKind::Tool, "read");
+        row.tool_args = "src/main.rs".into();
+        row.tool_output = Some("hidden body".into());
+        assert!(!row.expanded);
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let mut heights = Vec::new();
+        // First frame only lays out; then click inside the header band and let
+        // egui deliver press+release before the expansion frame is measured.
+        for frame in 0..5 {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(frame as f64 / 60.0),
+                ..Default::default()
+            };
+            let pos = egui::pos2(450.0, 14.0);
+            raw.events.push(egui::Event::PointerMoved(pos));
+            if frame == 1 {
+                for pressed in [true, false] {
+                    raw.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let start = ui.cursor().min.y;
+                    render_row(ui, &mut row, 0.0, true);
+                    heights.push(ui.cursor().min.y - start);
+                });
+            });
+        }
+        assert!(
+            row.expanded,
+            "clicking the tool header must expand the card"
+        );
+        let first = heights[0];
+        let last = *heights.last().unwrap();
+        assert!(
+            last > first,
+            "expanding must grow the card: {first} -> {last}"
+        );
     }
     #[test]
     fn expanded_tool_card_contains_chinese_argument_and_output_galleys() {

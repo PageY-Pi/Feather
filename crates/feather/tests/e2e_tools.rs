@@ -108,7 +108,12 @@ async fn agent_loop_end_to_end_matches_pi_formats() {
             serde_json::json!({"path": file.display().to_string(),
                                "content": "alpha line\nbeta line\ngamma line\n"}),
         )
-        .with_tool("bash", serde_json::json!({"command": "echo hello-e2e"}))
+        .with_tool(
+            "bash",
+            // The intent is required, so the scripted call carries it like a
+            // real one must.
+            serde_json::json!({"command": "echo hello-e2e", "description": "print a marker"}),
+        )
         .with_tool(
             "task_create",
             serde_json::json!({"title": "write the demo", "description": "e2e check"}),
@@ -170,6 +175,7 @@ async fn agent_loop_end_to_end_matches_pi_formats() {
                 call,
                 text,
                 is_error,
+                details: _,
             } => tool_results.push((call.name, text, is_error)),
             AgentEvent::TextDelta(_) => saw_text_delta = true,
             AgentEvent::RunEnd(_) => saw_run_end = true,
