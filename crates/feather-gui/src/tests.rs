@@ -104,6 +104,41 @@ fn utf8_output_truncation_never_splits_a_character() {
     assert_eq!(truncate_utf8("hello", 10), "hello");
 }
 
+/// The owned variant exists only to skip a copy, so it must agree byte-for-byte
+/// with the borrowing one, including the char-boundary walk at the limit.
+#[test]
+fn owned_truncation_matches_the_borrowing_one() {
+    let cases: &[(String, usize)] = &[
+        ("hello".to_string(), 10),
+        (String::new(), 0),
+        ("abcdef".to_string(), 3),
+        ("羽".repeat(10_000), 20_000),
+        ("羽".repeat(10_000), 20_001),
+        ("a羽b".to_string(), 2),
+        ("a羽b".to_string(), 3),
+        (format!("{}\n… (truncated)", "z".repeat(40)), 20),
+    ];
+    for (text, limit) in cases {
+        assert_eq!(
+            truncate_owned(text.clone(), *limit),
+            truncate_utf8(text, *limit),
+            "mismatch for limit {limit} on {} bytes",
+            text.len()
+        );
+    }
+    // Truncation is not idempotent: the marker itself is inside the limit, so
+    // re-truncating a truncated string drops part of the old marker and appends
+    // a fresh one. Document the growth rather than pretend it is stable — no
+    // caller re-truncates a result, and the test pins the real behaviour.
+    let once = truncate_owned("羽".repeat(10_000), 20_000);
+    let twice = truncate_owned(once.clone(), 20_000);
+    assert_eq!(
+        twice.len(),
+        once.len() + 1,
+        "second pass re-truncates the marker"
+    );
+}
+
 #[test]
 fn finalized_message_precedes_queued_user_delivery() {
     let mut app = fixture();
@@ -1855,6 +1890,26 @@ fn the_web_tools_share_a_globe() {
         crate::cards::tool_visuals("web_search").1,
         "local grep is not a network call"
     );
+}
+
+/// The task tools are a tracked checklist, so they get a checked box rather
+/// than the `{}` placeholder every unlisted tool fell through to.
+#[test]
+fn the_task_tools_carry_a_checklist_mark() {
+    for name in ["task_create", "task_update", "task_list", "task_get"] {
+        assert_eq!(
+            crate::cards::tool_visuals(name).1,
+            "☑",
+            "{name} belongs to the task store"
+        );
+    }
+    // Each still reads as a distinct verb: sharing an icon must not collapse
+    // the label, or a transcript of create/update/list becomes unreadable.
+    assert_eq!(crate::cards::tool_visuals("task_create").0, "Task Create");
+    assert_eq!(crate::cards::tool_visuals("task_update").0, "Task Update");
+    assert_eq!(crate::cards::tool_visuals("task_list").0, "Task List");
+    // And no task card is left rendering as a bare id.
+    assert_ne!(crate::cards::tool_visuals("task_create").1, "{}");
 }
 
 #[test]

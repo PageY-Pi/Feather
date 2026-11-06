@@ -16,6 +16,11 @@ struct Heights {
     bar_band: Option<egui::Rect>,
     follow_tail: Option<bool>,
     last_offset: Option<f32>,
+    /// Lowest row index whose height may differ from what `prefix` was built
+    /// from. Heights are measured *after* the prefix is used for this frame's
+    /// layout, so the next frame must recompute from here rather than from the
+    /// stamp diff alone (which sees only row identity, not new heights).
+    dirty_from: usize,
 }
 #[derive(Default, Clone)]
 pub struct View {
@@ -44,15 +49,34 @@ fn prefix(values: &[f32]) -> Vec<f32> {
     }
     result
 }
-fn rebuild_prefix(values: &[f32], prefix: &mut Vec<f32>) {
-    prefix.clear();
-    prefix.reserve(values.len() + 1);
-    prefix.push(10.0);
-    let mut total = 10.0;
-    for &height in values {
-        total += height;
-        prefix.push(total);
+/// Recompute `prefix` for `values`, reusing entries up to `dirty_from`.
+///
+/// `prefix` is one longer than `values`: `prefix[i]` is the y of row `i` and
+/// `prefix[n]` the total. `dirty_from` is the index of the *first row whose
+/// height changed*; every entry before it — `prefix[0..=dirty_from]` — depends
+/// only on rows before that one and is still correct, so the recomputation
+/// starts there instead of redoing the whole history. At 2000+ rows a full
+/// rebuild was the most expensive single thing `show` did per frame.
+fn rebuild_prefix_from(values: &[f32], prefix: &mut Vec<f32>, dirty_from: usize) {
+    let needed = values.len() + 1;
+    let start = dirty_from.min(needed.saturating_sub(1));
+    prefix.resize(needed, 10.0);
+    prefix.truncate(needed);
+    // Rows at and after `start` may hold stale or garbage entries, so the sum is
+    // re-seeded from the last trustworthy entry: `prefix[start]` is the y of row
+    // `start`, which equals the y of the row before it plus that row's height.
+    let mut total = if start == 0 {
+        prefix.fill(10.0);
+        10.0
+    } else {
+        prefix[start]
+    };
+    total = total.max(10.0);
+    for index in start..values.len() {
+        total += values[index];
+        prefix[index + 1] = total;
     }
+    prefix[0] = 10.0;
 }
 /// Return only the intersecting range with bounded pixel overscan.
 fn visible_range(prefix: &[f32], top: f32, bottom: f32) -> std::ops::Range<usize> {
@@ -126,7 +150,9 @@ pub fn show(
             // prepended. ui_key is stable; row indices are not. This also handles
             // one boundary tool-result row being joined into its older call.
             let mut rebased_viewport = viewport;
+            let mut rebased = false;
             if !cache.stamps.is_empty() && cache.stamps[0] != rows.first().map_or(0, |r| r.ui_key) {
+                rebased = true;
                 let old_prefix = prefix(&cache.values);
                 let old_anchor = old_prefix
                     .partition_point(|y| *y <= viewport.min.y)
@@ -164,20 +190,35 @@ pub fn show(
                 cache.stamps = rows.iter().map(|r| r.ui_key).collect();
             }
             let viewport = rebased_viewport;
+            // A shorter history invalidates the prefix tail: every entry from
+            // the new length onward is gone.
+            if cache.values.len() > rows.len() {
+                cache.dirty_from = cache.dirty_from.min(rows.len());
+            }
             cache.values.resize(rows.len(), 140.0);
             cache.measured.resize(rows.len(), None);
             cache.stamps.resize(rows.len(), 0);
             cache.values.truncate(rows.len());
             cache.measured.truncate(rows.len());
             cache.stamps.truncate(rows.len());
+            let mut dirty_from = rows.len();
             for (index, row) in rows.iter().enumerate() {
                 if cache.stamps[index] != row.ui_key {
                     cache.values[index] = 140.0;
                     cache.measured[index] = None;
                     cache.stamps[index] = row.ui_key;
+                    dirty_from = dirty_from.min(index);
                 }
             }
-            rebuild_prefix(&cache.values, &mut cache.prefix);
+            // Heights are measured at the end of the previous frame, after that
+            // frame's prefix was already consumed, so this carries the earlier
+            // mark forward. Row identity changes and a rebase both widen it.
+            dirty_from = dirty_from.min(cache.dirty_from);
+            if rebased {
+                dirty_from = 0;
+            }
+            cache.dirty_from = rows.len();
+            rebuild_prefix_from(&cache.values, &mut cache.prefix, dirty_from);
             let old_prefix = &cache.prefix;
             let anchor = old_prefix
                 .partition_point(|y| *y <= viewport.min.y)
@@ -236,6 +277,11 @@ pub fn show(
                         correction += intra_correction;
                     }
                     cache.values[index] = height;
+                    // Record for the next frame: this row's prefix entry and
+                    // every entry after it are now stale.
+                    if delta.abs() > 0.01 {
+                        cache.dirty_from = cache.dirty_from.min(index);
+                    }
                 }
             }
             new_total = cache.values.iter().sum::<f32>() + 20.0 + if waiting { 76.0 } else { 0.0 };
@@ -479,6 +525,34 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The suffix-only rebuild must agree with a full rebuild for every dirty
+    /// position — this is the whole safety argument for not recomputing the
+    /// prefix from scratch each frame.
+    #[test]
+    fn suffix_prefix_rebuild_matches_full_rebuild() {
+        let values: Vec<f32> = (0..200).map(|i| 100.0 + (i % 17) as f32 * 3.5).collect();
+        let full = prefix(&values);
+        for dirty in [0usize, 1, 7, 99, 198, 199, 200] {
+            let mut rebuilt = full.clone();
+            // `prefix[dirty]` depends only on rows before `dirty`, so it stays
+            // correct; everything after it must be recomputed. Trash that tail
+            // so a rebuild which skipped it would be caught.
+            for entry in rebuilt.iter_mut().skip(dirty + 1) {
+                *entry = 0.0;
+            }
+            rebuild_prefix_from(&values, &mut rebuilt, dirty);
+            assert_eq!(rebuilt, full, "dirty_from={dirty}");
+        }
+
+        // Growing and shrinking histories stay consistent too.
+        let mut cache_prefix = prefix(&values[..50]);
+        rebuild_prefix_from(&values, &mut cache_prefix, 50);
+        assert_eq!(cache_prefix, full);
+        let mut shrunk = full.clone();
+        rebuild_prefix_from(&values[..40], &mut shrunk, 40);
+        assert_eq!(shrunk, prefix(&values[..40]));
+    }
     #[test]
     fn range_is_bounded_for_large_histories() {
         let prefix: Vec<_> = (0..=10000).map(|i| i as f32 * 100.0).collect();
@@ -552,6 +626,9 @@ mod tests {
             h.follow_tail = Some(false);
             h.values.fill(140.0);
             h.measured.fill(None);
+            // Resetting every height by hand invalidates the whole prefix; the
+            // normal path would have recorded this as it re-measured.
+            h.dirty_from = 0;
             d.insert_temp(cache_id.unwrap(), h);
         });
         let mut state = egui::scroll_area::State::load(&ctx, scroll_id.unwrap()).unwrap();

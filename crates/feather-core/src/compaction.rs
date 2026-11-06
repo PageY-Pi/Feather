@@ -96,10 +96,12 @@ pub fn compaction_room(
 
 /// Head+tail shrink around an elision marker. Never returns something longer
 /// than the input; the marker states how much was removed.
-pub fn shrink_tool_result(text: &str, budget: usize) -> (String, usize, usize) {
+pub fn shrink_tool_result(text: &str, budget: usize) -> (std::borrow::Cow<'_, str>, usize, usize) {
     let total = text.chars().count();
     if total <= budget || budget < 64 {
-        return (text.to_string(), total, total);
+        // Borrowed: most tool results are under budget, and the caller usually
+        // only inspects the length before deciding not to replace the message.
+        return (std::borrow::Cow::Borrowed(text), total, total);
     }
     let head = budget * 3 / 5;
     let tail = budget - head;
@@ -107,15 +109,15 @@ pub fn shrink_tool_result(text: &str, budget: usize) -> (String, usize, usize) {
     let tail_s: String = text.chars().skip(total - tail).collect();
     let elided = total - head - tail;
     let out = format!("{head_s}\n[feather: {elided} chars elided by compaction]\n{tail_s}");
-    (out, total, elided)
+    (std::borrow::Cow::Owned(out), total, elided)
 }
 
 /// Shrink arbitrary live-context text with a neutral marker. Raw audit text is
 /// never passed here; this is only for the replaceable model context.
-pub fn shrink_text(text: &str, budget: usize) -> (String, usize, usize) {
+pub fn shrink_text(text: &str, budget: usize) -> (std::borrow::Cow<'_, str>, usize, usize) {
     let total = text.chars().count();
     if total <= budget || budget < 64 {
-        return (text.to_string(), total, total);
+        return (std::borrow::Cow::Borrowed(text), total, total);
     }
     let marker = "\n[feather: content elided by compaction]\n";
     let marker_len = marker.chars().count();
@@ -125,7 +127,11 @@ pub fn shrink_text(text: &str, budget: usize) -> (String, usize, usize) {
     let head_s: String = text.chars().take(head).collect();
     let tail_s: String = text.chars().skip(total.saturating_sub(tail)).collect();
     let removed = total.saturating_sub(head + tail);
-    (format!("{head_s}{marker}{tail_s}"), total, removed)
+    (
+        std::borrow::Cow::Owned(format!("{head_s}{marker}{tail_s}")),
+        total,
+        removed,
+    )
 }
 
 /// Force a live context under an estimated-token budget. Complete oldest turns
@@ -133,8 +139,21 @@ pub fn shrink_text(text: &str, budget: usize) -> (String, usize, usize) {
 /// arguments are elided while preserving message roles and call/result pairing.
 /// The durable raw audit is never passed here and therefore remains complete.
 pub fn shrink_messages_to_tokens(messages: &mut Vec<Message>, budget: u64) {
+    // Per-message token estimates, kept in step with `messages` so both phases
+    // below stay linear in the number of blocks instead of quadratic. Calling
+    // `estimate_context_tokens` per iteration re-tokenizes the whole context —
+    // once per removed turn and up to 64 times for elision — which is what made
+    // this take ~1s on a long session.
+    let mut per_message: Vec<u64> = messages
+        .iter()
+        .map(tokenizer::estimate_message_tokens)
+        .collect();
+    // `estimate_context_tokens` adds a fixed 16-token request overhead.
+    let mut total: u64 = per_message.iter().sum::<u64>() + 16;
+
+    // Phase 1: drop the oldest complete kept turn at a time.
     loop {
-        if tokenizer::estimate_context_tokens(messages) <= budget {
+        if total <= budget {
             return;
         }
         // Keep the synthetic summary at index zero. Remove the oldest complete
@@ -160,18 +179,21 @@ pub fn shrink_messages_to_tokens(messages: &mut Vec<Message>, budget: u64) {
             .filter_map(|(i, m)| (m.role == Role::User).then_some(i))
             .collect();
         if starts.len() >= 2 && starts[1] <= protect_until {
-            messages.drain(1..starts[1]);
+            let end = starts[1];
+            let removed: u64 = per_message.drain(1..end).sum();
+            messages.drain(1..end);
+            total -= removed;
             continue;
         }
         break;
     }
 
+    // Phase 2: elide the largest block until the estimate fits.
     for _ in 0..64 {
-        let current = tokenizer::estimate_context_tokens(messages);
-        if current <= budget {
+        if total <= budget {
             return;
         }
-        let excess = current.saturating_sub(budget);
+        let excess = total.saturating_sub(budget);
         let mut largest: Option<(usize, usize, usize)> = None;
         for (mi, message) in messages.iter().enumerate() {
             for (bi, block) in message.content.iter().enumerate() {
@@ -197,7 +219,9 @@ pub fn shrink_messages_to_tokens(messages: &mut Vec<Message>, budget: u64) {
         match &mut messages[mi].content[bi] {
             ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => {
                 let (shrunk, _, _) = shrink_text(text, target);
-                *text = shrunk;
+                // `shrunk` may borrow `text`, so materialise it before the
+                // assignment that would otherwise alias the same block.
+                *text = shrunk.into_owned();
             }
             ContentBlock::ToolCall(call) => {
                 call.arguments = serde_json::json!({
@@ -207,6 +231,10 @@ pub fn shrink_messages_to_tokens(messages: &mut Vec<Message>, budget: u64) {
             }
             ContentBlock::Image { .. } => return,
         }
+        // Re-estimate only the message that changed.
+        let updated = tokenizer::estimate_message_tokens(&messages[mi]);
+        total = total - per_message[mi] + updated;
+        per_message[mi] = updated;
     }
 }
 /// Serialize messages for the summarizer with tool results shrunk to
@@ -254,7 +282,10 @@ pub fn serialize_messages<'a>(
                 }
             }
             Role::ToolResult => {
-                let (shrunk, _, _) = shrink_tool_result(&m.text_cow(), budget);
+                // Bind the Cow first: the shrink may borrow it, so it has to
+                // outlive the temporary that `text_cow()` would otherwise be.
+                let text = m.text_cow();
+                let (shrunk, _, _) = shrink_tool_result(&text, budget);
                 out.push_str("[Tool result]: ");
                 out.push_str(&shrunk);
                 out.push('\n');
@@ -590,17 +621,25 @@ pub fn shrink_kept_span(messages: &mut [Message], settings: &CompactionSettings)
         if messages[i].shrink.is_some() {
             continue; // already shrunk; keep byte-stable
         }
-        let text = messages[i].text();
-        let (shrunk, original_len, _) = shrink_tool_result(&text, settings.kept_tool_result_budget);
-        if shrunk.len() < text.len() {
-            saved += text.len() - shrunk.len();
-            messages[i].content = vec![ContentBlock::Text { text: shrunk }];
-            messages[i].shrink = Some(crate::message::ShrinkInfo {
-                original_len,
-                head: settings.kept_tool_result_budget * 3 / 5,
-                tail: settings.kept_tool_result_budget * 2 / 5,
-            });
-        }
+        // Borrow the message text: an already-shrunk result leaves it untouched,
+        // and `shrink_tool_result` only borrows when it is under budget.
+        let (replacement, original_len) = {
+            let text = messages[i].text_cow();
+            let (shrunk, original_len, _) =
+                shrink_tool_result(&text, settings.kept_tool_result_budget);
+            let delta = text.len().saturating_sub(shrunk.len());
+            if delta == 0 {
+                continue;
+            }
+            saved += delta;
+            (shrunk.into_owned(), original_len)
+        };
+        messages[i].content = vec![ContentBlock::Text { text: replacement }];
+        messages[i].shrink = Some(crate::message::ShrinkInfo {
+            original_len,
+            head: settings.kept_tool_result_budget * 3 / 5,
+            tail: settings.kept_tool_result_budget * 2 / 5,
+        });
     }
     saved
 }
@@ -669,6 +708,137 @@ pub fn summary_message(summary: &str, reads: &[String], writes: &[String]) -> Me
 
 #[cfg(test)]
 mod tests {
+    /// The shrinker must fit the budget without re-tokenizing the whole context on
+    /// every iteration. This pins the observable contract (it lands under budget,
+    /// keeps the summary, and preserves call/result pairing) and — via a generous
+    /// time bound — catches a return to quadratic behaviour.
+    #[test]
+    fn shrinking_a_long_session_stays_under_budget_and_is_not_quadratic() {
+        let mut messages = vec![Message::user_text("[summary] earlier context")];
+        for t in 0..80 {
+            messages.push(Message::user_text(format!("turn {t} request")));
+            for m in 0..3 {
+                messages.push(Message::assistant(
+                    vec![
+                        ContentBlock::Text {
+                            text: "lorem ipsum dolor sit amet ".repeat(150),
+                        },
+                        ContentBlock::ToolCall(crate::message::ToolCall {
+                            id: format!("call_{t}_{m}"),
+                            name: "write".into(),
+                            arguments: serde_json::json!({"content": "x".repeat(4000)}),
+                        }),
+                    ],
+                    "m",
+                    crate::message::Api::Faux,
+                    crate::message::Usage::default(),
+                    crate::message::StopReason::Stop,
+                ));
+                messages.push(Message::tool_result(
+                    format!("call_{t}_{m}"),
+                    "write",
+                    "ok".repeat(500),
+                    false,
+                ));
+            }
+            messages.push(Message::assistant(
+                vec![ContentBlock::Text {
+                    text: format!("answer {t}"),
+                }],
+                "m",
+                crate::message::Api::Faux,
+                crate::message::Usage::default(),
+                crate::message::StopReason::Stop,
+            ));
+        }
+        let budget = crate::tokenizer::estimate_context_tokens(&messages) / 8;
+        let started = std::time::Instant::now();
+        shrink_messages_to_tokens(&mut messages, budget);
+        let elapsed = started.elapsed();
+
+        assert!(
+            crate::tokenizer::estimate_context_tokens(&messages) <= budget,
+            "shrink must land under the budget"
+        );
+        assert_eq!(
+            messages[0].text(),
+            "[summary] earlier context",
+            "the synthetic summary stays at index zero"
+        );
+        // Every surviving tool call keeps its result (pairing is preserved).
+        let calls: Vec<String> = messages
+            .iter()
+            .flat_map(|m| m.iter_tool_calls().map(|c| c.id.clone()))
+            .collect();
+        for id in &calls {
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.tool_call_id.as_deref() == Some(id.as_str())),
+                "tool call {id} lost its result"
+            );
+        }
+        // Quadratic behaviour is detectable as *growth*, not as an absolute time:
+        // quadruple the session and a linear shrinker takes ~4x as long, while a
+        // re-tokenizing one takes ~16x. Absolute walls are flaky on shared CI.
+        let small = elapsed;
+        let mut bigger = vec![Message::user_text("[summary] earlier context")];
+        for t in 0..320 {
+            bigger.push(Message::user_text(format!("turn {t} request")));
+            for m in 0..3 {
+                bigger.push(Message::assistant(
+                    vec![
+                        ContentBlock::Text {
+                            text: "lorem ipsum dolor sit amet ".repeat(150),
+                        },
+                        ContentBlock::ToolCall(crate::message::ToolCall {
+                            id: format!("call_{t}_{m}"),
+                            name: "write".into(),
+                            arguments: serde_json::json!({"content": "x".repeat(4000)}),
+                        }),
+                    ],
+                    "m",
+                    crate::message::Api::Faux,
+                    crate::message::Usage::default(),
+                    crate::message::StopReason::Stop,
+                ));
+                bigger.push(Message::tool_result(
+                    format!("call_{t}_{m}"),
+                    "write",
+                    "ok".repeat(500),
+                    false,
+                ));
+            }
+            bigger.push(Message::assistant(
+                vec![ContentBlock::Text {
+                    text: format!("answer {t}"),
+                }],
+                "m",
+                crate::message::Api::Faux,
+                crate::message::Usage::default(),
+                crate::message::StopReason::Stop,
+            ));
+        }
+        let big_budget = crate::tokenizer::estimate_context_tokens(&bigger) / 8;
+        let started = std::time::Instant::now();
+        shrink_messages_to_tokens(&mut bigger, big_budget);
+        let large = started.elapsed();
+        assert!(
+            crate::tokenizer::estimate_context_tokens(&bigger) <= big_budget,
+            "the larger session must also land under budget"
+        );
+
+        // Compare per-message cost so the 4x size change is normalised out.
+        let small_per_msg = small.as_secs_f64() / 4.0 / 81.0;
+        let large_per_msg = large.as_secs_f64() / 4.0 / 321.0;
+        assert!(
+            large_per_msg < small_per_msg * 3.0,
+            "per-message cost grew {:.1}x from {} msgs to 321 msgs; the shrinker is \
+         scanning the whole context per iteration again (quadratic)",
+            large_per_msg / small_per_msg.max(f64::MIN_POSITIVE),
+            81
+        );
+    }
     #[test]
     fn borrowed_cut_without_reasoning_matches_sanitized_cut() {
         let mut messages = Vec::new();
@@ -754,6 +924,15 @@ mod tests {
         let (out2, t2, e2) = shrink_tool_result("short", 1000);
         assert_eq!(out2, "short");
         assert_eq!((t2, e2), (5, 5));
+        // Under budget, the text is borrowed rather than copied: this is what
+        // keeps a large-but-unshrunk tool result from being duplicated.
+        assert!(matches!(out2, std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        // A tiny budget is a no-op too, even though the text is long: the
+        // helper refuses to shrink below 64 and must not fabricate ownership.
+        let (out3, _, _) = shrink_tool_result(&long, 8);
+        assert!(matches!(out3, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out3.len(), 10_000);
     }
 
     #[test]

@@ -169,6 +169,10 @@ pub fn delete_session(home: &Path, dir: &Path) -> Result<(), SessionError> {
         "tasks.redb",
         "checkpoints.redb",
         "subagents.redb",
+        // Git turn commits live in their own database so the checkpoint worker
+        // never contends with the durable snapshot. It still has to be probed
+        // here, or an active session could be deleted out from under it.
+        "git-turn-commits.redb",
     ] {
         let path = target.join(name);
         if path.exists() {
@@ -399,6 +403,49 @@ mod tests {
         assert!(!dir.exists());
         assert!(list_sessions(&home, &home).unwrap().is_empty());
         std::fs::remove_dir_all(home).unwrap();
+    }
+    /// Every database a live session can hold must guard deletion. The git turn
+    /// map moved to its own file when checkpoints went async; if the guard list
+    /// misses it, an active session can be deleted from under its worker.
+    #[test]
+    fn deletion_is_blocked_while_the_checkpoint_worker_holds_its_database() {
+        let home = std::env::temp_dir().join(crate::provider::gen_id("delete-guard"));
+        let root = home.join(".feather");
+        let cwd = home.join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut s = Session::new(&root, &cwd).unwrap();
+        s.push(Message::user_text("checkpoint me")).unwrap();
+        s.commit_turn().unwrap();
+        let dir = s.dir().to_path_buf();
+
+        // The git turn map is the database the async worker introduced. Close the
+        // session first so this test holds *only* that handle, then prove it
+        // still vetoes deletion: if the guard list misses it, history gets
+        // deleted out from under a live handle.
+        drop(s);
+        let git_db = dir.join("git-turn-commits.redb");
+        let _ = crate::database::create(&git_db);
+        let held = crate::database::open(&git_db).unwrap();
+        let err = delete_session(&root, &dir).unwrap_err().to_string();
+        assert!(
+            err.contains("close it before deleting"),
+            "expected the active-session guard to reject, got: {err}"
+        );
+        assert!(dir.exists());
+        drop(held);
+        let _ = delete_session(&root, &dir);
+        cleanup_dir(home);
+    }
+
+    /// Retry removal: a closing session can still be flushing on another
+    /// thread, and on Windows that surfaces as a sharing violation.
+    fn cleanup_dir(dir: std::path::PathBuf) {
+        for _ in 0..50 {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     #[test]
     fn catalog_covers_sessions_created_before_discovery() {

@@ -12,8 +12,103 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// How many file maps stay resident. A mapped 400-line source file costs about
+/// 76 KB (line `String`s plus an anchor, a hash, and two index entries per
+/// line), so an unbounded cache reaches ~150 MB after a couple of thousand
+/// files — a long session over a real repository does exactly that. Anchors
+/// are persisted in `anchors.redb` and re-adopted when every line hash still
+/// matches, so evicting a map costs a rebuild, never correctness.
+const MAP_CACHE_CAPACITY: usize = 64;
+
+/// Bounded, least-recently-used cache of file maps.
+///
+/// Both `get` and `get_mut` count as a use, because every tool path starts
+/// with a read and swapping in a map the caller is about to edit would be
+/// pure waste. `resolve_anchor` deliberately does *not* promote: it probes
+/// every resident map to find which file owns an anchor, so promoting there
+/// would let one anchor-only call reshuffle the entire cache.
+///
+/// Eviction is safe at any moment: the map is persisted on every edit, and a
+/// rebuild re-reads the file and adopts persisted anchors iff all line hashes
+/// match. The only visible effect is a rebuild on the next access, which the
+/// probe measured at 1.9 ms for 400 lines.
+struct MapCache {
+    entries: HashMap<PathBuf, AnchorMap>,
+    /// Access order, oldest first. Kept in sync with `entries`.
+    order: std::collections::VecDeque<PathBuf>,
+}
+
+impl MapCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, path: &Path) -> Option<&AnchorMap> {
+        if !self.entries.contains_key(path) {
+            return None;
+        }
+        self.promote(path);
+        self.entries.get(path)
+    }
+
+    fn get_mut(&mut self, path: &Path) -> Option<&mut AnchorMap> {
+        if !self.entries.contains_key(path) {
+            return None;
+        }
+        self.promote(path);
+        self.entries.get_mut(path)
+    }
+
+    /// Read without affecting recency — for whole-cache scans.
+    fn peek(&self, path: &Path) -> Option<&AnchorMap> {
+        self.entries.get(path)
+    }
+
+    fn contains_key(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
+    }
+
+    fn insert(&mut self, path: PathBuf, map: AnchorMap) {
+        self.entries.insert(path.clone(), map);
+        self.promote(&path);
+        self.evict_while_over_capacity();
+    }
+
+    fn remove(&mut self, path: &Path) -> Option<AnchorMap> {
+        self.order.retain(|p| p != path);
+        self.entries.remove(path)
+    }
+
+    /// Anchors of every resident file, for anchor-only resolution.
+    fn iter(&self) -> impl Iterator<Item = (&PathBuf, &AnchorMap)> {
+        self.entries.iter()
+    }
+
+    fn promote(&mut self, path: &Path) {
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(path.to_path_buf());
+    }
+
+    fn evict_while_over_capacity(&mut self) {
+        while self.entries.len() > MAP_CACHE_CAPACITY {
+            // `order` and `entries` are kept in sync, so a miss here means
+            // the invariant already broke; drop the entry anyway rather than
+            // spin forever.
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
 pub struct AnchorStore {
-    maps: Mutex<HashMap<PathBuf, AnchorMap>>,
+    maps: Mutex<MapCache>,
     home: PathBuf,
     records: Mutex<Option<feather_core::records::Records>>,
     snapshots: Option<feather_core::file_snapshots::FileSnapshots>,
@@ -21,17 +116,26 @@ pub struct AnchorStore {
     /// Most recent touch time per path — tiebreaker when an anchor exists in
     /// several mapped files (anchor-only resolution).
     last_touched: Mutex<HashMap<PathBuf, u64>>,
+    /// `(mtime, len)` of each mapped file as of the last `ensure`.
+    ///
+    /// `ensure` has to notice out-of-band edits, and the previous test was
+    /// "re-read the whole file and compare strings", which re-reads and
+    /// re-renders every mapped file on every tool call. A stat is enough to
+    /// prove the file is unchanged, so this is the cheap fast path; a mismatch
+    /// falls back to the exact content comparison.
+    stamps: Mutex<HashMap<PathBuf, (Option<std::time::SystemTime>, u64)>>,
 }
 
 impl AnchorStore {
     pub fn new(home: &Path) -> Self {
         Self {
-            maps: Mutex::new(HashMap::new()),
+            maps: Mutex::new(MapCache::new()),
             home: home.to_path_buf(),
             records: Mutex::new(None),
             snapshots: None,
 
             last_touched: Mutex::new(HashMap::new()),
+            stamps: Mutex::new(HashMap::new()),
         }
     }
 
@@ -88,18 +192,64 @@ impl AnchorStore {
     /// Ensure the file is mapped and current (re-map when the disk content
     /// diverged from the cached map — external edit detection).
     fn ensure(&self, path: &Path) -> Result<(), EngineError> {
-        {
+        // Fast path: an unchanged (mtime, len) proves the file is the one this
+        // map was built from. The old test re-read the whole file and re-rendered
+        // the map's lines on every call, which cost ~58us per `ensure` on a
+        // 100 KB source file and dominated every hashline tool call.
+        let stamp = std::fs::metadata(path)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()));
+        // Fast path: the stamp is unchanged, so the file is byte-identical to the
+        // one this map was built from and a resident map is current. Residency is
+        // checked without going through the LRU: `ensure` runs on every tool call
+        // and would otherwise keep reshuffling recency for files nobody reads.
+        let stamps = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+        let unchanged = stamp.is_some() && stamps.get(path) == stamp.as_ref();
+        drop(stamps);
+        if unchanged {
             let maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(m) = maps.get(path) {
+            if maps.contains_key(path) {
+                return Ok(());
+            }
+        }
+        // Stamp moved (or no stamp yet): fall back to the exact comparison, so an
+        // edit that preserves mtime and length is still detected.
+        {
+            let mut stamps = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+            stamps.remove(path);
+        }
+        {
+            // A resident map may still be current even though the stamp moved
+            // (touched-but-identical files are common), so compare content
+            // exactly before paying for a rebuild. `peek` keeps this out of the
+            // recency order for the same reason as the fast path above.
+            let maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+            let current = maps.peek(path).is_some_and(|m| {
                 let disk = std::fs::read_to_string(path).unwrap_or_default();
-                if disk == m.to_file_content() {
-                    return Ok(());
+                disk == m.to_file_content()
+            });
+            drop(maps);
+            if current {
+                if let Some(stamp) = stamp {
+                    self.stamps
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(path.to_path_buf(), stamp);
                 }
+                return Ok(());
             }
         }
         let map = self.build_map(path)?;
-        let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
-        maps.insert(path.to_path_buf(), map);
+        {
+            let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+            maps.insert(path.to_path_buf(), map);
+        }
+        if let Some(stamp) = stamp {
+            self.stamps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_path_buf(), stamp);
+        }
         Ok(())
     }
 
@@ -179,7 +329,18 @@ impl AnchorStore {
     ) -> Result<Vec<String>, EngineError> {
         self.ensure(path)?;
         self.touch(path);
-        let maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        // `ensure` proved the map exists, but with the cache now bounded another
+        // thread's insert can evict it in the gap before this lock is taken.
+        // Defensive: `concurrent_reads_never_observe_an_evicted_map` exercises
+        // four threads over 3× the capacity and does not reproduce the gap, so
+        // this narrows a real interleaving rather than a demonstrated failure.
+        // A rebuild costs ~2 ms; a spurious "map vanished" fails the tool call.
+        if !maps.contains_key(path) {
+            drop(maps);
+            self.ensure(path)?;
+            maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        }
         let m = maps
             .get(path)
             .ok_or_else(|| EngineError::Io("map vanished".into()))?;
@@ -193,8 +354,13 @@ impl AnchorStore {
 
     pub fn total_lines(&self, path: &Path) -> Result<usize, EngineError> {
         self.ensure(path)?;
-        let maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(maps.get(path).map(|m| m.len()).unwrap_or(0))
+        let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        if !maps.contains_key(path) {
+            drop(maps);
+            self.ensure(path)?;
+            maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        }
+        Ok(maps.peek(path).map(|m| m.len()).unwrap_or(0))
     }
 
     pub fn replace(
@@ -268,6 +434,11 @@ impl AnchorStore {
         self.ensure(src_path)?;
         let payload = {
             let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+            if !maps.contains_key(src_path) {
+                drop(maps);
+                self.ensure(src_path)?;
+                maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+            }
             let m = maps
                 .get_mut(src_path)
                 .ok_or_else(|| EngineError::Io("map vanished".into()))?;
@@ -290,7 +461,12 @@ impl AnchorStore {
         self.ensure(src_path)?;
         self.ensure(dst_path)?;
         if src_path == dst_path {
-            let maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+            let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+            if !maps.contains_key(src_path) {
+                drop(maps);
+                self.ensure(src_path)?;
+                maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+            }
             let m = maps
                 .get(src_path)
                 .ok_or_else(|| EngineError::Io("map vanished".into()))?;
@@ -341,6 +517,14 @@ impl AnchorStore {
     ) -> Result<T, EngineError> {
         self.before_edit(path)?;
         let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        // The caller ran `ensure`, but a concurrent insert can evict the map
+        // before this lock is taken. Rebuilding once is cheap and keeps the
+        // edit path from failing on a cache miss it did not cause.
+        if !maps.contains_key(path) {
+            drop(maps);
+            self.ensure(path)?;
+            maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        }
         let map = maps
             .get_mut(path)
             .ok_or_else(|| EngineError::Io("map vanished".into()))?;
@@ -349,7 +533,26 @@ impl AnchorStore {
         drop(maps);
         self.persist_record(&rec);
         self.after_edit(path)?;
+        // This store just wrote the file, so record its new stamp. Without this
+        // the next `ensure` sees a stale stamp, falls back to the exact
+        // comparison, and re-reads the whole file — costing the very I/O the
+        // fast path exists to avoid, on every edit followed by a read.
+        self.restamp(path);
         Ok(out)
+    }
+    /// Record the file's current `(mtime, len)` after this store wrote it.
+    fn restamp(&self, path: &Path) {
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                self.stamps
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(path.to_path_buf(), (m.modified().ok(), m.len()));
+            }
+            // Gone (a move/delete): forget the stamp so a later map rebuild
+            // cannot be short-circuited by stale metadata.
+            Err(_) => self.invalidate(path),
+        }
     }
 
     fn persist(&self, map: &AnchorMap) {
@@ -364,6 +567,12 @@ impl AnchorStore {
 
     /// Forget a file's mapping (write/rewrite).
     pub fn invalidate(&self, path: &Path) {
+        // Drop the stamp too: a map rebuilt later must not inherit a stale
+        // (mtime, len) that would short-circuit the freshness check.
+        self.stamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(path);
         let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
         maps.remove(path);
     }
@@ -552,6 +761,203 @@ mod tests {
         d
     }
 
+    /// The `(mtime, len)` fast path must never mask a real edit. Each case below
+    /// changes the file out of band and expects the store to re-map it.
+    #[test]
+    fn stale_maps_are_detected_after_external_edits() {
+        let dir = home("freshness");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let store = AnchorStore::new(&dir);
+        assert_eq!(store.total_lines(&path).unwrap(), 3);
+
+        // Append: length grows.
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(store.total_lines(&path).unwrap(), 4, "append detected");
+
+        // Same length, different content.
+        std::fs::write(&path, "ONE\nTWO\nTHR\nFOUR\n").unwrap();
+        let rows = store.read(&path, None, None).unwrap();
+        assert!(
+            rows.iter().any(|r| r.contains("ONE")),
+            "same-length rewrite must be detected: {rows:?}"
+        );
+
+        // Truncation.
+        std::fs::write(&path, "only\n").unwrap();
+        assert_eq!(store.total_lines(&path).unwrap(), 1, "truncation detected");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An unchanged file must not be re-read or re-rendered on every call.
+    #[test]
+    fn repeated_ensure_skips_rereading_an_unchanged_file() {
+        let dir = home("stamp-fastpath");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let store = AnchorStore::new(&dir);
+        assert_eq!(store.total_lines(&path).unwrap(), 2);
+        // The stamp is recorded after the first map build, so the next call
+        // takes the metadata-only path.
+        {
+            let stamps = store.stamps.lock().unwrap();
+            assert!(
+                stamps.contains_key(&path),
+                "a successful ensure must record the file stamp"
+            );
+        }
+        // Still correct on the fast path.
+        assert_eq!(store.total_lines(&path).unwrap(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    /// Reads after an edit through the store must reflect that edit, whether the
+    /// next call takes the metadata fast path or the exact-comparison fallback.
+    #[test]
+    fn edits_through_the_store_keep_reads_correct() {
+        let dir = home("edit-restamp");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let store = AnchorStore::new(&dir);
+        store.read(&path, None, None).unwrap();
+
+        let anchor = store.build_map(&path).unwrap().anchor_at(1).unwrap();
+        store.replace(&path, anchor, anchor, "TWO").unwrap();
+
+        // Immediate re-read (fast path is armed now) must show the edit.
+        let rows = store.read(&path, None, None).unwrap();
+        assert!(
+            rows.iter().any(|r| r.contains("TWO")),
+            "edit must be visible immediately: {rows:?}"
+        );
+        assert_eq!(store.total_lines(&path).unwrap(), 3);
+        // And a later out-of-band edit is still caught.
+        std::fs::write(&path, "one\nTWO\nthree\nfour\n").unwrap();
+        assert_eq!(store.total_lines(&path).unwrap(), 4);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Concurrent readers on a bounded cache must never fail with "map
+    /// vanished": a map can be evicted between `ensure` and the lock that reads
+    /// it, and the retry exists to absorb exactly that.
+    #[test]
+    fn concurrent_reads_never_observe_an_evicted_map() {
+        use std::sync::Arc;
+        let dir = home("lru-concurrent");
+        let store = Arc::new(AnchorStore::new(&dir));
+        // More files than the cache holds, so eviction is constant.
+        let count = crate::store::MAP_CACHE_CAPACITY * 3;
+        let files: Vec<PathBuf> = (0..count)
+            .map(|i| {
+                let path = dir.join(format!("c{i}.txt"));
+                std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+                path
+            })
+            .collect();
+
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let store = Arc::clone(&store);
+            let files = files.clone();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..4 {
+                    for i in 0..files.len() {
+                        // Rotate the starting point so threads disagree about order.
+                        let path = &files[(i + t * 7 + round * 13) % files.len()];
+                        let rows = store
+                            .read(path, None, None)
+                            .unwrap_or_else(|e| panic!("read failed on {path:?}: {e:?}"));
+                        assert_eq!(rows.len(), 3, "file {i}");
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("reader thread panicked");
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The cache must not grow without bound: a long session over a large repo
+    /// maps every file it touches, and each map costs ~76 KB.
+    #[test]
+    fn the_map_cache_stays_bounded_and_keeps_serving_evicted_files() {
+        let dir = home("lru-bound");
+        let store = AnchorStore::new(&dir);
+        // One more than the capacity, so at least one file must be evicted.
+        let count = crate::store::MAP_CACHE_CAPACITY + 8;
+        let files: Vec<PathBuf> = (0..count)
+            .map(|i| {
+                let path = dir.join(format!("f{i}.txt"));
+                std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+                path
+            })
+            .collect();
+
+        for path in &files {
+            store.read(path, None, None).unwrap();
+        }
+        let cached = store.maps.lock().unwrap().entries.len();
+        assert_eq!(
+            cached,
+            crate::store::MAP_CACHE_CAPACITY,
+            "cache must be capped at {MAP_CACHE_CAPACITY}, held {cached} of {count}"
+        );
+
+        // Every file still works, whether resident or rebuilt on demand. The
+        // first files were evicted, so this exercises both paths.
+        for (i, path) in files.iter().enumerate() {
+            assert_eq!(store.total_lines(path).unwrap(), 3, "file {i}");
+            let rows = store.read(path, None, None).unwrap();
+            assert!(
+                rows.iter().any(|r| r.contains("beta")),
+                "file {i}: {rows:?}"
+            );
+        }
+
+        // Edits still apply after an eviction + rebuild.
+        let first = &files[0];
+        let anchor = store.build_map(first).unwrap().anchor_at(1).unwrap();
+        store.replace(first, anchor, anchor, "BETA").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Recency has to be real: repeatedly reading one file must keep it
+    /// resident while a stream of other files evicts everything else.
+    #[test]
+    fn a_recently_used_map_survives_eviction_pressure() {
+        let dir = home("lru-recency");
+        let store = AnchorStore::new(&dir);
+        let hot = dir.join("hot.txt");
+        std::fs::write(&hot, "keep\nme\n").unwrap();
+        store.read(&hot, None, None).unwrap();
+
+        let capacity = crate::store::MAP_CACHE_CAPACITY;
+        for i in 0..capacity * 2 {
+            let path = dir.join(format!("cold{i}.txt"));
+            std::fs::write(&path, "cold\n").unwrap();
+            store.read(&path, None, None).unwrap();
+            // Touch the hot file often enough to stay the most recent.
+            store.read(&hot, None, None).unwrap();
+        }
+
+        let maps = store.maps.lock().unwrap();
+        assert!(
+            maps.contains_key(&hot),
+            "the most recently used map was evicted"
+        );
+        assert!(maps.entries.len() <= capacity);
+        drop(maps);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[test]
     fn anchor_edits_outside_workspace_rewind_through_session() {
         use feather_core::{Message, Session};

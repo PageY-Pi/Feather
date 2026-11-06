@@ -1248,6 +1248,22 @@ where
                     continue;
                 }
                 let kind = command["type"].as_str().unwrap_or("");
+                // Resolved once: the read-only table is pure, but the mutating
+                // arms below need it to be absent before they run.
+                let read_only = dispatch_read_command(
+                    kind,
+                    &command,
+                    ReadSnapshot {
+                        idle: idle.as_ref(),
+                        cached_state: &cached_state,
+                        cached_messages: &cached_messages,
+                        running: running.is_some(),
+                        is_compacting,
+                        queue: &queue,
+                        home,
+                        cwd,
+                    },
+                );
                 let result: Result<Option<Value>, String> = match kind {
                     "prompt" | "steer" | "follow_up" => match user_message(&command) {
                         Err(e) => Err(e),
@@ -1337,86 +1353,18 @@ where
                             }
                         }
                     }
-                    "get_entries" => {
-                        let dir = session_dir(idle.as_ref(), &cached_state);
-                        read_transcript(&dir).and_then(|entries| {
-                            let start = match command.get("since").and_then(Value::as_str) {
-                                Some(since) => entries
-                                    .iter()
-                                    .position(|entry| entry.id == since)
-                                    .map(|index| index + 1)
-                                    .ok_or_else(|| format!("Entry not found: {since}"))?,
-                                None => 0,
-                            };
-                            let leaf_id = entries.last().map(|entry| entry.id.clone());
-                            let payload = entries_payload(&entries, start);
-                            Ok(Some(json!({"entries": payload, "leafId": leaf_id})))
-                        })
-                    }
-                    "get_fork_messages" => {
-                        let dir = session_dir(idle.as_ref(), &cached_state);
-                        read_transcript(&dir).map(|entries| {
-                            let messages: Vec<Value> = entries
-                                .iter()
-                                .filter(|entry| entry.message.role == Role::User)
-                                .map(|entry| {
-                                    json!({"entryId": entry.id, "text": entry.message.text()})
-                                })
-                                .collect();
-                            Some(json!({"messages": messages}))
-                        })
-                    }
                     "set_steering_mode" | "set_follow_up_mode" => {
                         match command["mode"].as_str() {
-                            Some("all" | "one-at-a-time") => { queue.set_mode(kind == "set_steering_mode", command["mode"] == "all"); Ok(None) }
-                            _ => Err("mode must be all or one-at-a-time".into())
+                            Some("all" | "one-at-a-time") => {
+                                queue.set_mode(kind == "set_steering_mode", command["mode"] == "all");
+                                Ok(None)
+                            }
+                            _ => Err("mode must be all or one-at-a-time".into()),
                         }
                     }
-                    "get_state" => {
-                        let mut v = idle.as_ref().map(state).unwrap_or_else(|| cached_state.clone());
-                        let (steering, follow) = queue.snapshot();
-                        v["isStreaming"] = json!(running.is_some());
-                        v["isCompacting"] = json!(is_compacting);
-                        v["pendingMessageCount"] = json!(steering.len()+follow.len());
-                        if let Some(agent) = idle.as_ref() {
-                            v["thinkingLevel"] = json!(agent.thinking_level().map(|l| clamp_level(agent,l).as_str()).unwrap_or("off"));
-                        }
-                        Ok(Some(v))
-                    }
-                    "get_available_models" => {
-                        let global_context = idle.as_ref().map(|a| a.config().context_window).unwrap_or(200_000);
-                        let models = models::load().map(|cat| cat.providers.iter().flat_map(|(pid,p)| p.models.iter().map(move |m| model_object(pid,p,m,global_context))).collect::<Vec<_>>()).unwrap_or_default();
-                        Ok(Some(json!({"models":models})))
-                    }
-                    "get_available_thinking_levels" => {
-                        let levels = match idle.as_ref() {
-                            Some(agent) => available_thinking_levels(agent),
-                            None => levels_for_model(&cached_state["model"]),
-                        };
-                        Ok(Some(json!({"levels": levels})))
-                    }
-                    "get_commands" => Ok(Some(commands_object(home, cwd))),
-                    "get_messages" => {
-                        let messages: Vec<Value> = match idle.as_ref() {
-                            Some(agent) => agent.session().messages().iter().map(wire_message).collect(),
-                            None => cached_messages.iter().map(wire_message).collect(),
-                        };
-                        Ok(Some(json!({"messages": messages})))
-                    }
-                    "get_last_assistant_text" => {
-                        let text = match idle.as_ref() {
-                            Some(agent) => agent.session().messages().iter().rev().find(|m| m.role == Role::Assistant && !m.text().is_empty()).map(Message::text),
-                            None => cached_messages.iter().rev().find(|m| m.role == Role::Assistant && !m.text().is_empty()).map(Message::text),
-                        };
-                        Ok(Some(json!({"text": text})))
-                    }
-                    "get_session_stats" => {
-                        let stats = match idle.as_ref() {
-                            Some(agent) => session_stats(agent),
-                            None => cached_stats(&cached_state, &cached_messages),
-                        };
-                        Ok(Some(stats))
-                    }
+                    // Read-only commands resolve in one table lookup; anything
+                    // else falls through to the arms below, which mutate the loop.
+                    _ if read_only.is_some() => read_only.expect("guarded by is_some"),
                     "set_thinking_level" if running.is_some() || compacting.is_some() => match command["level"].as_str().and_then(ThinkingLevel::parse) {
                         Some(level) => {
                             pending_thinking = Some(if level == ThinkingLevel::Off { None } else { Some(level) });
@@ -1527,6 +1475,152 @@ where
         }
     }
     Ok(())
+}
+/// Commands that only read state: they take a plain snapshot and never touch
+/// the event loop's mutable locals, so they live outside `run_with_control`.
+///
+/// `None` means "not a read command" and lets the caller fall through to the
+/// mutating arms.
+///
+/// The mutating arms are deliberately *not* tabled here. They are ~180 lines in
+/// total but reach 12 distinct mutable locals (`idle`, `running`, `compacting`,
+/// `abort`, `bash`, `queue`, `cached_state`, `cached_messages`, `is_compacting`,
+/// `pending_aborts`, `pending_thinking`, `pending_auto_compaction`) through 59
+/// references, and seven of them `await` to install a freshly spawned task. A
+/// table would have to pass all of that as one `&mut` context struct — more
+/// indirection than the arms it replaces — so only the read-only half is
+/// extracted.
+/// The read-only view of the event loop that read commands answer from.
+///
+/// Bundled so a command handler never has to grow a parameter list: adding
+/// state means adding a field, and every arm sees it.
+struct ReadSnapshot<'a> {
+    idle: Option<&'a Agent>,
+    cached_state: &'a Value,
+    cached_messages: &'a [Message],
+    running: bool,
+    is_compacting: bool,
+    queue: &'a feather_core::agent::InputQueue,
+    home: &'a Path,
+    cwd: &'a Path,
+}
+fn dispatch_read_command(
+    kind: &str,
+    command: &Value,
+    snap: ReadSnapshot<'_>,
+) -> Option<Result<Option<Value>, String>> {
+    let ReadSnapshot {
+        idle,
+        cached_state,
+        cached_messages,
+        running,
+        is_compacting,
+        queue,
+        home,
+        cwd,
+    } = snap;
+    let result = match kind {
+        "get_entries" => {
+            let dir = session_dir(idle, cached_state);
+            read_transcript(&dir).and_then(|entries| {
+                let start = match command.get("since").and_then(Value::as_str) {
+                    Some(since) => entries
+                        .iter()
+                        .position(|entry| entry.id == since)
+                        .map(|index| index + 1)
+                        .ok_or_else(|| format!("Entry not found: {since}"))?,
+                    None => 0,
+                };
+                let leaf_id = entries.last().map(|entry| entry.id.clone());
+                let payload = entries_payload(&entries, start);
+                Ok(Some(json!({"entries": payload, "leafId": leaf_id})))
+            })
+        }
+        "get_fork_messages" => {
+            let dir = session_dir(idle, cached_state);
+            read_transcript(&dir).map(|entries| {
+                let messages: Vec<Value> = entries
+                    .iter()
+                    .filter(|entry| entry.message.role == Role::User)
+                    .map(|entry| json!({"entryId": entry.id, "text": entry.message.text()}))
+                    .collect();
+                Some(json!({"messages": messages}))
+            })
+        }
+        "get_state" => {
+            let mut v = idle.map(state).unwrap_or_else(|| cached_state.clone());
+            let (steering, follow) = queue.snapshot();
+            v["isStreaming"] = json!(running);
+            v["isCompacting"] = json!(is_compacting);
+            v["pendingMessageCount"] = json!(steering.len() + follow.len());
+            if let Some(agent) = idle {
+                v["thinkingLevel"] = json!(agent
+                    .thinking_level()
+                    .map(|l| clamp_level(agent, l).as_str())
+                    .unwrap_or("off"));
+            }
+            Ok(Some(v))
+        }
+        "get_available_models" => {
+            let global_context = idle.map(|a| a.config().context_window).unwrap_or(200_000);
+            let models = models::load()
+                .map(|cat| {
+                    cat.providers
+                        .iter()
+                        .flat_map(|(pid, p)| {
+                            p.models
+                                .iter()
+                                .map(move |m| model_object(pid, p, m, global_context))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(Some(json!({"models": models})))
+        }
+        "get_available_thinking_levels" => {
+            let levels = match idle {
+                Some(agent) => available_thinking_levels(agent),
+                None => levels_for_model(&cached_state["model"]),
+            };
+            Ok(Some(json!({"levels": levels})))
+        }
+        "get_commands" => Ok(Some(commands_object(home, cwd))),
+        "get_messages" => {
+            let messages: Vec<Value> = match idle {
+                Some(agent) => agent
+                    .session()
+                    .messages()
+                    .iter()
+                    .map(wire_message)
+                    .collect(),
+                None => cached_messages.iter().map(wire_message).collect(),
+            };
+            Ok(Some(json!({"messages": messages})))
+        }
+        "get_last_assistant_text" => {
+            let find = |messages: &[Message]| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant && !m.text().is_empty())
+                    .map(Message::text)
+            };
+            let text = match idle {
+                Some(agent) => find(agent.session().messages()),
+                None => find(cached_messages),
+            };
+            Ok(Some(json!({"text": text})))
+        }
+        "get_session_stats" => {
+            let stats = match idle {
+                Some(agent) => session_stats(agent),
+                None => cached_stats(cached_state, cached_messages),
+            };
+            Ok(Some(stats))
+        }
+        _ => return None,
+    };
+    Some(result)
 }
 
 #[cfg(test)]

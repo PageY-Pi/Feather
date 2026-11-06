@@ -6,6 +6,7 @@
 //! the GUI binary, one-shot mode and tests.
 
 pub mod agent;
+pub mod checkpoint_worker;
 pub mod compaction;
 pub mod database;
 pub mod file_snapshots;

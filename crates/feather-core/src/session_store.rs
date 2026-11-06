@@ -262,6 +262,56 @@ impl SessionStore {
         txn.commit()?;
         Ok(())
     }
+    /// Append a whole turn's audit rows with ONE durable commit.
+    ///
+    /// Committing the rows together turns one fsync per message into one per
+    /// turn. The rows stay individually addressable (sequence numbers are
+    /// contiguous) and a crash still cannot expose half a turn, because either
+    /// the transaction lands or it does not.
+    ///
+    /// `touch` carries discovery metadata (modified time, first prompt) so it
+    /// commits in the same transaction instead of a second one.
+    pub fn append_raw_batch<I>(
+        &self,
+        rows: I,
+        touch: Option<(u64, &str)>,
+    ) -> Result<u64, SessionStoreError>
+    where
+        I: IntoIterator<Item = (String, u64, Message)>,
+    {
+        let txn = self.db.begin_write()?;
+        let mut first_seq = None;
+        let mut next;
+        {
+            let mut raw = txn.open_table(RAW)?;
+            let mut meta = txn.open_table(META)?;
+            next = meta
+                .get(K_RAW_COUNT)?
+                .map(|v| bytes_to_u64(v.value()))
+                .unwrap_or(0);
+            for (id, timestamp, message) in rows {
+                let seq = next;
+                first_seq.get_or_insert(seq);
+                let rec = RawRecordRef {
+                    id: &id,
+                    timestamp,
+                    message: &message,
+                };
+                raw.insert(seq, serde_json::to_vec(&rec)?.as_slice())?;
+                next += 1;
+            }
+            if first_seq.is_some() {
+                meta.insert(K_RAW_COUNT, next.to_le_bytes().as_slice())?;
+            }
+            if let Some((modified_ms, first_prompt)) = touch {
+                meta.insert(K_MODIFIED_MS, modified_ms.to_le_bytes().as_slice())?;
+                meta.insert(K_FIRST_PROMPT, first_prompt.as_bytes())?;
+            }
+        }
+        txn.commit()?;
+        // The first sequence, or the current count when there was nothing to add.
+        Ok(first_seq.unwrap_or(next))
+    }
 
     /// Append one raw audit row, returning its sequence number.
     pub fn append_raw(

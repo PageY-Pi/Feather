@@ -4,6 +4,13 @@
 //! compaction threshold and budget arithmetic; exact usage always comes from
 //! the provider response and is recorded per assistant message.
 
+/// Fixed per-request overhead (framing, role markers) charged exactly once for
+/// a whole request. `estimate_context_tokens` and `estimate_request_static_tokens`
+/// both include it because each describes a complete request on its own, so any
+/// code that adds the two together must subtract one copy — see
+/// [`request_input_tokens_from_totals`].
+const REQUEST_OVERHEAD_TOKENS: u64 = 16;
+
 /// Words-in-text heuristic: ~4 chars per token, word-boundary aware, with a
 /// small surcharge for JSON punctuation density. Deterministic and fast.
 pub fn estimate_tokens(text: &str) -> u64 {
@@ -84,7 +91,17 @@ fn estimate_message_tokens_filtered(m: &crate::message::Message, include_thinkin
 
 /// Token count of the whole linear context (what would be sent).
 pub fn estimate_context_tokens(msgs: &[crate::message::Message]) -> u64 {
-    msgs.iter().map(estimate_message_tokens).sum::<u64>() + 16
+    msgs.iter().map(estimate_message_tokens).sum::<u64>() + REQUEST_OVERHEAD_TOKENS
+}
+
+/// Token count of the whole linear context with reasoning blocks excluded.
+/// `Session` keeps this as a running total for endpoints that drop reasoning
+/// from the request body; this function is the reference it is checked against.
+pub fn estimate_context_tokens_without_thinking(msgs: &[crate::message::Message]) -> u64 {
+    msgs.iter()
+        .map(estimate_message_tokens_without_thinking)
+        .sum::<u64>()
+        + REQUEST_OVERHEAD_TOKENS
 }
 
 /// Estimate the tokens occupied by a tool schema in the provider request.
@@ -114,11 +131,6 @@ pub fn estimate_request_input_tokens(
     messages: &[crate::message::Message],
     tools: &[crate::provider::ToolDef],
 ) -> u64 {
-    let system_tokens = if system.is_empty() {
-        0
-    } else {
-        estimate_tokens(system) + 4
-    };
     let message_tokens = if api.sends_reasoning_in_history() {
         messages.iter().map(estimate_message_tokens).sum::<u64>()
     } else {
@@ -127,11 +139,107 @@ pub fn estimate_request_input_tokens(
             .map(estimate_message_tokens_without_thinking)
             .sum::<u64>()
     };
-    system_tokens + message_tokens + tools.iter().map(estimate_tool_tokens).sum::<u64>() + 16
+    estimate_request_static_tokens(system, tools) + message_tokens
+}
+
+/// The part of a request that never changes between turns: system instructions
+/// plus tool schemas. Computed once per configuration and then reused, since
+/// re-estimating 24 tool schemas per turn costs more than the whole message scan
+/// at typical history sizes.
+pub fn estimate_request_static_tokens(system: &str, tools: &[crate::provider::ToolDef]) -> u64 {
+    let system_tokens = if system.is_empty() {
+        0
+    } else {
+        estimate_tokens(system) + 4
+    };
+    system_tokens + tools.iter().map(estimate_tool_tokens).sum::<u64>() + REQUEST_OVERHEAD_TOKENS
+}
+
+/// Assemble a request estimate from an already-computed static part and the
+/// session's running message totals.
+///
+/// `totals` is `(including reasoning, excluding reasoning)` — exactly what
+/// `Session` maintains as rows are pushed. `api` still chooses which of the two
+/// the request pays for, so switching models costs nothing. This is pure
+/// arithmetic: no message is visited, which is the point. It agrees with
+/// [`estimate_request_input_tokens`] whenever the totals describe the same
+/// messages, and `totals_assembled_estimate_matches_a_full_scan` pins that.
+///
+/// Both inputs already carry [`REQUEST_OVERHEAD_TOKENS`] because each measures a
+/// complete request on its own, so one copy is subtracted here. Charging it twice
+/// would inflate every request estimate by 16 and shift the compaction trigger.
+pub fn request_input_tokens_from_totals(
+    api: crate::message::Api,
+    static_tokens: u64,
+    totals: (u64, u64),
+) -> u64 {
+    let (with_reasoning, without_reasoning) = totals;
+    let message_tokens = if api.sends_reasoning_in_history() {
+        with_reasoning
+    } else {
+        without_reasoning
+    };
+    static_tokens + message_tokens.saturating_sub(REQUEST_OVERHEAD_TOKENS)
 }
 
 #[cfg(test)]
 mod tests {
+    /// The whole point of the running counters is that the cheap assembly
+    /// agrees with the full scan, for every API, on a history that contains
+    /// reasoning. If these ever diverge, compaction fires at the wrong line.
+    #[test]
+    fn totals_assembled_estimate_matches_a_full_scan() {
+        use crate::message::{Api, ContentBlock, Message, Role, StopReason, ToolCall, Usage};
+
+        let messages = vec![
+            Message::user_text("first 羽毛 question"),
+            Message::assistant(
+                vec![
+                    ContentBlock::Thinking {
+                        text: "reasoning that some endpoints drop".into(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "an answer".into(),
+                    },
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "t1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "src/main.rs"}),
+                    }),
+                ],
+                "m",
+                Api::AnthropicMessages,
+                Usage::default(),
+                StopReason::ToolUse,
+            ),
+            Message::tool_result("t1", "read", "file contents", false),
+        ];
+        assert_eq!(messages[1].role, Role::Assistant);
+
+        let system = "You are feather.";
+        let tools = vec![crate::provider::ToolDef {
+            name: "read".into(),
+            description: "Read a file.".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let static_tokens = estimate_request_static_tokens(system, &tools);
+        let totals = (
+            estimate_context_tokens(&messages),
+            estimate_context_tokens_without_thinking(&messages),
+        );
+
+        for api in [Api::AnthropicMessages, Api::OpenaiCompletions] {
+            assert_eq!(
+                request_input_tokens_from_totals(api, static_tokens, totals),
+                estimate_request_input_tokens(api, system, &messages, &tools),
+                "assembled estimate diverged for {api:?}"
+            );
+        }
+        // The two totals really do differ, otherwise this test proves nothing.
+        assert_ne!(totals.0, totals.1);
+    }
+
     #[test]
     fn tool_arguments_are_estimated_from_their_values() {
         use crate::message::{Api, ContentBlock, Message, StopReason, ToolCall, Usage};

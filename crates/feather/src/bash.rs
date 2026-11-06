@@ -15,7 +15,11 @@ impl AgentTool for BashTool {
 
     fn description(&self) -> &'static str {
         "Run a Bash command in the project directory and return stdout+stderr. On Windows uses Git Bash/MSYS2 (POSIX paths, pipelines, quoting), not cmd or PowerShell. Each call starts in the project directory; cd does not persist. \
-         Params: command (string, required), description (string, recommended). \
+         Params: command (string, required), description (string, required), timeout (integer seconds, optional). \
+         Set `timeout` from what the command actually needs: a build or a full test suite can \
+         take several minutes, while a listing takes seconds. Omitting it uses the configured \
+         default, and a command that hits the limit is killed with a message telling you to \
+         retry with a larger `timeout` — so say how long you expect to need. \
          Always set `description` to one short phrase (under 60 chars) saying what the command \
          is for, e.g. \"run the gui tests\" or \"check which files changed\". It is shown to the \
          user instead of the raw command, so they can follow along without decoding shell syntax. \
@@ -33,6 +37,10 @@ impl AgentTool for BashTool {
                 "description": {
                     "type": "string",
                     "description": "Short phrase (under 60 chars) describing what this command does, shown in the UI"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Wall-clock limit for this command, in seconds. Set it from what the command actually needs: a build or test suite may take minutes, a listing takes seconds. Omit only for short commands. Clamped to 1..=3600."
                 }
             },
             // `description` is listed as required on purpose. Measured over 573
@@ -41,6 +49,14 @@ impl AgentTool for BashTool {
             // enforces it at runtime (the tool still works when it is absent),
             // so this is a hint about how models actually behave, not a schema
             // contract the caller must satisfy.
+            // `timeout` is not "required" for the same measured reason the
+            // `description` note above describes, but unlike `description` it
+            // is *not* enforced: a call that omits it inherits the configured
+            // default rather than failing, because most calls are short and a
+            // missing timeout is not a mistake worth a round trip. What matters
+            // is that the choice is now the caller's: the old fixed 120s cap
+            // could not express "build this, take the time it needs" and killed
+            // honest work with no way to ask for more.
             "required": ["command", "description"]
         })
     }
@@ -64,6 +80,9 @@ impl AgentTool for BashTool {
             if let Err(error) = check_intent(&args) {
                 return ToolOutcome::err(error);
             }
+            // The caller decides how long its command may take; `self.timeout`
+            // is only the default for calls that do not say.
+            let (timeout, timeout_note) = resolve_timeout(&args, self.timeout);
 
             if *abort.borrow() {
                 return ToolOutcome::err("bash: aborted by user");
@@ -122,18 +141,22 @@ impl AgentTool for BashTool {
                 Ok::<_, std::io::Error>((status, output))
             };
             let mut completion = Box::pin(completion);
-            let deadline = tokio::time::sleep(self.timeout);
+            let deadline = tokio::time::sleep(timeout);
             tokio::pin!(deadline);
             let reason = loop {
                 tokio::select! {
                     result=&mut completion=>return match result {
                         Ok((status,text))=>{
                             let text=truncate_owned(text,20_000);
+                            let text = match &timeout_note {
+                                Some(note) => format!("{text}\n{note}"),
+                                None => text,
+                            };
                             ToolOutcome{text:format!("{text}\n[exit {}]",status.code().unwrap_or(-1)),is_error:!status.success(),details:None}
                         },
                         Err(e)=>ToolOutcome::err(format!("bash: wait failed: {e}")),
                     },
-                    _=&mut deadline=>break format!("bash: timed out after {}s (command killed)",self.timeout.as_secs_f64()),
+                    _=&mut deadline=>break format!("bash: timed out after {}s (command killed); retry with a larger `timeout` if it needs longer",timeout.as_secs_f64()),
                     changed=abort.changed(),if abort_open=>{
                         if changed.is_err(){abort_open=false;}
                         else if *abort.borrow(){break "bash: aborted by user".into();}
@@ -230,6 +253,59 @@ fn check_intent(args: &serde_json::Value) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Ceiling on a caller-supplied timeout.
+///
+/// The tool runs inside the GUI process, so an unbounded value would let one
+/// command outlive any reasonable turn and hold the run open indefinitely. An
+/// hour is long enough for a real build and short enough to be recoverable.
+const MAX_TIMEOUT_SECS: u64 = 3600;
+
+/// Resolve the timeout for one call: the caller's `timeout`, else the default.
+///
+/// Returns the clamped value plus, when clamping or substitution happened, a
+/// note to append to the outcome so the caller can see what actually applied
+/// instead of assuming its number was honoured verbatim.
+fn resolve_timeout(
+    args: &serde_json::Value,
+    default: std::time::Duration,
+) -> (std::time::Duration, Option<String>) {
+    let raw = match args.get("timeout") {
+        None | Some(serde_json::Value::Null) => return (default, None),
+        Some(value) => value,
+    };
+    // A float is a plausible thing for a model to emit (`"timeout": 300.0`) and
+    // is not worth failing over, so accept any non-negative number.
+    let seconds = match raw.as_u64() {
+        Some(n) => n,
+        None => match raw.as_f64() {
+            Some(f) if f.is_finite() && f >= 0.0 => f.floor() as u64,
+            _ => {
+                return (
+                    default,
+                    Some(format!(
+                        "[timeout ignored: expected a whole number of seconds, got {raw}]"
+                    )),
+                )
+            }
+        },
+    };
+    if seconds == 0 {
+        return (
+            default,
+            Some("[timeout ignored: 0s would kill every command; using the default]".to_string()),
+        );
+    }
+    if seconds > MAX_TIMEOUT_SECS {
+        return (
+            std::time::Duration::from_secs(MAX_TIMEOUT_SECS),
+            Some(format!(
+                "[timeout clamped to {MAX_TIMEOUT_SECS}s from {seconds}s]"
+            )),
+        );
+    }
+    (std::time::Duration::from_secs(seconds), None)
 }
 
 fn truncate_owned(text: String, max_chars: usize) -> String {
@@ -508,5 +584,90 @@ mod tests {
             .await;
         assert!(out.is_error);
         assert!(out.text.contains("timed out"));
+        // The failure has to say what to do next, or the model just retries the
+        // same command and times out again.
+        assert!(out.text.contains("larger `timeout`"), "{}", out.text);
+    }
+
+    /// The caller's `timeout` decides, not the configured default.
+    ///
+    /// The default here is deliberately tiny (1s) and the call asks for more:
+    /// if the argument were ignored, a 2s sleep would die and the test would
+    /// fail. That is the whole point of the change — a long command can now
+    /// ask for the time it needs.
+    #[tokio::test]
+    async fn the_caller_sets_the_timeout_and_may_exceed_the_default() {
+        let t = BashTool {
+            timeout: std::time::Duration::from_secs(1),
+            cwd: std::env::temp_dir(),
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let out = t
+            .execute(
+                serde_json::json!({
+                    "command": "sleep 2; printf finished",
+                    "description": "outlast the default timeout",
+                    "timeout": 20
+                }),
+                rx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("finished"), "{}", out.text);
+        assert!(!out.text.contains("timed out"), "{}", out.text);
+    }
+
+    #[test]
+    fn the_timeout_argument_is_clamped_and_explained() {
+        let default = std::time::Duration::from_secs(120);
+        // Omitted: the configured default, and nothing to report.
+        assert_eq!(
+            resolve_timeout(&serde_json::json!({"command": "x"}), default),
+            (default, None)
+        );
+        // Honoured verbatim.
+        assert_eq!(
+            resolve_timeout(&serde_json::json!({"timeout": 300}), default),
+            (std::time::Duration::from_secs(300), None)
+        );
+        // A model emitting `300.0` is not worth a failed round trip.
+        assert_eq!(
+            resolve_timeout(&serde_json::json!({"timeout": 300.0}), default),
+            (std::time::Duration::from_secs(300), None)
+        );
+        // Zero would kill every command before it started, so it falls back.
+        let (d, note) = resolve_timeout(&serde_json::json!({"timeout": 0}), default);
+        assert_eq!(d, default);
+        assert!(note.unwrap().contains("0s"), "zero must explain itself");
+        // Above the ceiling is clamped, not refused, and the caller is told.
+        let (d, note) = resolve_timeout(&serde_json::json!({"timeout": 999_999}), default);
+        assert_eq!(d, std::time::Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert!(note.unwrap().contains("clamped"));
+        // Garbage falls back rather than failing the command.
+        let (d, note) = resolve_timeout(&serde_json::json!({"timeout": "soon"}), default);
+        assert_eq!(d, default);
+        assert!(note.unwrap().contains("ignored"));
+    }
+
+    #[tokio::test]
+    async fn a_clamped_timeout_is_reported_in_the_output() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let out = tool()
+            .execute(
+                serde_json::json!({
+                    "command": "printf ran",
+                    "description": "check the clamp is surfaced",
+                    "timeout": 999_999
+                }),
+                rx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert!(out.text.contains("ran"));
+        assert!(
+            out.text.contains("clamped"),
+            "the caller must see the limit that applied: {}",
+            out.text
+        );
     }
 }

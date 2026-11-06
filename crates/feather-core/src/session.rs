@@ -29,14 +29,29 @@ pub struct Session {
     child_store: Option<(std::sync::Arc<crate::substore::SubagentStore>, String)>,
     child_seq: u64,
     messages: std::sync::Arc<Vec<Message>>,
+    /// Running token estimate of every message, reasoning included.
     context_tokens: u64,
+    /// Same sum minus reasoning blocks. Which of the two a request actually
+    /// pays for depends on the endpoint, so both are maintained as rows arrive
+    /// and the API choice is applied when the request estimate is read.
+    context_tokens_without_thinking: u64,
     history_hash: u64,
     message_hashes: Vec<u64>,
     prefix_tokens: Vec<u64>,
+    /// Off-thread workspace checkpoints. `None` for in-memory sessions, which
+    /// have no workspace directory to checkpoint.
+    checkpoints: Option<crate::checkpoint_worker::CheckpointWorker>,
     snapshots: Option<SnapshotStore>,
     turn: u64,
     created_ms: u64,
     first_prompt: String,
+    /// Audit rows pushed since the last turn commit, in push order.
+    ///
+    /// `push` buffers here instead of writing each message to redb, so a turn
+    /// costs one durable commit rather than one per message. `commit_turn`
+    /// flushes the batch; anything that must be durable *before* a turn ends
+    /// (rewind, close, compaction) flushes it too.
+    pending_audit: Vec<(String, u64, Message)>,
     /// Cumulative usage across the whole session (incl. compaction calls).
     total_usage: Usage,
     /// Host-side problems the *model* has to know about (skipped checkpoint
@@ -104,13 +119,16 @@ impl Session {
             child_seq: 0,
             messages: std::sync::Arc::new(Vec::new()),
             context_tokens: 16,
+            context_tokens_without_thinking: 16,
             history_hash: crate::message::fnv1a(b"feather-history-v1"),
             message_hashes: Vec::new(),
             prefix_tokens: vec![16],
+            checkpoints: Some(crate::checkpoint_worker::CheckpointWorker::start()),
             snapshots: Some(snapshots),
             turn: 0,
             created_ms: now,
             first_prompt: String::new(),
+            pending_audit: Vec::new(),
             total_usage: Usage::default(),
             runtime_diagnostics: Vec::new(),
             notes: Vec::new(),
@@ -141,13 +159,16 @@ impl Session {
             child_seq: 0,
             messages: std::sync::Arc::new(Vec::new()),
             context_tokens: 16,
+            context_tokens_without_thinking: 16,
             history_hash: crate::message::fnv1a(b"feather-history-v1"),
             message_hashes: Vec::new(),
             prefix_tokens: vec![16],
+            checkpoints: None,
             snapshots: None,
             turn: 0,
             created_ms: crate::message::now_millis(),
             first_prompt: String::new(),
+            pending_audit: Vec::new(),
             total_usage: Usage::default(),
             runtime_diagnostics: Vec::new(),
             notes: Vec::new(),
@@ -252,14 +273,17 @@ impl Session {
             child_store: None,
             child_seq: 0,
             context_tokens: 16,
+            context_tokens_without_thinking: 16,
             message_hashes: Vec::new(),
             prefix_tokens: Vec::new(),
             history_hash: crate::message::fnv1a(b"feather-history-v1"),
             messages: std::sync::Arc::new(messages),
+            checkpoints: Some(crate::checkpoint_worker::CheckpointWorker::start()),
             snapshots: Some(snapshots),
             turn,
             created_ms: meta.created_ms,
             first_prompt,
+            pending_audit: Vec::new(),
             total_usage,
             runtime_diagnostics: Vec::new(),
             notes,
@@ -301,8 +325,17 @@ impl Session {
     pub fn shared_messages(&self) -> std::sync::Arc<Vec<Message>> {
         std::sync::Arc::clone(&self.messages)
     }
+    /// Running estimate of the linear context, reasoning included. Kept up to
+    /// date by `push`/`refresh_context_metrics`, so reading it is free.
     pub fn context_tokens(&self) -> u64 {
         self.context_tokens
+    }
+
+    /// The same estimate with reasoning blocks excluded. `push` maintains
+    /// both so the request estimate can pick the right one without rescanning
+    /// the history every time the API changes.
+    pub fn context_tokens_without_thinking(&self) -> u64 {
+        self.context_tokens_without_thinking
     }
     pub fn history_hash(&self) -> u64 {
         self.history_hash
@@ -315,6 +348,7 @@ impl Session {
     }
     fn refresh_context_metrics(&mut self) {
         self.context_tokens = 16;
+        self.context_tokens_without_thinking = 16;
         self.history_hash = crate::message::fnv1a(b"feather-history-v1");
         self.message_hashes.clear();
         self.prefix_tokens.clear();
@@ -323,6 +357,8 @@ impl Session {
             let hash =
                 crate::message::json_hash(message).expect("Message serialization is infallible");
             self.context_tokens += crate::tokenizer::estimate_message_tokens(message);
+            self.context_tokens_without_thinking +=
+                crate::tokenizer::estimate_message_tokens_without_thinking(message);
             self.history_hash = self.history_hash.rotate_left(1) ^ hash;
             self.message_hashes.push(hash);
             self.prefix_tokens.push(self.context_tokens);
@@ -346,18 +382,35 @@ impl Session {
     /// Raw audit history (every pushed message, pre-compaction originals
     /// included). Replaces reading the old JSONL transcript.
     pub fn raw_messages(&self) -> Result<Vec<Message>, SessionError> {
-        match self.store.as_ref() {
-            Some(s) => Ok(s.raw_messages()?),
-            None => Ok(Vec::new()),
-        }
+        self.raw_entries().map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.message)
+                .collect::<Vec<_>>()
+        })
     }
 
     /// Raw audit history with entry ids/timestamps, in push order.
+    ///
+    /// Includes rows still buffered for the current turn, so a reader never
+    /// sees a truncated audit just because the turn has not committed yet.
     pub fn raw_entries(&self) -> Result<Vec<RawEntry>, SessionError> {
-        match self.store.as_ref() {
-            Some(s) => Ok(s.raw_entries()?),
-            None => Ok(Vec::new()),
+        let mut entries = match self.store.as_ref() {
+            Some(s) => s.raw_entries()?,
+            None => Vec::new(),
+        };
+        // Buffered rows are contiguous with what is on disk: `push` assigns ids
+        // in order and a commit writes the whole buffer.
+        let base = entries.last().map(|e| e.seq + 1).unwrap_or(0);
+        for (offset, (id, timestamp, message)) in self.pending_audit.iter().enumerate() {
+            entries.push(RawEntry {
+                seq: base + offset as u64,
+                id: id.clone(),
+                timestamp: *timestamp,
+                message: message.clone(),
+            });
         }
+        Ok(entries)
     }
 
     pub fn add_usage(&mut self, u: Usage) {
@@ -381,7 +434,7 @@ impl Session {
                 .push_message(id, self.child_seq, &msg)
                 .map_err(|e| SessionError::Catalog(e.to_string()))?;
         }
-        if let Some(store) = self.store.as_ref() {
+        if self.store.is_some() {
             let is_first_prompt =
                 self.first_prompt.is_empty() && msg.role == crate::message::Role::User;
             let first_prompt = if is_first_prompt {
@@ -391,13 +444,11 @@ impl Session {
             } else {
                 None
             };
-            store.append_raw_with_meta(
-                &crate::provider::gen_id("e"),
-                msg.timestamp,
-                &msg,
-                crate::message::now_millis(),
-                first_prompt.as_deref().unwrap_or(&self.first_prompt),
-            )?;
+            // Buffer the audit row; `commit_turn` writes the turn's rows in one
+            // transaction. The first prompt is recorded in memory so discovery
+            // can see it before the turn commits.
+            self.pending_audit
+                .push((crate::provider::gen_id("e"), msg.timestamp, msg.clone()));
             if let Some(first_prompt) = first_prompt {
                 self.first_prompt = first_prompt;
             }
@@ -409,6 +460,8 @@ impl Session {
         }
         self.child_seq += 1;
         self.context_tokens += crate::tokenizer::estimate_message_tokens(&msg);
+        self.context_tokens_without_thinking +=
+            crate::tokenizer::estimate_message_tokens_without_thinking(&msg);
         self.history_hash = self.history_hash.rotate_left(1) ^ message_hash;
         self.message_hashes.push(message_hash);
         self.prefix_tokens.push(self.context_tokens);
@@ -416,6 +469,27 @@ impl Session {
         Ok(())
     }
 
+    /// Write buffered audit rows to redb in a single transaction.
+    ///
+    /// Safe to call at any point: it is a no-op when nothing is buffered, so a
+    /// rewind or close can flush defensively without paying for an empty
+    /// commit.
+    pub fn flush_audit(&mut self) -> Result<(), SessionError> {
+        if self.pending_audit.is_empty() {
+            return Ok(());
+        }
+        let Some(store) = self.store.as_ref() else {
+            // In-memory session: the audit trail lives in `messages` only.
+            self.pending_audit.clear();
+            return Ok(());
+        };
+        let rows = std::mem::take(&mut self.pending_audit);
+        let touch = (crate::message::now_millis(), self.first_prompt.clone());
+        store
+            .append_raw_batch(rows, Some((touch.0, touch.1.as_str())))
+            .map_err(|e| SessionError::Catalog(e.to_string()))?;
+        Ok(())
+    }
     /// Commit the current message list as a snapshot for the given turn and
     /// bump the turn counter.
     pub fn commit_turn(&mut self) -> Result<u64, SessionError> {
@@ -424,6 +498,11 @@ impl Session {
             self.turn = next_turn;
             return Ok(self.turn);
         }
+        // Write this turn's audit rows in one durable commit. Doing it here
+        // (rather than per message in `push`) is what makes a turn cost one
+        // fsync instead of one per message; the rows are only needed once the
+        // turn is finished anyway.
+        self.flush_audit()?;
         // Working-directory checkpoints are best-effort diagnostics now: a git
         // index/path failure must not abort the prompt or prevent the durable
         // message snapshot from advancing. Rewind still has file_snapshots for
@@ -452,13 +531,35 @@ impl Session {
                 files.push(tracker.to_string());
             }
         }
-        match crate::gitckpt::GitCheckpoints::open(&self.cwd)
-            .commit_turn_report(next_turn, &self.dir, &files)
-        {
-            Ok(report) => self.runtime_diagnostics.extend(report.diagnostics),
-            Err(e) => self.runtime_diagnostics.push(format!(
-                "workspace checkpoint skipped; durable session snapshot continued: {e}"
-            )),
+        // Validate paths on this thread, spawn git on the worker.
+        //
+        // The split matters for correctness, not just speed: `precheck` is
+        // pure filesystem work and produces the "skipped this path"
+        // diagnostics the model must see on *this* turn, so it has to run
+        // before the snapshot is written. The git half (check-ignore, add,
+        // write-tree, commit-tree, update-ref) is what costs ~80ms and buys
+        // nothing until a rewind, so it goes to the worker.
+        let checkpoints = crate::gitckpt::GitCheckpoints::open(&self.cwd);
+        let prepared = checkpoints.precheck(&self.dir, &files);
+        let (accepted, path_diagnostics) = match prepared {
+            Some((accepted, diagnostics)) => (accepted, diagnostics),
+            None => (files, Vec::new()),
+        };
+        self.runtime_diagnostics.extend(path_diagnostics);
+        if let Some(worker) = self.checkpoints.as_ref() {
+            worker.submit(next_turn, &self.cwd, &self.dir, accepted);
+        }
+        // Collect outcomes from earlier turns. A failure is reported once, on
+        // the turn that follows it.
+        if let Some(worker) = self.checkpoints.as_ref() {
+            for outcome in worker.drain() {
+                if let Some(error) = outcome.error {
+                    self.runtime_diagnostics.push(format!(
+                        "workspace checkpoint skipped; durable session snapshot continued: {error}"
+                    ));
+                }
+                self.runtime_diagnostics.extend(outcome.diagnostics);
+            }
         }
         if !self.runtime_diagnostics.is_empty() {
             // Diagnostic is provider-visible data, not a user instruction. Keep
@@ -496,6 +597,10 @@ impl Session {
     /// pre-existing repos get content restore only). Raw audit history keeps
     /// every message.
     pub fn rewind_to(&mut self, turn: u64) -> Result<Vec<Message>, SessionError> {
+        // Nothing buffered may be lost or reordered by the rewind: the audit
+        // trail is a record of what actually happened, independent of which
+        // context the session continues from.
+        self.flush_audit()?;
         let Some(snapshots) = self.snapshots.as_ref() else {
             return Err(SessionError::Snapshot(
                 crate::snapshot::SnapshotError::Table(
@@ -504,6 +609,15 @@ impl Session {
             ));
         };
         let msgs = snapshots.load(turn)?;
+        // Drain the whole queue, not just this turn.
+        //
+        // Turns checkpoint in order, so a checkpoint for turn 2 can still be
+        // running when we rewind to turn 1. Restoring the workspace underneath
+        // an in-flight checkpoint would race the files *and* contend for the
+        // turn-map database, so wait for everything queued.
+        if let Some(worker) = self.checkpoints.as_ref() {
+            worker.flush();
+        }
         let workspace = crate::gitckpt::GitCheckpoints::open(&self.cwd);
         let file_store = crate::file_snapshots::FileSnapshots::new(&self.dir);
         let excluded = file_store.tracked_paths().unwrap_or_default();
@@ -631,6 +745,20 @@ impl Session {
         crate::session_catalog::register_session(&self.home, &self.dir, &meta)
     }
 }
+impl Drop for Session {
+    /// Flush any buffered audit rows on close so a session that ends
+    /// mid-turn (a crash-free shutdown, a dropped agent) still records what
+    /// happened. `flush_audit` is a no-op when nothing is buffered.
+    fn drop(&mut self) {
+        if self.pending_audit.is_empty() {
+            return;
+        }
+        // A failure here cannot be reported: the session is going away. The
+        // durable snapshot written by `commit_turn` is the crash-recovery
+        // authority; the raw audit is a secondary history.
+        let _ = self.flush_audit();
+    }
+}
 
 #[cfg(test)]
 mod fork_tests {
@@ -702,6 +830,12 @@ mod tests {
                     crate::tokenizer::estimate_context_tokens(&s.messages()[..=index])
                 );
             }
+            // The second counter must always agree with an independent scan,
+            // including after rewinds and compaction rewrites.
+            assert_eq!(
+                s.context_tokens_without_thinking(),
+                crate::tokenizer::estimate_context_tokens_without_thinking(s.messages())
+            );
         };
         check(&session);
         for n in 0..50 {
@@ -724,6 +858,76 @@ mod tests {
         session.set_messages_for_compaction(vec![Message::user_text("summary")]);
         check(&session);
         assert_eq!(retained.len(), old_len);
+    }
+    /// The turn boundary must not wait for git. `commit_turn` hands the
+    /// checkpoint to the worker and returns, so a slow or hung git cannot stall
+    /// a prompt. This asserts the contract, not a wall-clock number.
+    #[test]
+    fn commit_turn_does_not_wait_for_the_workspace_checkpoint() {
+        let h = home("async-ckpt");
+        let cwd = h.join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("a.txt"), "v1").unwrap();
+        let mut s = Session::new(&h, &cwd).unwrap();
+        s.push(Message::user_text("one")).unwrap();
+        s.commit_turn().unwrap();
+        // The durable message snapshot is immediately usable...
+        assert_eq!(s.turn(), 1);
+        assert_eq!(s.messages().len(), 1);
+        // ...and a rewind right after still finds the checkpoint, because it
+        // drains the queue first.
+        s.push(Message::user_text("two")).unwrap();
+        s.commit_turn().unwrap();
+        s.rewind_to(1).unwrap();
+        assert_eq!(s.messages().len(), 1);
+        assert_eq!(s.messages()[0].text(), "one");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+    /// Audit rows are buffered per turn but must all be durable once the turn
+    /// commits — batching changes *when* they are written, never *whether*.
+    #[test]
+    fn a_turn_batches_its_audit_rows_but_loses_none_of_them() {
+        let h = home("batched-audit");
+        let cwd = h.join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut s = Session::new(&h.join("sessions").join("s1"), &cwd).unwrap();
+        for i in 0..5 {
+            s.push(Message::user_text(format!("m{i}"))).unwrap();
+        }
+        // Nothing is durable until the turn commits: the buffer holds them.
+        let store = crate::session_store::SessionStore::open(s.dir()).unwrap();
+        assert_eq!(
+            store.raw_len().unwrap(),
+            0,
+            "rows must be batched, not fanned out"
+        );
+        s.commit_turn().unwrap();
+        // One commit later, every row is there, in push order.
+        let store = crate::session_store::SessionStore::open(s.dir()).unwrap();
+        let rows = store.raw_messages().unwrap();
+        assert_eq!(rows.len(), 5);
+        let texts: Vec<String> = rows.iter().map(Message::text).collect();
+        assert_eq!(texts, ["m0", "m1", "m2", "m3", "m4"]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// A session closed mid-turn must not silently drop what it recorded.
+    #[test]
+    fn dropping_a_session_flushes_buffered_audit_rows() {
+        let h = home("drop-flush");
+        let cwd = h.join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let dir;
+        {
+            let mut s = Session::new(&h.join("sessions").join("s1"), &cwd).unwrap();
+            dir = s.dir().to_path_buf();
+            s.push(Message::user_text("unfinished")).unwrap();
+            // No commit_turn: the turn never completed.
+        }
+        let store = crate::session_store::SessionStore::open(&dir).unwrap();
+        assert_eq!(store.raw_len().unwrap(), 1, "close must flush, not discard");
+        let _ = std::fs::remove_dir_all(&h);
     }
     #[test]
     fn checkpoint_rejection_is_a_context_diagnostic_not_a_session_abort() {

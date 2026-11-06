@@ -382,6 +382,9 @@ mod tests {
                 .push(Message::user_text(format!("durable {n}")))
                 .unwrap();
         }
+        // The pager reads committed rows from redb, and a turn's audit rows are
+        // written when the turn commits.
+        session.commit_turn().unwrap();
         let (mut history, _) = History::from_session(&session).unwrap();
         let mut rows = rows_from_messages(&session.raw_messages().unwrap());
         history.committed(400, &rows);
@@ -417,6 +420,7 @@ mod tests {
             session.push(message.clone()).unwrap();
             rows.extend(rows_from_messages(&[message]));
         }
+        session.commit_turn().unwrap();
         history.durable_tail_changed();
         let ctx = eframe::egui::Context::default();
         history.bound_live_tail(&rows, true, &ctx);
@@ -535,6 +539,8 @@ mod tests {
                 .push(Message::user_text(format!("evict prompt {n}")))
                 .unwrap();
         }
+        // The pager reads committed rows from redb.
+        session.commit_turn().unwrap();
         let (mut history, mut rows) = History::from_session(&session).unwrap();
         let ctx = eframe::egui::Context::default();
         while history.remaining() > 0 {
@@ -642,10 +648,12 @@ mod tests {
             a.push(Message::user_text(format!("session-A {n}")))
                 .unwrap();
         }
+        a.commit_turn().unwrap();
         let (mut history, _) = History::from_session(&a).unwrap();
         history.request_older(&eframe::egui::Context::default());
         let mut b = Session::new(&home, &root).unwrap();
         b.push(Message::user_text("session-B only")).unwrap();
+        b.commit_turn().unwrap();
         let (fresh, mut rows) = History::from_session(&b).unwrap();
         history = fresh;
         assert!(!history.poll(&mut rows));

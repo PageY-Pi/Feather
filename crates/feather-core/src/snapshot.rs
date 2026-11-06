@@ -13,8 +13,9 @@
 
 use crate::message::Message;
 use redb::{Database, ReadableTable, TableDefinition};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const CHUNKS: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("chunks");
 const SNAPSHOTS: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("snapshots");
@@ -78,6 +79,15 @@ struct SnapshotRecord {
     history_hash: u64,
 }
 
+/// Process-wide `Weak` handles to open snapshot databases.
+///
+/// A `Weak` (not `Arc`) so a session that is dropped actually releases its
+/// file handle: the cache must never keep a database alive on its own, or a
+/// closed session would still block deletion on Windows.
+fn snapshot_cache() -> &'static Mutex<BTreeMap<PathBuf, Weak<Database>>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 #[derive(Clone)]
 pub struct SnapshotStore {
     db: Arc<Database>,
@@ -86,11 +96,26 @@ pub struct SnapshotStore {
 
 impl SnapshotStore {
     /// Open (creating if needed) `<dir>/snapshots.redb`.
+    ///
+    /// The handle is shared process-wide through a `Weak` cache, like
+    /// `session_store`/`records`. redb permits exactly one open handle per file
+    /// per process, so a live `Session` (which keeps this store) used to make
+    /// any second `open` of the same file fail with "database already open" —
+    /// a rewind-menu refresh, a test, or a second view of the same session.
+    /// Reusing the live handle removes the failure rather than retrying it.
     pub fn open(dir: &Path) -> Result<Self, SnapshotError> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join("snapshots.redb");
+        let path = std::fs::canonicalize(dir)?.join("snapshots.redb");
+        if let Some(db) = snapshot_cache()
+            .lock()
+            .map_err(|e| SnapshotError::Db(e.to_string()))?
+            .get(&path)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(Self { db, path });
+        }
         // ensure tables exist (redundant-but-cheap first commit)
-        let db = crate::database::create(&path)?;
+        let db = Arc::new(crate::database::create(&path)?);
         let txn = db.begin_write()?;
         {
             txn.open_table(CHUNKS)?;
@@ -98,10 +123,11 @@ impl SnapshotStore {
             txn.open_table(META)?;
         }
         txn.commit()?;
-        Ok(Self {
-            db: Arc::new(db),
-            path,
-        })
+        snapshot_cache()
+            .lock()
+            .map_err(|e| SnapshotError::Db(e.to_string()))?
+            .insert(path.clone(), Arc::downgrade(&db));
+        Ok(Self { db, path })
     }
 
     pub fn path(&self) -> &Path {
@@ -362,6 +388,25 @@ mod tests {
         d
     }
 
+    /// Opening the same session's snapshot store twice must succeed. redb allows
+    /// one handle per file per process, so without the shared cache the second
+    /// open fails with "database already open" — the failure that forced the
+    /// GUI to retry session reopening in a loop.
+    #[test]
+    fn opening_the_same_store_twice_reuses_one_handle() {
+        let dir = tmpdir("reopen");
+        let first = SnapshotStore::open(&dir).unwrap();
+        let second = SnapshotStore::open(&dir).unwrap();
+
+        // Same underlying database, so a write through one is visible to the
+        // other without either closing.
+        first.snapshot(1, &[Message::user_text("shared")]).unwrap();
+        assert_eq!(second.latest_turn().unwrap(), 1);
+        assert_eq!(second.load(1).unwrap().len(), 1);
+        // Both clone cheaply off the shared handle.
+        let _third = first.clone();
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[test]
     fn roundtrip_and_rollback() {
         let dir = tmpdir("rt");

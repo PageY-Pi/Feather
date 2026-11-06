@@ -7,205 +7,191 @@ use eframe::egui;
 
 pub fn render_row(ui: &mut egui::Ui, row: &mut ChatRow, now: f64, show_thinking: bool) {
     match row.kind {
-        RowKind::User => {
-            let max = (ui.available_width() * 0.82).min(650.0);
-            let text_width = ui.fonts(|fonts| {
-                fonts
-                    .layout_no_wrap(row.text.clone(), egui::FontId::proportional(15.5), TEXT)
-                    .size()
-                    .x
-            });
-            // Short one-line prompts should hug their content; multiline or
-            // wrapped text keeps the existing readable maximum bubble width.
-            let compact = !row.text.contains(['\n', '\r']) && text_width <= max - 36.0;
-            let bubble_width = if compact {
-                (text_width + 36.0).max(72.0).min(max)
-            } else {
-                max
-            };
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                egui::Frame::none()
-                    .fill(USER_BUBBLE)
-                    .rounding(egui::Rounding {
-                        nw: 20.0,
-                        ne: 20.0,
-                        sw: 20.0,
-                        se: 7.0,
-                    })
-                    .inner_margin(egui::Margin::symmetric(18.0, 13.0))
-                    .show(ui, |ui| {
-                        ui.set_width(bubble_width);
-                        // The bubble is right-anchored by its parent, but its
-                        // contents are normal left-aligned paragraphs, not RTL.
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&row.text).size(15.5).color(TEXT),
-                                )
-                                .wrap(),
-                            );
-                        });
-                    });
-            });
-        }
-        RowKind::Assistant => {
-            // Codex-style response surface: one quiet frame, a compact identity
-            // row, and deliberate dividers instead of a stack of nested bubbles.
-            let card = egui::Frame::none()
-                .fill(PANEL_2)
-                .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                .rounding(egui::Rounding::same(13.0))
-                .inner_margin(egui::Margin::symmetric(16.0, 13.0))
-                .show(ui, |ui| {
-                    let width = ui.available_width();
-                    ui.set_width((width - 1.0).max(120.0));
-                    ui.horizontal(|ui| {
-                        mascot(ui, 22.0);
-                        ui.add_space(1.0);
-                        ui.label(
-                            egui::RichText::new("Feather")
-                                .size(12.5)
-                                .strong()
-                                .color(INK),
-                        );
-                        if row.streaming {
-                            ui.add_space(7.0);
-                            status_badge(ui, "Working", TEAL, SOFT_ACCENT);
-                        }
-                        if row.streaming {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    crate::activity::orbit(ui, 18.0, now);
-                                },
-                            );
-                        }
-                    });
-
-                    if !row.thinking.is_empty() {
-                        ui.add_space(8.0);
-                        // Global toggle applies once per row, including virtualized
-                        // rows revisited later. Header clicks remain independently usable.
-                        let mode_id = ui.id().with("thinking-global-mode");
-                        let previous = ui.data(|d| d.get_temp::<bool>(mode_id));
-                        let force = (previous != Some(show_thinking)).then_some(show_thinking);
-                        ui.data_mut(|d| d.insert_temp(mode_id, show_thinking));
-                        // `header_response.rect` only spans the label text
-                        // (`collapsing_header_frame` defaults to false), so
-                        // anchoring the pulse to it drew the dot on top of the
-                        // word "Thoughts". Keep the header's vertical band so
-                        // the dot stays baseline-aligned, but widen it to the
-                        // card so it parks at the right edge.
-                        let card_right = ui.available_rect_before_wrap().right();
-                        let header = egui::CollapsingHeader::new(
-                            egui::RichText::new("Thoughts").size(12.0).color(TEAL),
-                        )
-                        .id_salt("thinking")
-                        .default_open(true)
-                        .open(force)
-                        .show_background(false)
-                        .icon(|ui, openness, response| {
-                            let center = response.rect.center();
-                            let stroke = egui::Stroke::new(1.4_f32, TEAL);
-                            ui.painter().circle_stroke(center, 4.0, stroke);
-                            if openness > 0.5 {
-                                ui.painter().line_segment(
-                                    [
-                                        center + egui::vec2(-2.0, 0.0),
-                                        center + egui::vec2(2.0, 0.0),
-                                    ],
-                                    stroke,
-                                );
-                            } else {
-                                ui.painter().line_segment(
-                                    [
-                                        center + egui::vec2(0.0, -2.0),
-                                        center + egui::vec2(0.0, 2.0),
-                                    ],
-                                    stroke,
-                                );
-                            }
-                        })
-                        .show(ui, |ui| {
-                            egui::Frame::none()
-                                .fill(SIDEBAR)
-                                .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                                .rounding(egui::Rounding::same(9.0))
-                                .inner_margin(egui::Margin::symmetric(12.0, 9.0))
-                                .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    thinking_text(ui, &row.thinking, row.streaming);
-                                });
-                        });
-                        if row.streaming {
-                            let band = header.header_response.rect;
-                            let pulse_rect = egui::Rect::from_min_max(
-                                egui::pos2(band.left(), band.top()),
-                                egui::pos2(card_right, band.bottom()),
-                            );
-                            crate::activity::pulse_in(ui, pulse_rect, now, TEAL);
-                        }
-                    }
-                    if !row.text.is_empty() {
-                        if !row.thinking.is_empty() {
-                            ui.add_space(9.0);
-                            ui.separator();
-                            ui.add_space(8.0);
-                        }
-                        prose(ui, &row.text, row.streaming);
-                    }
-                    if row.streaming {
-                        ui.add_space(5.0);
-                        crate::activity::orbit(ui, 18.0, now);
-                    }
-                });
-            let rail = egui::Rect::from_min_max(
-                egui::pos2(card.response.rect.left(), card.response.rect.top() + 12.0),
-                egui::pos2(
-                    card.response.rect.left() + 3.0,
-                    card.response.rect.bottom() - 12.0,
-                ),
-            );
-            ui.painter().rect_filled(rail, 1.5, TEAL);
-        }
+        RowKind::User => render_user(ui, row),
+        RowKind::Assistant => render_assistant(ui, row, now, show_thinking),
         RowKind::Tool => render_tool(ui, row, now),
-        RowKind::Notice => {
-            ui.add(egui::Label::new(egui::RichText::new(&row.text).size(12.5).color(MUTED)).wrap());
-        }
-        RowKind::Error => {
-            egui::Frame::none()
-                .fill(crate::theme::ERROR_BG)
-                .rounding(16.0)
-                .inner_margin(egui::Margin::symmetric(16.0, 12.0))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("A little snag")
-                            .size(13.0)
-                            .strong()
-                            .color(RED),
-                    );
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&row.text).size(14.0).color(TEXT))
-                            .wrap(),
-                    );
-                });
-        }
+        RowKind::Notice => render_notice(ui, row),
+        RowKind::Error => render_error(ui, row),
     }
 }
 
-fn status_badge(ui: &mut egui::Ui, label: &str, color: egui::Color32, fill: egui::Color32) {
-    egui::Frame::none()
-        .fill(fill)
-        .rounding(egui::Rounding::same(7.0))
-        .inner_margin(egui::Margin::symmetric(7.0, 3.0))
+/// Inline system notice: quiet, small, no card of its own.
+fn render_notice(ui: &mut egui::Ui, row: &ChatRow) {
+    ui.add(egui::Label::new(egui::RichText::new(&row.text).size(12.5).color(MUTED)).wrap());
+}
+/// A user prompt: a right-anchored bubble that hugs short single-line text.
+fn render_user(ui: &mut egui::Ui, row: &ChatRow) {
+    let max = (ui.available_width() * 0.82).min(650.0);
+    let text_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(row.text.clone(), egui::FontId::proportional(15.5), TEXT)
+            .size()
+            .x
+    });
+    // Short one-line prompts should hug their content; multiline or
+    // wrapped text keeps the existing readable maximum bubble width.
+    let compact = !row.text.contains(['\n', '\r']) && text_width <= max - 36.0;
+    let bubble_width = if compact {
+        (text_width + 36.0).max(72.0).min(max)
+    } else {
+        max
+    };
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+        egui::Frame::none()
+            .fill(USER_BUBBLE)
+            .rounding(egui::Rounding {
+                nw: 20.0,
+                ne: 20.0,
+                sw: 20.0,
+                se: 7.0,
+            })
+            .inner_margin(egui::Margin::symmetric(18.0, 13.0))
+            .show(ui, |ui| {
+                ui.set_width(bubble_width);
+                // The bubble is right-anchored by its parent, but its
+                // contents are normal left-aligned paragraphs, not RTL.
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&row.text).size(15.5).color(TEXT))
+                            .wrap(),
+                    );
+                });
+            });
+    });
+}
+
+/// The assistant card: one quiet frame, a compact identity row, and
+/// deliberate dividers instead of a stack of nested bubbles.
+///
+/// `show_thinking` is a global toggle applied once per row, so a virtualized
+/// row revisited later still reflects the current setting.
+fn render_assistant(ui: &mut egui::Ui, row: &mut ChatRow, now: f64, show_thinking: bool) {
+    // Codex-style response surface: one quiet frame, a compact identity
+    // row, and deliberate dividers instead of a stack of nested bubbles.
+    let card = egui::Frame::none()
+        .fill(PANEL_2)
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .rounding(egui::Rounding::same(13.0))
+        .inner_margin(egui::Margin::symmetric(16.0, 13.0))
         .show(ui, |ui| {
-            // `Extend` keeps the badge on one line: in the right-to-left header
-            // layout a narrow remaining width otherwise wrapped mid-word,
-            // stacking "Error" into a vertical column of letters.
-            ui.add(
-                egui::Label::new(egui::RichText::new(label).size(10.5).strong().color(color))
-                    .wrap_mode(egui::TextWrapMode::Extend),
+            let width = ui.available_width();
+            ui.set_width((width - 1.0).max(120.0));
+            ui.horizontal(|ui| {
+                mascot(ui, 22.0);
+                ui.add_space(1.0);
+                ui.label(
+                    egui::RichText::new("Feather")
+                        .size(12.5)
+                        .strong()
+                        .color(INK),
+                );
+                if row.streaming {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        crate::activity::orbit(ui, 18.0, now);
+                    });
+                }
+            });
+
+            if !row.thinking.is_empty() {
+                ui.add_space(8.0);
+                // Global toggle applies once per row, including virtualized
+                // rows revisited later. Header clicks remain independently usable.
+                let mode_id = ui.id().with("thinking-global-mode");
+                let previous = ui.data(|d| d.get_temp::<bool>(mode_id));
+                let force = (previous != Some(show_thinking)).then_some(show_thinking);
+                ui.data_mut(|d| d.insert_temp(mode_id, show_thinking));
+                // `header_response.rect` only spans the label text
+                // (`collapsing_header_frame` defaults to false), so
+                // anchoring the pulse to it drew the dot on top of the
+                // word "Thoughts". Keep the header's vertical band so
+                // the dot stays baseline-aligned, but widen it to the
+                // card so it parks at the right edge.
+                let card_right = ui.available_rect_before_wrap().right();
+                let header = egui::CollapsingHeader::new(
+                    egui::RichText::new("Thoughts").size(12.0).color(TEAL),
+                )
+                .id_salt("thinking")
+                .default_open(true)
+                .open(force)
+                .show_background(false)
+                .icon(|ui, openness, response| {
+                    let center = response.rect.center();
+                    let stroke = egui::Stroke::new(1.4_f32, TEAL);
+                    ui.painter().circle_stroke(center, 4.0, stroke);
+                    if openness > 0.5 {
+                        ui.painter().line_segment(
+                            [
+                                center + egui::vec2(-2.0, 0.0),
+                                center + egui::vec2(2.0, 0.0),
+                            ],
+                            stroke,
+                        );
+                    } else {
+                        ui.painter().line_segment(
+                            [
+                                center + egui::vec2(0.0, -2.0),
+                                center + egui::vec2(0.0, 2.0),
+                            ],
+                            stroke,
+                        );
+                    }
+                })
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(SIDEBAR)
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                        .rounding(egui::Rounding::same(9.0))
+                        .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            thinking_text(ui, &row.thinking, row.streaming);
+                        });
+                });
+                if row.streaming {
+                    let band = header.header_response.rect;
+                    let pulse_rect = egui::Rect::from_min_max(
+                        egui::pos2(band.left(), band.top()),
+                        egui::pos2(card_right, band.bottom()),
+                    );
+                    crate::activity::pulse_in(ui, pulse_rect, now, TEAL);
+                }
+            }
+            if !row.text.is_empty() {
+                if !row.thinking.is_empty() {
+                    ui.add_space(9.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                }
+                prose(ui, &row.text, row.streaming);
+            }
+            if row.streaming {
+                ui.add_space(5.0);
+                crate::activity::orbit(ui, 18.0, now);
+            }
+        });
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(card.response.rect.left(), card.response.rect.top() + 12.0),
+        egui::pos2(
+            card.response.rect.left() + 3.0,
+            card.response.rect.bottom() - 12.0,
+        ),
+    );
+    ui.painter().rect_filled(rail, 1.5, TEAL);
+}
+/// The error card: a red frame with a soft heading and the raw message.
+fn render_error(ui: &mut egui::Ui, row: &ChatRow) {
+    egui::Frame::none()
+        .fill(crate::theme::ERROR_BG)
+        .rounding(16.0)
+        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("A little snag")
+                    .size(13.0)
+                    .strong()
+                    .color(RED),
             );
+            ui.add(egui::Label::new(egui::RichText::new(&row.text).size(14.0).color(TEXT)).wrap());
         });
 }
 
@@ -232,10 +218,23 @@ pub fn tool_visuals(name: &str) -> (String, &'static str, egui::Color32) {
         "bash" | "shell" => ("Bash".into(), ">_", INK),
         // Search reads as a search: the magnifier is the action itself.
         "anchor_grep" | "grep" => ("Grep".into(), "🔍", TEAL),
+        // A delegated conversation, not another local edit: two figures say
+        // "someone else does this work" where a single mark would read as one
+        // more file operation. `subagent_models` starts nothing, so its label
+        // says so, but the family shares one mark.
+        "subagent" | "agent" => ("Subagent".into(), "👥", TEAL),
+        "subagent_models" => ("Subagent Models".into(), "👥", TEAL),
         // The network, not the tool: both calls reach out to the internet, and a
         // globe says that at a glance where a magnifier would promise a search.
         "web_search" => ("Web Search".into(), "🌎", TEAL),
         "web_fetch" => ("Web Fetch".into(), "🌎", TEAL),
+        // A tracked checklist, so the mark is a checked box. `task_list` and
+        // `task_update` are the same list seen from different angles, and a
+        // person reading a transcript cares which tool ran, not which variant,
+        // so they share it rather than inventing a second shape.
+        "task_create" => ("Task Create".into(), "☑", TEAL),
+        "task_update" => ("Task Update".into(), "☑", TEAL),
+        "task_list" | "task_get" => ("Task List".into(), "☑", TEAL),
         _ => (display_label(name), "{}", TEAL),
     }
 }
@@ -345,88 +344,21 @@ fn render_tool(ui: &mut egui::Ui, row: &mut ChatRow, now: f64) {
             let width = ui.available_width();
             let header_top = ui.cursor().min.y;
             let header_left = ui.cursor().min.x;
-            let header = ui.horizontal(|ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 7.0, TOOL_BG);
-                ui.painter()
-                    .rect_stroke(rect, 7.0, egui::Stroke::new(1.0_f32, BORDER));
-
-                paint_tool_glyph(ui.painter(), rect, glyph, INK);
-                ui.add_space(9.0);
-                // Keep the command column flexible; the metadata column owns only
-                // its measured width so narrow windows never push the title off-canvas.
-                ui.allocate_ui_with_layout(
-                    // Auto height: a long bash command wraps to a second line
-                    // instead of being cut off at a fixed 26px box.
-                    egui::vec2((width - 150.0).max(72.0), 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&label).size(13.0).strong().color(TEXT),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                        );
-                        if !row.tool_args.is_empty() {
-                            // `Label` has no row limit in egui 0.29, so build the
-                            // layout by hand: wrap to at most two rows and let the
-                            // galley elide the rest. A long bash command stays
-                            // readable without pushing the card arbitrarily tall.
-                            let mut job = egui::text::LayoutJob::simple(
-                                row.tool_args.clone(),
-                                egui::FontId::monospace(11.5),
-                                MUTED,
-                                ui.available_width(),
-                            );
-                            job.wrap.max_rows = 2;
-                            job.wrap.break_anywhere = true;
-                            ui.add(egui::Label::new(job));
-                        }
-                    },
-                );
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
-
-                    let center = rect.center();
-                    let dy = if row.expanded { -2.0 } else { 2.0 };
-                    ui.painter().add(egui::Shape::line(
-                        vec![
-                            center + egui::vec2(-4.0, -dy),
-                            center + egui::vec2(0.0, dy),
-                            center + egui::vec2(4.0, -dy),
-                        ],
-                        egui::Stroke::new(1.4_f32, MUTED),
-                    ));
-                    ui.add_space(7.0);
-                    if let Some(seconds) = seconds {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("{seconds:.1}s"))
-                                    .size(11.0)
-                                    .color(MUTED),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                        );
-                        ui.add_space(7.0);
-                    }
-                    if row.streaming {
-                        crate::activity::orbit(ui, 16.0, now);
-                        ui.add_space(6.0);
-                    }
-                    // A running card shows the spinner instead; a settled one
-                    // gets a check or a cross. Icons read at a glance without
-                    // needing a label, which is what fit badly in this slot.
-                    if let Some(ok) = look.status {
-                        status_icon(ui, ok);
-                    }
-                });
-            });
+            let header = tool_header_row(
+                ui,
+                row,
+                now,
+                width,
+                &ToolHeader {
+                    label: &label,
+                    glyph,
+                    seconds,
+                    look,
+                },
+            );
             let header_rect = egui::Rect::from_min_size(
                 egui::pos2(header_left, header_top),
-                egui::vec2(width, header.response.rect.height().max(26.0)),
+                egui::vec2(width, header.rect.height().max(26.0)),
             );
             let hit = ui.interact(
                 header_rect,
@@ -443,15 +375,31 @@ fn render_tool(ui: &mut egui::Ui, row: &mut ChatRow, now: f64) {
                     ui.add_space(8.0);
                     egui::Frame::none()
                         .fill(SIDEBAR)
-                        .rounding(egui::Rounding::same(7.0))
-                        .inner_margin(egui::Margin::symmetric(9.0, 7.0))
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                        .rounding(egui::Rounding::same(9.0))
+                        .inner_margin(egui::Margin::symmetric(12.0, 9.0))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(
-                                    progress.lines().take(4).collect::<Vec<_>>().join("\n"),
+                            // Match the thinking block's width. A text-hugging
+                            // frame collapsed to ~92px inside a 1084px card, so
+                            // live progress read as a stray label rather than a
+                            // live surface.
+                            ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let mut lines = progress.lines();
+                            if let Some(header) = lines.next() {
+                                ui.label(
+                                    egui::RichText::new(header).size(11.5).strong().color(TEAL),
+                                );
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        lines.take(3).collect::<Vec<_>>().join("\n"),
+                                    )
+                                    .size(11.5)
+                                    .color(TEXT),
                                 )
-                                .size(11.5)
-                                .color(TEAL),
+                                .wrap(),
                             );
                         });
                 }
@@ -467,84 +415,7 @@ fn render_tool(ui: &mut egui::Ui, row: &mut ChatRow, now: f64) {
                 ui.ctx().request_repaint();
             }
             let _ = tool_state.show_body_unindented(ui, |ui| {
-                // The header carries only the meaning; reveal the raw command
-                // or anchor list here so nothing is hidden from the user.
-                if !row.tool_detail.is_empty() {
-                    ui.add_space(9.0);
-                    ui.label(
-                        egui::RichText::new(if matches!(row.text.as_str(), "bash" | "shell") {
-                            "COMMAND"
-                        } else {
-                            "ARGS"
-                        })
-                        .size(10.5)
-                        .strong()
-                        .color(MUTED),
-                    );
-                    ui.add_space(5.0);
-                    egui::Frame::none()
-                        .fill(SIDEBAR)
-                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(10.0))
-                        .show(ui, |ui| {
-                            ui.set_width((width - 20.0).max(100.0));
-                            let mut job = egui::text::LayoutJob::simple(
-                                row.tool_detail.clone(),
-                                egui::FontId::monospace(12.0),
-                                TEXT,
-                                ui.available_width(),
-                            );
-                            job.wrap.max_rows = 6;
-                            job.wrap.break_anywhere = true;
-                            ui.add(egui::Label::new(job));
-                        });
-                }
-                ui.add_space(9.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(if row.streaming {
-                            "LIVE OUTPUT"
-                        } else {
-                            "OUTPUT"
-                        })
-                        .size(10.5)
-                        .strong()
-                        .color(MUTED),
-                    );
-                    if row.streaming {
-                        ui.add_space(5.0);
-                        ui.label(egui::RichText::new("streaming").size(10.5).color(TEAL));
-                    }
-                });
-                ui.add_space(5.0);
-                egui::Frame::none()
-                    .fill(output_fill)
-                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                    .rounding(egui::Rounding::same(8.0))
-                    .inner_margin(egui::Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.set_width((width - 20.0).max(100.0));
-                        egui::ScrollArea::vertical()
-                            .id_salt("tool-output")
-                            .max_height(230.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                let text = row
-                                    .tool_output
-                                    .as_deref()
-                                    .unwrap_or("Waiting for the tool…");
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(text)
-                                            .monospace()
-                                            .size(12.5)
-                                            .color(TEXT),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                    });
+                tool_output_body(ui, row, width, output_fill);
             });
             hit
         });
@@ -559,6 +430,192 @@ fn render_tool(ui: &mut egui::Ui, row: &mut ChatRow, now: f64) {
         ),
     );
     ui.painter().rect_filled(rail, 1.5, accent);
+}
+
+/// The expanded tool card: the raw command/anchor list, then the output body.
+///
+/// Split out of `render_tool` so the card frame stays readable; everything it
+/// needs about the row is read through the same `&ChatRow` borrow.
+fn tool_output_body(ui: &mut egui::Ui, row: &ChatRow, width: f32, output_fill: egui::Color32) {
+    // The header carries only the meaning; reveal the raw command
+    // or anchor list here so nothing is hidden from the user.
+    if !row.tool_detail.is_empty() {
+        ui.add_space(9.0);
+        ui.label(
+            egui::RichText::new(if matches!(row.text.as_str(), "bash" | "shell") {
+                "COMMAND"
+            } else {
+                "ARGS"
+            })
+            .size(10.5)
+            .strong()
+            .color(MUTED),
+        );
+        ui.add_space(5.0);
+        egui::Frame::none()
+            .fill(SIDEBAR)
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.set_width((width - 20.0).max(100.0));
+                let mut job = egui::text::LayoutJob::simple(
+                    row.tool_detail.clone(),
+                    egui::FontId::monospace(12.0),
+                    TEXT,
+                    ui.available_width(),
+                );
+                job.wrap.max_rows = 6;
+                job.wrap.break_anywhere = true;
+                ui.add(egui::Label::new(job));
+            });
+    }
+    ui.add_space(9.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(if row.streaming {
+                "LIVE OUTPUT"
+            } else {
+                "OUTPUT"
+            })
+            .size(10.5)
+            .strong()
+            .color(MUTED),
+        );
+        if row.streaming {
+            ui.add_space(5.0);
+            ui.label(egui::RichText::new("streaming").size(10.5).color(TEAL));
+        }
+    });
+    ui.add_space(5.0);
+    egui::Frame::none()
+        .fill(output_fill)
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            ui.set_width((width - 20.0).max(100.0));
+            egui::ScrollArea::vertical()
+                .id_salt("tool-output")
+                .max_height(230.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let text = row
+                        .tool_output
+                        .as_deref()
+                        .unwrap_or("Waiting for the tool…");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text).monospace().size(12.5).color(TEXT),
+                        )
+                        .wrap(),
+                    );
+                });
+        });
+}
+
+/// Everything the header row needs that the card frame also resolved.
+struct ToolHeader<'a> {
+    label: &'a str,
+    glyph: &'a str,
+    seconds: Option<f64>,
+    look: ToolCardLook,
+}
+
+/// The tool card's identity row: glyph, label, argument preview, status.
+///
+/// Returns the chevron's `Response` the caller turns into the click target for
+/// the whole header band. `look` and `seconds` are resolved by `render_tool`
+/// because the card frame needs them too.
+fn tool_header_row(
+    ui: &mut egui::Ui,
+    row: &mut ChatRow,
+    now: f64,
+    width: f32,
+    header: &ToolHeader<'_>,
+) -> egui::Response {
+    let ToolHeader {
+        label,
+        glyph,
+        seconds,
+        look,
+    } = header;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 7.0, TOOL_BG);
+        ui.painter()
+            .rect_stroke(rect, 7.0, egui::Stroke::new(1.0_f32, BORDER));
+
+        paint_tool_glyph(ui.painter(), rect, glyph, INK);
+        ui.add_space(9.0);
+        // Keep the command column flexible; the metadata column owns only
+        // its measured width so narrow windows never push the title off-canvas.
+        ui.allocate_ui_with_layout(
+            // Auto height: a long bash command wraps to a second line
+            // instead of being cut off at a fixed 26px box.
+            egui::vec2((width - 150.0).max(72.0), 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(*label).size(13.0).strong().color(TEXT))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+                if !row.tool_args.is_empty() {
+                    // `Label` has no row limit in egui 0.29, so build the
+                    // layout by hand: wrap to at most two rows and let the
+                    // galley elide the rest. A long bash command stays
+                    // readable without pushing the card arbitrarily tall.
+                    let mut job = egui::text::LayoutJob::simple(
+                        row.tool_args.clone(),
+                        egui::FontId::monospace(11.5),
+                        MUTED,
+                        ui.available_width(),
+                    );
+                    job.wrap.max_rows = 2;
+                    job.wrap.break_anywhere = true;
+                    ui.add(egui::Label::new(job));
+                }
+            },
+        );
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 18.0), egui::Sense::hover());
+
+            let center = rect.center();
+            let dy = if row.expanded { -2.0 } else { 2.0 };
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    center + egui::vec2(-4.0, -dy),
+                    center + egui::vec2(0.0, dy),
+                    center + egui::vec2(4.0, -dy),
+                ],
+                egui::Stroke::new(1.4_f32, MUTED),
+            ));
+            ui.add_space(7.0);
+            if let Some(seconds) = seconds {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{seconds:.1}s"))
+                            .size(11.0)
+                            .color(MUTED),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Extend),
+                );
+                ui.add_space(7.0);
+            }
+            if row.streaming {
+                crate::activity::orbit(ui, 16.0, now);
+                ui.add_space(6.0);
+            }
+            // A running card shows the spinner instead; a settled one
+            // gets a check or a cross. Icons read at a glance without
+            // needing a label, which is what fit badly in this slot.
+            if let Some(ok) = look.status {
+                status_icon(ui, ok);
+            }
+        });
+    })
+    .response
 }
 
 /// Bytes of a live stream kept in the last, still-growing label.
@@ -724,6 +781,11 @@ struct StreamCache {
 
 #[cfg(test)]
 std::thread_local! {static LAYOUT_CALLS: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};}
+
+// Parses of a prose line, i.e. `inline` ring *misses*. A hit on a second frame
+// must leave this at zero growth.
+#[cfg(test)]
+std::thread_local! {static INLINE_PARSES: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};}
 
 fn estimate_text_height(text: &str, width: f32, font_id: &egui::FontId) -> f32 {
     let line_height = (font_id.size * 1.35).max(1.0);
@@ -994,10 +1056,10 @@ fn prose(ui: &mut egui::Ui, text: &str, streaming: bool) {
         } else if line.starts_with("- ") || line.starts_with("* ") {
             ui.horizontal_top(|ui| {
                 ui.label(egui::RichText::new("•").color(TEAL));
-                ui.add(egui::Label::new(inline(&line[2..])).wrap());
+                ui.add(egui::Label::new(inline(ui, &line[2..])).wrap());
             });
         } else {
-            ui.add(egui::Label::new(inline(line)).wrap());
+            ui.add(egui::Label::new(inline(ui, line)).wrap());
         }
     }
     if !buffer.is_empty() {
@@ -1026,7 +1088,26 @@ fn code_block(ui: &mut egui::Ui, index: usize, text: &str, streaming: bool) {
         });
 }
 
-fn inline(text: &str) -> egui::text::LayoutJob {
+/// Parse one line of inline prose into a `LayoutJob`.
+///
+/// Every line of every visible block is re-parsed on every frame, and the parse
+/// costs more than drawing the result, so the job is memoised in a bounded ring.
+/// The formats are fixed, so the source line alone determines the job.
+fn inline(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
+    let hash = fingerprint(text);
+    let ring = layout_cache::job_ring(ui.ctx());
+    let mut ring = ring.lock().expect("job ring poisoned");
+    if let Some(job) = ring.get(hash, text, fingerprint) {
+        return job;
+    }
+    #[cfg(test)]
+    INLINE_PARSES.with(|calls| calls.set(calls.get() + 1));
+    let job = parse_inline(text);
+    ring.insert(hash, text, job.clone());
+    job
+}
+
+fn parse_inline(text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let mut code = false;
     let mut bold = false;
@@ -1642,5 +1723,144 @@ mod tests {
             });
         }
         assert_eq!(widths[0], widths[1]);
+    }
+    /// Live subagent progress is a surface, not a caption. A frame that hugs
+    /// its text measured ~92px inside a 1084px card, which read as a stray
+    /// label. It must span the card like the thinking block does.
+    #[test]
+    fn live_progress_fills_the_card_width_like_the_thinking_block() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0));
+        let fills = |row: &mut ChatRow| -> Vec<f32> {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.set_width(crate::theme::content_width(ui.available_width()));
+                        render_row(ui, row, 0.0, true);
+                    });
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill != egui::Color32::TRANSPARENT => {
+                        Some(r.rect.width())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut tool = ChatRow::new(RowKind::Tool, "subagent");
+        tool.streaming = true;
+        tool.tool_output = Some("planning · deepseek-v4.1\nRunning bash".into());
+        let tool_widths = fills(&mut tool);
+
+        // The widest filled rect is the progress box (narrower only than the
+        // card itself, which is the first fill).
+        let card = tool_widths[0];
+        let progress = tool_widths
+            .iter()
+            .copied()
+            .filter(|w| *w < card)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            progress > card * 0.9,
+            "progress must span the card: {progress} of {card}"
+        );
+    }
+
+    /// The header names the model: two concurrent children are otherwise
+    /// indistinguishable. `details.model` wins once the child resolves it.
+    #[test]
+    fn a_subagent_header_names_the_model() {
+        let args = serde_json::json!({"task": "review the parser", "label": "parser",
+            "model": "deepseek/deepseek-v4.1"});
+        assert_eq!(
+            crate::tool_subject("subagent", &args, None, None).as_deref(),
+            Some("parser · deepseek/deepseek-v4.1")
+        );
+        // The resolved model is authoritative: it may differ from the request
+        // when the child falls back to a default.
+        let details = serde_json::json!({"id": "sub_1", "model": "deepseek-v4.1-flash"});
+        assert_eq!(
+            crate::tool_subject("subagent", &args, Some(&details), None).as_deref(),
+            Some("parser · deepseek-v4.1-flash")
+        );
+    }
+
+    /// Without a label or a model there is nothing meaningful to show, and the
+    /// task text must not leak into a one-line header.
+    #[test]
+    fn a_subagent_header_never_falls_back_to_the_task_text() {
+        let args = serde_json::json!({"task": "a very long delegated instruction"});
+        assert_eq!(
+            crate::tool_subject("subagent", &args, None, None).as_deref(),
+            Some("")
+        );
+        // A label alone still identifies the run.
+        let labelled = serde_json::json!({"task": "t", "label": "parser"});
+        assert_eq!(
+            crate::tool_subject("subagent", &labelled, None, None).as_deref(),
+            Some("parser")
+        );
+    }
+
+    /// The delegated task is what was actually asked, so it is revealed on
+    /// expand rather than dropped.
+    #[test]
+    fn a_subagent_card_reveals_the_delegated_task() {
+        let args = serde_json::json!({"task": "review the parser"});
+        assert_eq!(crate::tool_detail("subagent", &args), "review the parser");
+        // `prompt` is the documented alias.
+        let aliased = serde_json::json!({"prompt": "review the lexer"});
+        assert_eq!(crate::tool_detail("subagent", &aliased), "review the lexer");
+    }
+
+    /// The prose job cache only pays off if it survives between frames. If the
+    /// ring were rebuilt every frame the parse count would not drop, and the
+    /// whole mechanism would be pure overhead.
+    #[test]
+    fn prose_layout_is_reused_across_frames() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let body = "A paragraph with **bold** and `code`.\n\nSecond line here.\n";
+        let mut row = ChatRow::new(RowKind::Assistant, body);
+        row.streaming = false;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(760.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        let render = |row: &mut ChatRow| {
+            let _ = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| render_row(ui, row, 0.0, true));
+            });
+        };
+
+        // First frame parses every line.
+        INLINE_PARSES.with(|calls| calls.set(0));
+        render(&mut row);
+        let first = INLINE_PARSES.with(|calls| calls.get());
+        assert!(first > 0, "the first frame must parse the prose lines");
+
+        // Later frames must be pure cache hits.
+        INLINE_PARSES.with(|calls| calls.set(0));
+        for _ in 0..5 {
+            render(&mut row);
+        }
+        assert_eq!(
+            INLINE_PARSES.with(|calls| calls.get()),
+            0,
+            "settled frames must not re-parse prose lines"
+        );
     }
 }

@@ -40,13 +40,27 @@ impl GitCheckpoints {
     fn map_path(session_dir: &Path) -> PathBuf {
         session_dir.join("turn_commits.json")
     }
+    /// The turn→commit map lives in its own database, not in
+    /// `checkpoints.redb`.
+    ///
+    /// Both used to share one file because they always ran on one thread, where
+    /// the `Records` weak cache guaranteed a single handle. Checkpoints now run
+    /// on a worker thread, so the worker would open the same redb the main
+    /// thread already holds and redb refuses (`Database already open`). Two
+    /// files, two locks, no interaction.
+    fn map_db(session_dir: &Path) -> PathBuf {
+        session_dir.join("git-turn-commits.redb")
+    }
 
     fn load_map(session_dir: &Path) -> std::io::Result<BTreeMap<u64, TurnCommit>> {
-        let store = crate::records::Records::open(&session_dir.join("checkpoints.redb"))
+        let store = crate::records::Records::open(&Self::map_db(session_dir))
             .map_err(std::io::Error::other)?;
         if let Some(map) = store.get("turns").map_err(std::io::Error::other)? {
             return Ok(map);
         }
+        // Anything older is migrated by `precheck` on the calling thread. It
+        // cannot happen here: the worker must never open
+        // `checkpoints.redb`, which the main thread already holds.
         let legacy = Self::map_path(session_dir);
         if legacy.exists() {
             let map: BTreeMap<u64, TurnCommit> =
@@ -66,9 +80,23 @@ impl GitCheckpoints {
         }
         Ok(BTreeMap::new())
     }
+    /// Best-effort read of the pre-split layout, where the turn map shared
+    /// `checkpoints.redb` with file-snapshot state.
+    ///
+    /// Returns `None` when the file is absent, unreadable, or currently locked
+    /// by another handle — all of which simply mean "nothing to migrate".
+    fn migrate_from_shared_db(session_dir: &Path) -> Option<BTreeMap<u64, TurnCommit>> {
+        let shared = session_dir.join("checkpoints.redb");
+        if !shared.is_file() {
+            return None;
+        }
+        let store = crate::records::Records::open(&shared).ok()?;
+        let map: BTreeMap<u64, TurnCommit> = store.get("turns").ok()??;
+        (!map.is_empty()).then_some(map)
+    }
 
     fn save_map(session_dir: &Path, map: &BTreeMap<u64, TurnCommit>) -> std::io::Result<()> {
-        crate::records::Records::open(&session_dir.join("checkpoints.redb"))
+        crate::records::Records::open(&Self::map_db(session_dir))
             .and_then(|s| s.put("turns", map))
             .map_err(std::io::Error::other)
     }
@@ -169,12 +197,98 @@ impl GitCheckpoints {
         (out.into_iter().collect(), diagnostics)
     }
 
-    fn is_ignored(repo: &Path, rel: &str) -> bool {
-        git_command()
-            .args(["check-ignore", "-q", "--", rel])
+    /// Which of `files` git would ignore, in one process.
+    ///
+    /// The per-file form (`check-ignore -q -- f`) cost one process per file,
+    /// which dominated the checkpoint: a 12-file turn spawned 48 of them. With
+    /// `--stdin -z` git reports only the ignored paths, in the order given, so
+    /// one spawn answers the whole turn.
+    ///
+    /// `-z` and a NUL-separated stdin are both required: without them a path
+    /// containing a newline is parsed as two paths, and a path that is ignored
+    /// could be misattributed to a different entry.
+    fn ignored_paths(repo: &Path, files: &[String]) -> BTreeSet<String> {
+        if files.is_empty() {
+            return BTreeSet::new();
+        }
+        let mut input = Vec::new();
+        for f in files {
+            input.extend_from_slice(f.as_bytes());
+            input.push(0);
+        }
+        let mut child = match git_command()
+            .args(["check-ignore", "--stdin", "-z"])
             .current_dir(repo)
-            .status()
-            .is_ok_and(|status| status.success())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            // A spawn failure is not a reason to drop a checkpoint: treat
+            // nothing as ignored and let `git add` do the filtering it already
+            // does. `add` refuses ignored paths, which is the same outcome.
+            Err(_) => return BTreeSet::new(),
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&input);
+            // Dropping closes the pipe so git can finish.
+        }
+        match child.wait_with_output() {
+            Ok(out) => out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|chunk| !chunk.is_empty())
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect(),
+            Err(_) => BTreeSet::new(),
+        }
+    }
+
+    /// Stage every accepted file in ONE `git add`.
+    ///
+    /// `git add -- a b c` takes the whole list. Files git still refuses (a
+    /// nested repo, a broken submodule) do not fail the batch in a useful way,
+    /// so on error we fall back to per-file adds to keep the precise diagnostic
+    /// naming the offending path — the slow path only runs when something is
+    /// actually wrong.
+    fn add_all(
+        repo: &Path,
+        index: &Path,
+        files: &[String],
+        diagnostics: &mut Vec<String>,
+    ) -> Vec<String> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let mut cmd = git_command();
+        cmd.arg("add").arg("--");
+        cmd.args(files);
+        let out = cmd.current_dir(repo).env("GIT_INDEX_FILE", index).output();
+        if out.as_ref().is_ok_and(|o| o.status.success()) {
+            return files.to_vec();
+        }
+        // One bad path must not cost the whole checkpoint, so retry singly and
+        // report exactly which paths were refused.
+        let mut added = Vec::new();
+        for f in files {
+            let out = git_command()
+                .args(["add", "--", f])
+                .current_dir(repo)
+                .env("GIT_INDEX_FILE", index)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => added.push(f.clone()),
+                Ok(o) => diagnostics.push(format!(
+                    "[ILLEGAL_COMMAND] checkpoint skipped path {f}: {}",
+                    Self::sanitize_git_stderr(&o.stderr, repo)
+                )),
+                Err(e) => diagnostics.push(format!(
+                    "[ILLEGAL_COMMAND] checkpoint skipped path {f}: {e}"
+                )),
+            }
+        }
+        added
     }
 
     fn sanitize_git_stderr(stderr: &[u8], repo: &Path) -> String {
@@ -206,6 +320,56 @@ impl GitCheckpoints {
         Ok(self.commit_turn_report(turn, session_dir, files)?.hash)
     }
 
+    /// Validate the touched paths *without* spawning git.
+    ///
+    /// `clean_files` is pure filesystem work: it normalizes paths, rejects
+    /// escapes and non-files, and produces the diagnostics the model needs.
+    /// Running it on the caller's thread keeps those diagnostics on the turn
+    /// they belong to, which matters: a model told "that path was skipped" on
+    /// the same turn stops retrying it, while a diagnostic delivered a turn
+    /// late has already cost another rejected call.
+    ///
+    /// Returns the accepted repo-relative paths plus diagnostics, or `None`
+    /// when the repo cannot be established (in which case the caller leaves
+    /// the checkpoint to the worker's error report).
+    pub fn precheck(
+        &self,
+        session_dir: &Path,
+        files: &[String],
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        // One-time migration of the pre-split layout, on the caller's thread
+        // (the worker must never open `checkpoints.redb`).
+        //
+        // Guarded by the new database's existence: once it is there the
+        // migration is over, and re-reading the old file every turn would put a
+        // redb open back on the turn boundary — which is the cost this whole
+        // change exists to remove.
+        if !Self::map_db(session_dir).is_file() {
+            if let Some(map) = Self::migrate_from_shared_db(session_dir) {
+                if let Ok(store) = crate::records::Records::open(&Self::map_db(session_dir)) {
+                    let _ = store.put("turns", &map);
+                }
+            }
+        }
+        let root = crate::workspace_path::normalize_input(&self.start);
+        // `ensure_repo` would create `.git`; probing only needs the directory.
+        let repo = std::fs::canonicalize(&root).ok()?;
+        Some(Self::clean_files(&repo, files))
+    }
+
+    /// Do the git half of a checkpoint for already-validated `files`.
+    ///
+    /// This is the expensive part (spawns), which is why it runs on the
+    /// checkpoint worker rather than at the turn boundary.
+    pub fn commit_prepared(
+        &self,
+        turn: u64,
+        session_dir: &Path,
+        files: Vec<String>,
+    ) -> std::io::Result<CheckpointReport> {
+        self.commit_turn_report(turn, session_dir, &files)
+    }
+
     pub fn commit_turn_report(
         &self,
         turn: u64,
@@ -222,25 +386,15 @@ impl GitCheckpoints {
             .join(format!("git-index-{turn}.tmp"));
 
         let _ = std::fs::remove_file(&index);
-        let mut added = Vec::new();
-        for f in &files {
-            if Self::is_ignored(&repo, f) {
-                continue;
-            }
-            let out = git_command()
-                .args(["add", "--", f])
-                .current_dir(&repo)
-                .env("GIT_INDEX_FILE", &index)
-                .output()?;
-            if out.status.success() {
-                added.push(f.clone());
-            } else {
-                diagnostics.push(format!(
-                    "[ILLEGAL_COMMAND] checkpoint skipped path {f}: {}",
-                    Self::sanitize_git_stderr(&out.stderr, &repo)
-                ));
-            }
-        }
+        // Two spawns for the whole turn instead of two per file: one
+        // `check-ignore` for every path, then one `add` for the survivors.
+        let ignored = Self::ignored_paths(&repo, &files);
+        let staged: Vec<String> = files
+            .iter()
+            .filter(|f| !ignored.contains(*f))
+            .cloned()
+            .collect();
+        let added = Self::add_all(&repo, &index, &staged, &mut diagnostics);
         let out = git_command()
             .arg("write-tree")
             .current_dir(&repo)
@@ -692,5 +846,70 @@ mod tests {
         assert!(!report.diagnostics.iter().any(|d| d.contains("adir")));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(outside);
+    }
+    /// One `check-ignore` must classify every path. The per-file form cost a
+    /// process per file; this asserts the batched answer is the same set.
+    #[test]
+    fn ignored_paths_classifies_the_whole_list_in_one_pass() {
+        let dir = temp("ignored-batch");
+        git(&dir, &["init"]);
+        std::fs::write(dir.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        for f in ["a.log", "b.log", "keep.txt"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        std::fs::write(dir.join("build/out.o"), "x").unwrap();
+        let files: Vec<String> = ["a.log", "keep.txt", "b.log", "build/out.o"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ignored = GitCheckpoints::ignored_paths(&dir, &files);
+        assert!(ignored.contains("a.log"));
+        assert!(ignored.contains("b.log"));
+        assert!(ignored.contains("build/out.o"));
+        assert!(!ignored.contains("keep.txt"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An empty list must not spawn git at all.
+    #[test]
+    fn ignored_paths_is_free_when_there_is_nothing_to_check() {
+        let dir = temp("ignored-empty");
+        let ignored = GitCheckpoints::ignored_paths(&dir, &[]);
+        assert!(ignored.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The batch must stage every path, and the fallback must still name the
+    /// single path that git refuses rather than failing the whole checkpoint.
+    #[test]
+    fn add_all_stages_the_batch_and_reports_only_refused_paths() {
+        let dir = temp("add-batch");
+        git(&dir, &["init"]);
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let index = dir.join("batch-index.tmp");
+        let files: Vec<String> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut diagnostics = Vec::new();
+        let added = GitCheckpoints::add_all(&dir, &index, &files, &mut diagnostics);
+        assert_eq!(added.len(), 3, "all three staged in one add");
+        assert!(diagnostics.is_empty());
+
+        // A path that does not exist is refused; the others still stage.
+        let mixed: Vec<String> = ["a.txt", "missing.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut diagnostics = Vec::new();
+        let added = GitCheckpoints::add_all(&dir, &index, &mixed, &mut diagnostics);
+        assert_eq!(added, vec!["a.txt".to_string()]);
+        assert_eq!(diagnostics.len(), 1, "exactly the refused path is reported");
+        assert!(diagnostics[0].contains("missing.txt"));
+        let _ = std::fs::remove_file(&index);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

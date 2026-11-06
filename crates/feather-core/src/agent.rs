@@ -317,6 +317,9 @@ pub struct Agent {
     abort: tokio::sync::watch::Sender<bool>,
     abort_rx: tokio::sync::watch::Receiver<bool>,
     queue: InputQueue,
+    /// System-prompt + tool-schema token cost for the current config. Fixed
+    /// until `reconfigure`, so it is estimated once instead of every turn.
+    static_request_tokens: u64,
 }
 
 #[derive(Debug)]
@@ -486,6 +489,8 @@ impl Agent {
         provider: ProviderRef,
         planner: Option<Arc<dyn CachePlanner>>,
     ) -> Self {
+        let static_request_tokens =
+            tokenizer::estimate_request_static_tokens(&config.system_prompt, &config.tools);
         let (events, _) = tokio::sync::broadcast::channel(4096);
         let (abort, abort_rx) = tokio::sync::watch::channel(false);
         Self {
@@ -498,6 +503,7 @@ impl Agent {
             abort,
             abort_rx,
             queue: InputQueue::default(),
+            static_request_tokens,
         }
     }
 
@@ -569,6 +575,10 @@ impl Agent {
         self.config = config;
         self.provider = provider;
         self.tools = tools;
+        self.static_request_tokens = tokenizer::estimate_request_static_tokens(
+            &self.config.system_prompt,
+            &self.config.tools,
+        );
         // A model switch is exactly when a broken pairing surfaces: the next
         // request goes to a provider that rejects a `tool` message with no
         // `tool_calls` parent, and the session looks permanently bricked. Repair
@@ -583,6 +593,20 @@ impl Agent {
         let id = s.id().to_string();
         self.session = s;
         Ok(id)
+    }
+
+    /// Prompt-side token estimate for the current context, assembled from the
+    /// cached static part and the session's running totals. No message is
+    /// visited, so this is safe to call before every request.
+    fn request_input_tokens(&self) -> u64 {
+        tokenizer::request_input_tokens_from_totals(
+            self.config.api,
+            self.static_request_tokens,
+            (
+                self.session.context_tokens(),
+                self.session.context_tokens_without_thinking(),
+            ),
+        )
     }
     /// Build the next chat request from the linear history, applying the
     /// cache planner.
@@ -686,12 +710,7 @@ impl Agent {
             // cached message rows. Include system instructions and tool schemas,
             // and use only the configured compaction headroom before each normal request.
             // build_request so no later async work can make the prompt stale.
-            let request_tokens = tokenizer::estimate_request_input_tokens(
-                self.config.api,
-                &self.config.system_prompt,
-                self.session.messages(),
-                &self.config.tools,
-            );
+            let request_tokens = self.request_input_tokens();
             if compaction::should_compact_request(
                 request_tokens,
                 self.config.context_window,
@@ -700,12 +719,7 @@ impl Agent {
                 let before_request_tokens = request_tokens;
                 match self.compact("threshold").await {
                     Ok(saved) if saved > 0 => {
-                        let after = tokenizer::estimate_request_input_tokens(
-                            self.config.api,
-                            &self.config.system_prompt,
-                            self.session.messages(),
-                            &self.config.tools,
-                        );
+                        let after = self.request_input_tokens();
                         let _ = self.events.send(AgentEvent::CompactionDone {
                             tokens_before: before_request_tokens,
                             tokens_after: after,
@@ -716,12 +730,7 @@ impl Agent {
                         // A no-op compaction must not issue an over-limit request.
                         // Surface the condition rather than compacting repeatedly
                         // and sending the same invalid prompt three times.
-                        let after = tokenizer::estimate_request_input_tokens(
-                            self.config.api,
-                            &self.config.system_prompt,
-                            self.session.messages(),
-                            &self.config.tools,
-                        );
+                        let after = self.request_input_tokens();
                         if after > self.config.context_window {
                             return Err(AgentError::Provider(crate::provider::ProviderError::Stream(
                                 format!(
@@ -1184,24 +1193,14 @@ impl Agent {
             return Err(AgentError::Aborted);
         }
         let settings = self.config.compaction.clone();
-        let before_request_tokens = tokenizer::estimate_request_input_tokens(
-            self.config.api,
-            &self.config.system_prompt,
-            self.session.messages(),
-            &self.config.tools,
-        );
+        let before_request_tokens = self.request_input_tokens();
         let before_chars = compaction::context_characters(self.session.messages());
         let _before_tokens = self.session.context_tokens();
         // Tokens the request spends before the first message (system prompt and
         // tool schemas), and the room messages may occupy before the trigger
         // fires again. Cut and safety-net shrink both use this, so a rewrite
         // never lands exactly on the trigger and re-fires on the next turn.
-        let static_request_tokens = tokenizer::estimate_request_input_tokens(
-            self.config.api,
-            &self.config.system_prompt,
-            &[],
-            &self.config.tools,
-        );
+        let static_request_tokens = self.static_request_tokens;
         // Budget the rewrite must hit. `context_window - reserve` alone is the
         // trigger *line*: a rewrite that lands on it is over it again as soon as
         // one tool result arrives, so every later turn compacts.
@@ -1315,13 +1314,14 @@ impl Agent {
         // this must stay a no-op in the normal case.
         compaction::shrink_messages_to_tokens(&mut new_msgs, room);
         let after_chars = compaction::context_characters(&new_msgs);
+        // `new_msgs` is a candidate list that is not installed yet, so the
+        // session totals do not describe it: this one estimate has to scan.
         let after_request_tokens = tokenizer::estimate_request_input_tokens(
             self.config.api,
             &self.config.system_prompt,
             &new_msgs,
             &self.config.tools,
         );
-        let _after_tokens = tokenizer::estimate_context_tokens(&new_msgs);
         let saved = before_chars.saturating_sub(after_chars);
         if saved == 0 || after_request_tokens >= before_request_tokens {
             return Ok(0); // oversized/ineffective summary: preserve original context

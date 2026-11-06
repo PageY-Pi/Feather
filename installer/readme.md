@@ -1,6 +1,6 @@
-# Feather 1.3.0 Windows installer
+# Feather 1.3.1 Windows installer
 
-Share `dist/Feather-1.3.0-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.3.1-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -86,6 +86,9 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.3.1 gives `bash` a `timeout` argument in seconds, so a build or a full
+  test suite can ask for the time it needs instead of dying on a fixed cap. The
+  task tools also stop rendering as `{}` and share a checked-box mark.
 - 1.3.0 adds the OpenCode Go subscription provider, and makes tool cards say
   what the call does instead of what the program is called. Cards carry a ✅/❎
   icon instead of Done/Error chips, an error no longer washes the whole card

@@ -283,8 +283,13 @@ impl SubagentTool {
         let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let mut parent_open = true;
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(100));
+        // One header line for every progress tick, so the card can show which
+        // child is running on which model. The model is resolved above from
+        // the request or the parent's default; without it the reader cannot
+        // tell two concurrent children apart.
+        let header = format!("{label} · {model}");
         if let Some(p) = &progress {
-            let _ = p.send(format!("{label} · {id}\nStarting child"));
+            let _ = p.send(format!("{header}\nStarting child"));
         }
         let mut timed_out = false;
         let mut persist_error = None;
@@ -293,12 +298,12 @@ impl SubagentTool {
              result=&mut run=>break result,
              _=&mut deadline,if !timed_out=>{timed_out=true;let _=abort_tx.send(true);},
              changed=abort.changed(),if parent_open=>{if changed.is_err(){parent_open=false;}else if *abort.borrow(){let _=abort_tx.send(true);}},
-             _=heartbeat.tick()=>{if let Some(p)=&progress{let _=p.send(format!("{label} · {id}\n{}",bounded(&partial,2048,40)));}},
+             _=heartbeat.tick()=>{if let Some(p)=&progress{let _=p.send(format!("{header}\n{}",bounded(&partial,2048,40)));}},
              Ok(event)=events.recv()=>{match event{
               AgentEvent::AssistantMessage(message)=>{let _=message;partial.clear();},
               AgentEvent::TextDelta(text)=>{if partial.len()<2048{partial.push_str(&bounded(&text,2048-partial.len(),40));}},
               AgentEvent::ToolStart{call}=>{partial=format!("Running {}",call.name);},_=>{}
-             }if last.elapsed()>=std::time::Duration::from_millis(100){if let Some(p)=&progress{let _=p.send(format!("{} · {}\n{}",label,id,bounded(&partial,2048,40)));}last=std::time::Instant::now();}}
+             }if last.elapsed()>=std::time::Duration::from_millis(100){if let Some(p)=&progress{let _=p.send(format!("{header}\n{}",bounded(&partial,2048,40)));}last=std::time::Instant::now();}}
             }
         };
         drop(run);

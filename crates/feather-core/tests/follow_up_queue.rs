@@ -28,6 +28,21 @@ fn session(name: &str) -> (Session, std::path::PathBuf) {
     std::fs::create_dir_all(&root).unwrap();
     (Session::new(&root.join(".feather"), &root).unwrap(), root)
 }
+/// Remove a test session directory, tolerating a checkpoint still landing.
+///
+/// Checkpoints run on a background thread, so a `.redb` can be held for a
+/// moment after the turn returns. On Windows that makes `remove_dir_all` fail
+/// with a sharing violation, so retry briefly instead of flaking.
+fn cleanup(root: std::path::PathBuf) {
+    for _ in 0..50 {
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
 
 struct Gate {
     tx: tokio::sync::watch::Sender<bool>,
@@ -115,7 +130,7 @@ async fn follow_up_queued_during_tool_runs_after_current_final() {
         .unwrap();
     let follow = texts.iter().position(|(_, t)| t == "follow final").unwrap();
     assert!(current < queued && queued < follow, "{texts:?}");
-    std::fs::remove_dir_all(root).unwrap();
+    cleanup(root);
 }
 
 #[tokio::test]
@@ -160,7 +175,7 @@ async fn final_assistant_event_precedes_queued_user_and_next_turn() {
         .unwrap()
         .0;
     assert!(cur < run && run < queued && queued < next_turn, "{seq:?}");
-    std::fs::remove_dir_all(root).unwrap();
+    cleanup(root);
 }
 
 #[tokio::test]
@@ -188,7 +203,7 @@ async fn multiple_followups_run_one_per_request_in_order() {
         .map(Message::text)
         .collect();
     assert_eq!(users, ["initial", "f1", "f2"]);
-    std::fs::remove_dir_all(root).unwrap();
+    cleanup(root);
 }
 
 #[tokio::test]
@@ -213,5 +228,5 @@ async fn queued_followup_survives_abort_before_delivery() {
         feather_core::message::StopReason::Aborted
     ));
     assert_eq!(agent.input_queue().snapshot().1, vec!["survivor"]);
-    std::fs::remove_dir_all(root).unwrap();
+    cleanup(root);
 }
