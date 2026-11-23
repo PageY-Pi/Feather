@@ -145,6 +145,9 @@ enum UiEvent {
     },
     /// Startup model discovery finished; the catalog on screen is stale.
     ModelsRefreshed,
+    /// The broadcast ring wrapped and `n` agent events were never delivered.
+    /// Surfaced as a note instead of silently rendering a truncated stream.
+    EventsLost(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -1633,6 +1636,24 @@ impl FeatherApp {
                     // resolved catalog is rebuilt from it on the next read.
                     self.catalog = models::load();
                 }
+                UiEvent::EventsLost(n) => {
+                    // The delta stream is incomplete, so text and tool rows may be
+                    // missing from what the UI accumulated. The session is always
+                    // authoritative: rebuild the rows from it rather than leaving
+                    // a silently truncated transcript on screen.
+                    if let Some(agent) = self.agent.clone() {
+                        if let Ok(guard) = agent.try_lock() {
+                            self.rows = rows_from_messages(guard.session().messages());
+                        }
+                    }
+                    self.rows.push(ChatRow::new(
+                        RowKind::Notice,
+                        format!(
+                            "The event stream fell behind and {n} updates were dropped; \
+                             the transcript above was rebuilt from the session."
+                        ),
+                    ));
+                }
             }
             count += 1;
             if count >= 2048 || started.elapsed() >= std::time::Duration::from_millis(4) {
@@ -1870,7 +1891,7 @@ async fn drive_prompt(
             result=&mut prompt=>break result.map_err(|e|e.to_string()),
             event=events.recv()=>match event {
                 Ok(event)=>{if tx.send(UiEvent::Agent(event)).is_err(){return;}ctx.request_repaint_after(std::time::Duration::from_millis(33));},
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{},
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n))=>{if tx.send(UiEvent::EventsLost(n)).is_err(){return;}},
                 Err(tokio::sync::broadcast::error::RecvError::Closed)=>break Err("agent event stream closed".into()),
             }
         }
@@ -1883,7 +1904,16 @@ async fn drive_prompt(
                     return;
                 }
             }
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            // The ring wrapped: some deltas were never forwarded. Silently
+            // discarding the loss renders as a gap with no explanation, so the
+            // UI is told and can resync the transcript from the session instead
+            // of trusting the delta stream.
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                if tx.send(UiEvent::EventsLost(n)).is_err() {
+                    return;
+                }
+                continue;
+            }
             Err(_) => break,
         }
     }
@@ -1924,6 +1954,22 @@ fn truncate_owned(mut text: String, limit: usize) -> String {
     text.truncate(end);
     text.push_str("\n… (truncated)");
     text
+}
+
+/// Truncate to `max_chars` **characters**, matching the unit the agent uses.
+///
+/// The tool layer caps output with a character budget (`feather::bash`), so a
+/// byte budget here cuts a multi-byte result earlier than the model's own limit
+/// and the UI shows strictly less than the model was given. Counting characters
+/// keeps the two views consistent for CJK and emoji output, where a byte limit is
+/// up to 3x stricter than the agent's.
+fn truncate_chars(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn tool_summary(args: &serde_json::Value) -> String {
@@ -2103,7 +2149,9 @@ fn rows_from_messages(messages: &[feather_core::message::Message]) -> Vec<ChatRo
                 }
             }
             Role::ToolResult => {
-                let output = truncate_owned(message.text(), 20_000);
+                // Characters, not bytes: this is the row the user compares against
+                // the model's own char-budgeted view of the same tool result.
+                let output = truncate_chars(message.text(), 20_000);
                 let id = message.tool_call_id.clone();
                 if let Some(row) = rows
                     .iter_mut()

@@ -25,6 +25,27 @@ const SNAPSHOTS: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("sn
 /// not the maximum turn.
 const META: TableDefinition<'static, &str, u64> = TableDefinition::new("meta");
 const CURRENT_TURN_KEY: &str = "current_turn";
+/// Number of messages `snapshot_reusing` had to serialize, returned to the caller.
+///
+/// The point of the reuse hint is that a commit costs the changed suffix, not the
+/// history length, so this is what the cost test pins. It is returned rather than
+/// read from a global so it stays exact under parallel tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotCost {
+    /// Messages whose canonical JSON had to be produced and stored.
+    pub serialized: u64,
+    /// Messages whose key was reused from the hint without serializing.
+    pub reused: u64,
+}
+
+/// What a snapshot commit produced: state to carry forward, and what it cost.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotCommit {
+    /// State to pass as the `reuse` hint on the next commit.
+    pub chunks: SnapshotChunks,
+    /// Work this commit actually performed.
+    pub cost: SnapshotCost,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -77,6 +98,32 @@ struct SnapshotRecord {
     /// FNV of the whole message list — used by the cache-optimizer as the
     /// "history generation" marker.
     history_hash: u64,
+}
+
+/// The chunk keys a snapshot commit wrote, paired with the message hashes they
+/// were derived from.
+///
+/// Held by `Session` between commits so the next snapshot can reuse the unchanged
+/// prefix instead of re-serializing the whole conversation. It is a cache, not
+/// state: `snapshot_reusing` re-checks every entry by hash, so a stale or empty
+/// value can only cost extra work, never a wrong snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotChunks {
+    /// Chunk key recorded for each message, in message order.
+    pub keys: Vec<u64>,
+    /// FNV-1a of each message's canonical JSON at the time it was stored.
+    pub bases: Vec<u64>,
+}
+
+impl SnapshotChunks {
+    /// Number of leading messages whose stored key is still valid for `hashes`.
+    fn reusable_prefix(&self, hashes: &[u64]) -> usize {
+        self.bases
+            .iter()
+            .zip(hashes.iter())
+            .take_while(|(stored, current)| stored == current)
+            .count()
+    }
 }
 
 /// Process-wide `Weak` handles to open snapshot databases.
@@ -136,18 +183,62 @@ impl SnapshotStore {
 
     /// Persist a snapshot for `turn`. Idempotent: re-snapshotting the same
     /// content is a no-op; divergent content for the same turn overwrites.
+    ///
+    /// Cost is proportional to what *changed*, not to the length of the history.
+    /// Sessions are append-only between compactions, so the newest snapshot is
+    /// almost always a prefix of the new message list; reusing its chunk keys for
+    /// that prefix avoids re-serializing and re-hashing the entire conversation
+    /// on every tool-loop iteration (which made a long session quadratic in
+    /// bytes written through `serde_json`).
     pub fn snapshot(&self, turn: u64, messages: &[Message]) -> Result<(), SnapshotError> {
+        self.snapshot_reusing(turn, messages, &[], &SnapshotChunks::default())
+            .map(|_| ())
+    }
+
+    /// Snapshot reusing known chunk keys for an unchanged prefix.
+    ///
+    /// `message_hashes[i]` must be FNV-1a of `messages[i]`'s canonical JSON (the
+    /// chunk key domain). `reuse` carries what a previous commit stored; an entry
+    /// is taken only when its recorded hash still matches, so a stale or short
+    /// hint simply falls back to storing that chunk. The returned value describes
+    /// what this commit wrote, ready to pass back on the next call.
+    pub fn snapshot_reusing(
+        &self,
+        turn: u64,
+        messages: &[Message],
+        message_hashes: &[u64],
+        reuse: &SnapshotChunks,
+    ) -> Result<SnapshotCommit, SnapshotError> {
         let mut keys = Vec::with_capacity(messages.len());
-        // serialize each message once — the bytes feed the FNV key, the chunk
-        // table, and the running history hash (was: 3 separate to_vec calls)
+        let mut cost = SnapshotCost::default();
+        let mut base_hashes: Vec<u64> = Vec::with_capacity(messages.len());
         let mut hist = crate::message::fnv1a(b"feather-history-v1");
         let txn = self.db.begin_write()?;
         {
             let mut chunks = txn.open_table(CHUNKS)?;
-            for m in messages {
+            // Reuse the prefix this turn did not change. `message_hashes` is the
+            // same FNV-1a of each message's canonical JSON that keys the chunk
+            // table, maintained incrementally by `Session::push`, so an equal
+            // hash at position i proves the bytes are the ones already stored —
+            // no serialization, no read-back, and the collision probe resolved
+            // exactly as it was before.
+            // Messages that still hash to what was stored need no serialization
+            // and no chunk-table read: their key is already correct.
+            let reusable = reuse.reusable_prefix(message_hashes);
+            for (index, m) in messages.iter().enumerate() {
+                let base = match message_hashes.get(index) {
+                    Some(hash) => *hash,
+                    None => crate::message::json_hash(m)?,
+                };
+                base_hashes.push(base);
+                hist = hist.rotate_left(1) ^ base;
+                if index < reusable {
+                    keys.push(reuse.keys[index]);
+                    cost.reused += 1;
+                    continue;
+                }
+                cost.serialized += 1;
                 let bytes = serde_json::to_vec(m)?;
-                let base = crate::message::fnv1a(&bytes);
-                hist = hist.rotate_left(1) ^ crate::message::fnv1a(&bytes);
                 // FNV-64 collision guard: a key hit with DIFFERENT bytes must
                 // not silently alias the other message — probe neighbor keys
                 let mut key = base;
@@ -170,6 +261,8 @@ impl SnapshotStore {
                 keys.push(key);
             }
         }
+        // Kept for the caller so the next commit can reuse what this one stored.
+        let chunk_keys = keys.clone();
         {
             let mut snaps = txn.open_table(SNAPSHOTS)?;
             let rec = SnapshotRecord {
@@ -196,7 +289,13 @@ impl SnapshotStore {
             meta.insert(CURRENT_TURN_KEY, turn)?;
         }
         txn.commit()?;
-        Ok(())
+        Ok(SnapshotCommit {
+            chunks: SnapshotChunks {
+                keys: chunk_keys,
+                bases: base_hashes,
+            },
+            cost,
+        })
     }
 
     pub fn history_hash(messages: &[Message]) -> u64 {
@@ -406,6 +505,173 @@ mod tests {
         // Both clone cheaply off the shared handle.
         let _third = first.clone();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reusing a prefix must be invisible in the result: a snapshot written with
+    /// a hint has to load back byte-identically, and its recorded history hash
+    /// has to equal a full recomputation. If reuse ever diverged, rewind and
+    /// resume would restore a different conversation from the one committed.
+    #[test]
+    fn hinted_snapshot_matches_a_full_rebuild() {
+        let dir = tmpdir("reuse");
+        let store = SnapshotStore::open(&dir).unwrap();
+
+        let base = vec![
+            Message::user_text("first"),
+            Message::assistant(
+                vec![crate::message::ContentBlock::Text {
+                    text: "answer".into(),
+                }],
+                "m",
+                crate::message::Api::Faux,
+                Usage::default(),
+                StopReason::Stop,
+            ),
+        ];
+        let hashes: Vec<u64> = base
+            .iter()
+            .map(|m| crate::message::json_hash(m).unwrap())
+            .collect();
+
+        store.snapshot(1, &base).unwrap();
+        let first = store.list().unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Grow the history and reuse the prefix stored by the first commit.
+        let mut grown = base.clone();
+        grown.push(Message::user_text("second"));
+        let mut grown_hashes = hashes.clone();
+        grown_hashes.push(crate::message::json_hash(&grown[2]).unwrap());
+
+        let reuse = SnapshotChunks {
+            keys: vec![],
+            bases: vec![],
+        };
+        let stored = store
+            .snapshot_reusing(2, &grown, &grown_hashes, &reuse)
+            .unwrap();
+        assert_eq!(stored.chunks.bases, grown_hashes);
+
+        // A second commit that actually reuses the hint.
+        let mut grown2 = grown.clone();
+        grown2.push(Message::user_text("third"));
+        let mut hashes2 = grown_hashes.clone();
+        hashes2.push(crate::message::json_hash(&grown2[3]).unwrap());
+        let stored2 = store
+            .snapshot_reusing(3, &grown2, &hashes2, &stored.chunks)
+            .unwrap();
+        assert_eq!(stored2.chunks.bases, hashes2);
+        // Only the new message needed storing; the prefix came from the hint.
+        assert_eq!(stored2.cost.serialized, 1);
+        assert_eq!(stored2.cost.reused, grown.len() as u64);
+
+        // Every turn loads back to exactly what was passed in.
+        assert_eq!(store.load(1).unwrap(), base);
+        assert_eq!(store.load(2).unwrap(), grown);
+        assert_eq!(store.load(3).unwrap(), grown2);
+
+        // The recorded history hash is the same one a full pass computes.
+        let listed = store.list().unwrap();
+        let hash_at = |turn: u64| listed.iter().find(|t| t.0 == turn).unwrap().2;
+        assert_eq!(hash_at(3), SnapshotStore::history_hash(&grown2));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A hint that no longer matches the history must degrade to storing the
+    /// changed chunks, never to recording the old keys.
+    #[test]
+    fn stale_hint_falls_back_to_storing_chunks() {
+        let dir = tmpdir("reuse-stale");
+        let store = SnapshotStore::open(&dir).unwrap();
+
+        let original = vec![Message::user_text("a"), Message::user_text("b")];
+        store.snapshot(1, &original).unwrap();
+
+        let rewritten = vec![Message::user_text("a"), Message::user_text("b")];
+        let mut hashes: Vec<u64> = rewritten
+            .iter()
+            .map(|m| crate::message::json_hash(m).unwrap())
+            .collect();
+        // A hint claiming different bases: nothing may be reused from it.
+        let stale = SnapshotChunks {
+            keys: vec![0xdead, 0xbeef],
+            bases: vec![1, 2],
+        };
+        let stored = store
+            .snapshot_reusing(2, &rewritten, &hashes, &stale)
+            .unwrap();
+        assert_eq!(stored.chunks.bases, hashes, "hint bases must be recomputed");
+        assert_ne!(
+            stored.chunks.keys,
+            vec![0xdead, 0xbeef],
+            "stale keys were reused"
+        );
+        assert_eq!(stored.cost.reused, 0, "nothing should have been reused");
+        assert_eq!(stored.cost.serialized, 2);
+        assert_eq!(store.load(2).unwrap(), rewritten);
+
+        // A short history with a long hint is also safe.
+        hashes.truncate(1);
+        let short = &rewritten[..1];
+        let stored_short = store.snapshot_reusing(3, short, &hashes, &stale).unwrap();
+        assert_eq!(store.load(3).unwrap(), short);
+        assert_eq!(stored_short.chunks.bases.len(), 1);
+        assert_eq!(stored_short.cost.reused, 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The reuse hint has to actually skip work: commit cost must track the
+    /// changed suffix, not the length of the history. A test that only checked
+    /// `load()` equality would pass even if every message were re-serialized.
+    #[test]
+    fn reuse_serializes_only_the_changed_suffix() {
+        let dir = tmpdir("reuse-cost");
+        let store = SnapshotStore::open(&dir).unwrap();
+
+        let mut messages: Vec<Message> = (0..50)
+            .map(|n| Message::user_text(format!("message {n}")))
+            .collect();
+        let hashes = |msgs: &[Message]| -> Vec<u64> {
+            msgs.iter()
+                .map(|m| crate::message::json_hash(m).unwrap())
+                .collect()
+        };
+
+        let mut hint = store
+            .snapshot_reusing(1, &messages, &hashes(&messages), &SnapshotChunks::default())
+            .unwrap()
+            .chunks;
+
+        // Each new turn appends one message. Only that message may be stored.
+        for turn in 2..=6u64 {
+            messages.push(Message::user_text(format!("turn {turn}")));
+            let commit = store
+                .snapshot_reusing(turn, &messages, &hashes(&messages), &hint)
+                .unwrap();
+            hint = commit.chunks;
+            assert_eq!(
+                commit.cost.serialized, 1,
+                "turn {turn} re-serialized the whole history instead of the suffix"
+            );
+            assert_eq!(commit.cost.reused as usize, messages.len() - 1);
+            assert_eq!(store.load(turn).unwrap(), messages);
+        }
+
+        // A prefix rewrite (what compaction does) must invalidate from the edit
+        // onward — the reused prefix simply ends there.
+        messages[3] = Message::user_text("rewritten");
+        let commit = store
+            .snapshot_reusing(7, &messages, &hashes(&messages), &hint)
+            .unwrap();
+        assert_eq!(
+            commit.cost.serialized,
+            (messages.len() - 3) as u64,
+            "rewrite from index 3 onward"
+        );
+        assert_eq!(commit.cost.reused, 3);
+        assert_eq!(store.load(7).unwrap(), messages);
     }
     #[test]
     fn roundtrip_and_rollback() {

@@ -820,11 +820,20 @@ fn layout_cached_piece(
         color: color.to_array(),
     };
     let ring = layout_cache::galley_ring(ui.ctx());
-    ring.lock()
-        .expect("galley ring poisoned")
-        .bind_atlas(&ui.fonts(|f| f.texture_atlas()));
-    if let Some(galley) = ring.lock().expect("galley ring poisoned").get(&key) {
-        return galley;
+    // One lock for the whole lookup. Taking it once per phase meant three
+    // uncontended-lock round trips (and two extra poison checks) for every text
+    // piece of every visible row, on the frame's hottest path. The atlas handle
+    // is only needed when the cache might have been invalidated, so it is
+    // fetched lazily rather than on every call.
+    {
+        let mut ring = ring.lock().expect("galley ring poisoned");
+        // Order matters: binding the atlas may clear the whole ring (textures are
+        // recycled between atlas generations), so a galley must never be read out
+        // before the binding for this frame is established.
+        ring.bind_atlas(&ui.fonts(|f| f.texture_atlas()));
+        if let Some(galley) = ring.get(&key) {
+            return galley;
+        }
     }
     #[cfg(test)]
     LAYOUT_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -1096,14 +1105,23 @@ fn code_block(ui: &mut egui::Ui, index: usize, text: &str, streaming: bool) {
 fn inline(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
     let hash = fingerprint(text);
     let ring = layout_cache::job_ring(ui.ctx());
-    let mut ring = ring.lock().expect("job ring poisoned");
-    if let Some(job) = ring.get(hash, text, fingerprint) {
-        return job;
+    {
+        let mut ring = ring.lock().expect("job ring poisoned");
+        if let Some(job) = ring.get(hash, text, fingerprint) {
+            return job;
+        }
     }
+    // Parse outside the lock. It is the expensive half — a byte-by-byte scan that
+    // builds and merges format runs — and holding the ring across it serialised
+    // every visible block's inline text behind one mutex per frame. A concurrent
+    // miss now parses the same line twice, which is cheaper than making the whole
+    // transcript scan wait behind a single parse.
     #[cfg(test)]
     INLINE_PARSES.with(|calls| calls.set(calls.get() + 1));
     let job = parse_inline(text);
-    ring.insert(hash, text, job.clone());
+    ring.lock()
+        .expect("job ring poisoned")
+        .insert(hash, text, job.clone());
     job
 }
 

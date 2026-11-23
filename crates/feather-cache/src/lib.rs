@@ -52,10 +52,20 @@ use feather_core::provider::{CacheHints, ChatRequest};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Minimum new prefix growth (tokens) before a fresh message breakpoint is
-/// worth writing. Conservative default matching the plugin's long-retention
-/// behaviour for Anthropic-sized prompts.
-pub const DEFAULT_MIN_BREAKPOINT_TOKENS: u64 = 1024;
+/// Minimum new prefix growth (tokens) before a fresh message breakpoint is worth
+/// writing.
+///
+/// Writing a breakpoint costs a cache write (1.25x input on Anthropic) and only
+/// pays off if the new prefix is actually reused. Advancing the breakpoint for a
+/// handful of tokens converted a cheap cache *read* into an expensive cache
+/// *write* on every tool-loop iteration.
+///
+/// 2048 matches the largest minimum-cacheable-prefix among current models (the
+/// smaller models require 2048 tokens before a prefix is cacheable at all), so a
+/// breakpoint below this could be silently ignored by the provider while still
+/// costing a write. It also comfortably exceeds per-turn growth in a tool loop,
+/// which is what keeps the breakpoint pinned to an already-warm prefix.
+pub const DEFAULT_MIN_BREAKPOINT_TOKENS: u64 = 2048;
 /// Default ephemeral cache retention: Anthropic's 5-minute window. A value of
 /// `Some(3600)` requests the 1h window when the endpoint supports it.
 pub const DEFAULT_STICKY_TTL_SECONDS: u64 = 300;
@@ -223,6 +233,17 @@ impl feather_core::agent::CachePlanner for CacheOptimizer {
     ) {
         let was_one_off = self.metrics.one_off.swap(false, Ordering::Relaxed);
 
+        if was_one_off {
+            // A one-off request (a compaction summary) is not part of the
+            // conversation's prefix. It must therefore leave *all* prefix state
+            // untouched: recording its hashes as `prev_hashes` would make the
+            // next real request look like a total rewrite (stable = 0), and
+            // clearing `last_breakpoint` would discard the known-good boundary.
+            // Either mistake costs the following turn a full-prefix cache write.
+            req.cache = CacheHints::default();
+            return;
+        }
+
         let stable = {
             let mut prev = self.prev_hashes.lock().unwrap_or_else(|e| e.into_inner());
             let s = self.stable_prefix_len(new_hashes, &prev);
@@ -230,20 +251,9 @@ impl feather_core::agent::CachePlanner for CacheOptimizer {
             prev.extend_from_slice(new_hashes);
             s
         };
-        let stable = if was_one_off { 0 } else { stable };
         self.metrics
             .last_stable_prefix_len
             .store(stable as u64, Ordering::Relaxed);
-
-        if was_one_off {
-            // one-off request (summary): never write cache entries
-            req.cache = CacheHints::default();
-            *self
-                .last_breakpoint
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
-            return;
-        }
 
         // Only advance the message breakpoint once the stable prefix has grown
         // by at least `min_breakpoint_tokens` since the last breakpoint;
@@ -313,6 +323,10 @@ impl feather_core::agent::CachePlanner for CacheOptimizer {
 
     fn demote_one_off(&self) {
         self.metrics.one_off.store(true, Ordering::Relaxed);
+    }
+
+    fn end_one_off(&self) {
+        self.metrics.one_off.store(false, Ordering::Relaxed);
     }
 }
 
@@ -437,6 +451,59 @@ mod tests {
         assert!(!req3.cache.system);
         assert!(!req3.cache.tools);
         assert!(req3.cache.stable_message_index.is_none());
+    }
+
+    /// A summary request must be invisible to the conversation's prefix.
+    ///
+    /// It is not part of the linear history, so recording its hashes as the new
+    /// `prev_hashes` would make the following real request look like a total
+    /// rewrite (stable prefix 0) and throw away the known-good breakpoint. The
+    /// turn after every compaction would then pay a full-prefix cache write.
+    #[test]
+    fn one_off_leaves_prefix_tracking_intact_for_the_next_turn() {
+        let opt = CacheOptimizer::new();
+        let msgs = vec![
+            Message::user_text("a ".repeat(4000)),
+            Message::user_text("b ".repeat(4000)),
+        ];
+
+        // Turn 1 establishes a prefix, turn 2 grows it and plants a breakpoint.
+        let mut first = req_with(msgs.clone());
+        opt.plan(&mut first, 0);
+        let mut second_msgs = msgs.clone();
+        second_msgs.push(Message::user_text("c"));
+        let mut second = req_with(second_msgs.clone());
+        opt.plan(&mut second, 0);
+        let established = second.cache.stable_message_index;
+        assert_eq!(established, Some(1), "test premise: a breakpoint exists");
+
+        // The summary request is demoted and must change no prefix state.
+        opt.demote_one_off();
+        let mut summary = req_with(vec![Message::user_text(
+            "Summarize this coding-agent conversation.",
+        )]);
+        opt.plan(&mut summary, 0);
+        assert!(!summary.cache.system);
+        assert!(summary.cache.stable_message_index.is_none());
+
+        // The next real turn sees the *same* prefix as before the summary: the
+        // breakpoint survives rather than being recomputed from scratch.
+        let mut third = req_with(second_msgs);
+        opt.plan(&mut third, 0);
+        assert_eq!(
+            third.cache.stable_message_index, established,
+            "summary request poisoned the next turn's breakpoint"
+        );
+        assert!(
+            third.cache.system && third.cache.tools,
+            "summary request disabled caching for the next real turn"
+        );
+
+        // An explicit end_one_off is idempotent and harmless.
+        opt.end_one_off();
+        let mut fourth = req_with(vec![Message::user_text("d")]);
+        opt.plan(&mut fourth, 0);
+        assert!(fourth.cache.system);
     }
 
     #[test]

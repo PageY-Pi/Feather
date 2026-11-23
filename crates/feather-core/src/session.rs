@@ -15,7 +15,7 @@
 
 use crate::message::{Message, Usage};
 use crate::session_store::{self, RawEntry, SessionMeta, SessionStore};
-use crate::snapshot::SnapshotStore;
+use crate::snapshot::{SnapshotChunks, SnapshotStore};
 use std::path::{Path, PathBuf};
 
 pub struct Session {
@@ -42,6 +42,11 @@ pub struct Session {
     /// have no workspace directory to checkpoint.
     checkpoints: Option<crate::checkpoint_worker::CheckpointWorker>,
     snapshots: Option<SnapshotStore>,
+    /// What the last snapshot commit stored, so the next one only has to store
+    /// the messages that changed (see `SnapshotStore::snapshot_reusing`). Purely
+    /// an optimisation: an empty or stale value costs a full store, never a
+    /// wrong snapshot, because every reused entry is re-verified by hash.
+    snapshot_chunks: SnapshotChunks,
     turn: u64,
     created_ms: u64,
     first_prompt: String,
@@ -125,6 +130,7 @@ impl Session {
             prefix_tokens: vec![16],
             checkpoints: Some(crate::checkpoint_worker::CheckpointWorker::start()),
             snapshots: Some(snapshots),
+            snapshot_chunks: SnapshotChunks::default(),
             turn: 0,
             created_ms: now,
             first_prompt: String::new(),
@@ -165,6 +171,7 @@ impl Session {
             prefix_tokens: vec![16],
             checkpoints: None,
             snapshots: None,
+            snapshot_chunks: SnapshotChunks::default(),
             turn: 0,
             created_ms: crate::message::now_millis(),
             first_prompt: String::new(),
@@ -280,6 +287,7 @@ impl Session {
             messages: std::sync::Arc::new(messages),
             checkpoints: Some(crate::checkpoint_worker::CheckpointWorker::start()),
             snapshots: Some(snapshots),
+            snapshot_chunks: SnapshotChunks::default(),
             turn,
             created_ms: meta.created_ms,
             first_prompt,
@@ -580,10 +588,17 @@ impl Session {
             }
         }
         crate::file_snapshots::FileSnapshots::new(&self.dir).commit(next_turn)?;
-        self.snapshots
-            .as_ref()
-            .unwrap()
-            .snapshot(next_turn, &self.messages)?;
+        // Reuse the chunk keys the previous snapshot already stored for the
+        // unchanged prefix. `message_hashes` is maintained incrementally by
+        // `push`, so this costs one hash comparison per message instead of a
+        // full re-serialization of the conversation on every tool-loop turn.
+        let stored = self.snapshots.as_ref().unwrap().snapshot_reusing(
+            next_turn,
+            &self.messages,
+            &self.message_hashes,
+            &self.snapshot_chunks,
+        )?;
+        self.snapshot_chunks = stored.chunks;
         self.turn = next_turn;
         if let Some(store) = self.store.as_ref() {
             store.touch(crate::message::now_millis(), &self.first_prompt)?;
@@ -1051,6 +1066,64 @@ mod tests {
         assert_eq!(s2.messages()[0].text(), "persist me");
         // the raw audit keeps the uncommitted tail even though context drops it
         assert_eq!(s2.raw_messages().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// `commit_turn` must reuse the previous snapshot's chunks for an unchanged
+    /// prefix, and the resulting snapshots must still load back exactly.
+    ///
+    /// This pins the invariant the whole optimisation rests on: `Session`'s
+    /// `message_hashes` are the same FNV-1a of canonical JSON that keys the chunk
+    /// table. If those ever diverge (a different serializer, a normalization
+    /// step), reuse would record wrong keys and rewind would restore a corrupt
+    /// conversation — so this asserts both the cost and the restored content.
+    #[test]
+    fn commit_turn_reuses_unchanged_snapshot_chunks() {
+        let h = home("reuse-commit");
+        let mut s = Session::new(&h, Path::new("/tmp")).unwrap();
+        for n in 0..40 {
+            s.push(Message::user_text(format!("row {n}"))).unwrap();
+        }
+        s.commit_turn().unwrap();
+        let expected: Vec<String> = s.messages().iter().map(|m| m.text()).collect();
+        // The first commit had no hint, so it stored every message.
+        assert_eq!(s.snapshot_chunks.bases.len(), 40);
+
+        // Appending one message then committing must carry the hint forward.
+        s.push(Message::user_text("row 40")).unwrap();
+        s.commit_turn().unwrap();
+        assert_eq!(s.snapshot_chunks.bases.len(), 41);
+
+        // Control: a fresh hint re-stores everything.
+        let full = s
+            .snapshots()
+            .unwrap()
+            .snapshot_reusing(99, s.messages(), &[], &SnapshotChunks::default())
+            .unwrap()
+            .cost;
+        assert_eq!(full.serialized, 41, "no hint means a full store");
+
+        // The carried hint reuses every message: that is the whole optimisation.
+        let carried = s.snapshot_chunks.clone();
+        let reused = s
+            .snapshots()
+            .unwrap()
+            .snapshot_reusing(100, s.messages(), &carried.bases, &carried)
+            .unwrap()
+            .cost;
+        assert_eq!(reused.serialized, 0, "a matching hint reuses every message");
+        assert_eq!(reused.reused, 41);
+
+        // The real path: commit_turn carries the hint from the previous commit.
+        s.commit_turn().unwrap();
+        let dir = s.dir().to_path_buf();
+        drop(s);
+
+        let reopened = Session::open(&dir, &h).unwrap();
+        let texts: Vec<String> = reopened.messages().iter().map(|m| m.text()).collect();
+        assert_eq!(texts.len(), expected.len() + 1);
+        assert_eq!(&texts[..expected.len()], &expected[..]);
+        assert_eq!(texts.last().unwrap(), "row 40");
         let _ = std::fs::remove_dir_all(&h);
     }
 

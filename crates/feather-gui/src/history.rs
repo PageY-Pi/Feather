@@ -146,17 +146,23 @@ impl History {
                 return;
             }
         }
-        let bytes: usize = rows
-            .iter()
-            .map(|r| {
-                r.text.len()
-                    + r.thinking.len()
-                    + r.tool_args.len()
-                    + r.tool_output.as_ref().map_or(0, String::len)
-            })
-            .sum();
-        if rows.len() <= 256 && bytes <= 2 * PAGE_BYTES {
-            return;
+        // `rows.len() <= 256 && bytes <= ...` short-circuits, so when the page is
+        // already longer than the row budget the byte total cannot change the
+        // outcome — skip measuring it. Scanning every row's four string lengths
+        // each frame is otherwise pure overhead on the common path.
+        if rows.len() <= 256 {
+            let bytes: usize = rows
+                .iter()
+                .map(|r| {
+                    r.text.len()
+                        + r.thinking.len()
+                        + r.tool_args.len()
+                        + r.tool_output.as_ref().map_or(0, String::len)
+                })
+                .sum();
+            if bytes <= 2 * PAGE_BYTES {
+                return;
+            }
         }
         let Some(store) = self.store.clone() else {
             return;

@@ -1157,6 +1157,9 @@ where
     let mut bash: Option<BashRun> = None;
     let mut eof = false;
     let mut lines = reader.lines();
+    // Set when a lagged broadcast receiver lost events: the cached copy of the
+    // conversation must then be rebuilt from the session at the next settle.
+    let mut needs_resync = false;
     loop {
         tokio::select! {
             biased;
@@ -1166,7 +1169,16 @@ where
                         absorb_event(&event, &mut cached_messages);
                         for record in mapper.map(event) { emit(&mut out, &record).await?; }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => return Err(anyhow::anyhow!("RPC event stream lost {n} events")),
+                    // A lagged receiver means the broadcast ring wrapped: some
+                    // events were never delivered. That loses *incremental* state
+                    // only — the session is the authority, and `sync_messages`
+                    // rebuilds the cached copy from it. Aborting the run here
+                    // killed a live turn because the UI could not keep up, which
+                    // is the opposite of what a slow consumer should cause.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("feather: rpc event stream lagged by {n}; resyncing from session");
+                        needs_resync = true;
+                    }
                     Err(_) => {}
                 }
             }
@@ -1183,7 +1195,13 @@ where
                 running = None;
                 if let Err(error) = result { emit(&mut out, &json!({"type":"error","error":error.to_string()})).await?; }
                 cached_state = state(&agent);
-                sync_messages(&mut cached_messages, &agent);
+                // A lagged stream skips events, so the incremental cache can look
+                // consistent while missing rows. Force the authoritative rebuild.
+                if std::mem::take(&mut needs_resync) {
+                    cached_messages = agent.session().messages().to_vec();
+                } else {
+                    sync_messages(&mut cached_messages, &agent);
+                }
                 idle = Some(agent);
                 emit(&mut out, &json!({"type":"agent_settled"})).await?;
                 is_compacting = false;

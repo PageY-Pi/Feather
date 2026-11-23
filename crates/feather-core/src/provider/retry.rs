@@ -51,8 +51,37 @@ pub fn delay_until(plan: &RetryPlan, first_error: Instant, now: Instant) -> Dura
     (first_error + plan.deadline).saturating_duration_since(now)
 }
 
+/// HTTP statuses worth retrying: request timeout, conflict/lock, too-early,
+/// rate limiting, and the whole server-error class.
+///
+/// Everything else is permanent. A 400 (malformed request), 401/403 (bad or
+/// expired credential), 404 (unknown model) and 422 (unsupported parameter)
+/// describe the request itself, so retrying just repeats the same rejection
+/// after the full backoff — five requests and ~105 s before the user sees the
+/// error they could have had immediately.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 409 | 425 | 429) || (500..=599).contains(&status)
+}
+
+/// True when issuing the same request again could plausibly succeed.
+///
+/// `ProviderError::Api` carries the upstream status; it is the only variant that
+/// can distinguish a transient failure from a permanent one, so the status is
+/// consulted before the body heuristics. Quota exhaustion is terminal whatever
+/// the status: it is a billing condition that resolves in hours, not seconds.
 pub fn is_retryable(error: &ProviderError) -> bool {
-    !matches!(error, ProviderError::Aborted) && !is_quota_exhausted(error)
+    match error {
+        ProviderError::Aborted => false,
+        ProviderError::Api { status, .. } => {
+            is_retryable_status(*status) && !is_quota_exhausted(error)
+        }
+        ProviderError::Http(_) | ProviderError::Stream(_) | ProviderError::Decode(_) => {
+            !is_quota_exhausted(error)
+        }
+        // A credential failure is often a refresh that will succeed on the next
+        // resolve, so it stays retryable; quota/billing bodies still end it.
+        ProviderError::Auth(_) => !is_quota_exhausted(error),
+    }
 }
 
 pub fn is_quota_exhausted(error: &ProviderError) -> bool {
@@ -152,6 +181,56 @@ mod tests {
         );
         assert!(plan(&nonquota, 4).is_none());
         assert!(plan(&nonquota, 3).is_some());
+    }
+
+    /// A permanent rejection must fail once, immediately. Retrying it repeats
+    /// the same 400/401/404 five times across ~105 s of backoff while the user
+    /// waits for an error that was already decided by the first response.
+    #[test]
+    fn permanent_client_errors_are_not_retried() {
+        for status in [400, 401, 403, 404, 405, 413, 415, 422] {
+            let error = ProviderError::Api {
+                status,
+                body: "{\"error\":{\"message\":\"bad request\"}}".into(),
+            };
+            assert!(
+                plan(&error, 0).is_none(),
+                "HTTP {status} must not be retried"
+            );
+        }
+    }
+
+    /// Transient classes keep the full backoff schedule.
+    #[test]
+    fn transient_statuses_are_retried() {
+        for status in [408, 409, 425, 429, 500, 502, 503, 504, 529] {
+            let error = ProviderError::Api {
+                status,
+                body: "transient".into(),
+            };
+            assert!(plan(&error, 0).is_some(), "HTTP {status} must be retried");
+        }
+    }
+
+    /// Quota exhaustion stays terminal even when wrapped in a retryable status,
+    /// and transport-level failures are still retried (no status to consult).
+    #[test]
+    fn quota_beats_status_and_transport_errors_retry() {
+        let quota_503 = ProviderError::Api {
+            status: 503,
+            body: "insufficient_quota".into(),
+        };
+        assert!(plan(&quota_503, 0).is_none());
+
+        for error in [
+            ProviderError::Http("connection reset".into()),
+            ProviderError::Stream("upstream closed".into()),
+            ProviderError::Decode("truncated chunk".into()),
+        ] {
+            assert!(plan(&error, 0).is_some(), "transport error must retry");
+        }
+
+        assert!(plan(&ProviderError::Aborted, 0).is_none());
     }
 
     #[tokio::test(start_paused = true)]

@@ -90,6 +90,20 @@ pub fn anchor_grep(
             truncated = true;
             break;
         }
+        // Only map files that can actually match. Mapping is expensive: a full
+        // read, a line split, an anchor draw per line, and a redb round-trip to
+        // adopt persisted anchors — all paid before the first regex test. A
+        // repository-wide search is dominated by candidate files that do not
+        // match, so screening the raw bytes first keeps maps proportional to
+        // hits instead of to the file count.
+        //
+        // The screen is conservative: it skips a file only when its bytes cannot
+        // contain a match under any line boundary. Substring and literal modes
+        // search the raw haystack directly; anything undecidable falls through
+        // to the exact per-line path.
+        if !may_contain_match(file, &re, &opts.pattern, opts) {
+            continue;
+        }
         // map lazily; oversized/binary files are skipped silently here
         let Ok(rows) = store.read(file, None, None) else {
             continue;
@@ -176,6 +190,54 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
+/// Cheap screen: can `file` possibly contain a match?
+///
+/// Mapping a file is the expensive part of a search (read, split, one anchor per
+/// line, redb adoption), so it should only happen for files that have a chance.
+/// This screen is allowed to say "maybe" freely — a false positive just costs the
+/// mapping that would have happened anyway — but it must never skip a file that
+/// could match, so it errs toward `true` whenever it cannot decide.
+fn may_contain_match(file: &Path, re: &regex::Regex, pattern: &str, opts: &GrepOptions) -> bool {
+    // The exact path tests line content with CR stripped and the file split on
+    // '\n'. Raw bytes are therefore a superset of what the regex will see, with
+    // one exception: a match may not span a newline, so a raw hit that straddles
+    // one is a false positive — which is safe here.
+    let Ok(bytes) = std::fs::read(file) else {
+        // Unreadable: let the mapping path produce the real (skipped) outcome.
+        return true;
+    };
+
+    // Literal, case-sensitive searches reduce to a substring test.
+    if opts.literal && !opts.ignore_case {
+        return contains_subslice(&bytes, pattern.as_bytes());
+    }
+
+    // The regex engine needs text; a file that fails to decode would be refused
+    // by `build_map` anyway, so let that path report it.
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return true;
+    };
+
+    if re.is_match(text) {
+        return true;
+    }
+
+    // A pattern anchored with `^`/`$` or using look-around can match per line
+    // while failing against the whole document (multiline mode is off, and `$`
+    // only matches at the true end of the haystack). Retry line-by-line before
+    // deciding, which is exactly the granularity the caller will use.
+    text.split('\n')
+        .any(|line| re.is_match(line.strip_suffix('\r').unwrap_or(line)))
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
 /// Collect candidate files: an explicit file is used directly; a directory
 /// is walked (skipping noise dirs, honoring the optional glob).
 fn collect_files(
@@ -351,6 +413,113 @@ mod tests {
         .unwrap();
         assert_eq!(out3.hits.len(), 1);
         assert!(out3.sections.iter().any(|s| s.ends_with("b.ts ===")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The prefilter must never lose a hit. Each case here is a pattern whose
+    /// match is not a plain substring of the file, so a naive screen would drop
+    /// it: anchors (`^`/`$`), character classes, and alternation across lines.
+    #[test]
+    fn prefilter_never_drops_a_real_hit() {
+        let root = std::env::temp_dir().join(format!(
+            "feather-grep-screen-{}-{}",
+            std::process::id(),
+            feather_core::message::now_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = AnchorStore::new(&root);
+        // `zeta` appears only at the very end of a line, `alpha` mid-line, and
+        // neither appears in the decoy file.
+        std::fs::write(root.join("a.txt"), "alpha one\nmiddle\nzeta\n").unwrap();
+        std::fs::write(root.join("decoy.txt"), "nothing here\nat all\n").unwrap();
+
+        let cases: &[(&str, usize, bool)] = &[
+            // pattern, expected hits, ignore_case
+            ("^zeta$", 1, false),
+            ("^alpha", 1, false),
+            ("zeta$", 1, false),
+            ("a[lp]pha", 1, false),
+            ("alpha|zeta", 2, false),
+            ("ALPHA", 1, true),
+            ("nomatchanywhere", 0, false),
+        ];
+        for &(pattern, expected, ignore_case) in cases {
+            let out = anchor_grep(
+                &store,
+                &root,
+                &GrepOptions {
+                    pattern: pattern.into(),
+                    ignore_case,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                out.hits.len(),
+                expected,
+                "pattern {pattern:?} (ignore_case={ignore_case}) matched {} rows, want {expected}",
+                out.hits.len()
+            );
+        }
+
+        // Literal mode is the branch that uses the substring screen.
+        let out = anchor_grep(
+            &store,
+            &root,
+            &GrepOptions {
+                pattern: "zeta".into(),
+                literal: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.hits.len(), 1);
+        let none = anchor_grep(
+            &store,
+            &root,
+            &GrepOptions {
+                pattern: "definitely absent".into(),
+                literal: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(none.hits.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The screen exists to avoid mapping, so prove it declines a file whose
+    /// content cannot match: a file with no matching bytes must not appear in
+    /// the sections, and asking twice must not map it either.
+    #[test]
+    fn prefilter_skips_files_without_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "feather-grep-skip-{}-{}",
+            std::process::id(),
+            feather_core::message::now_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = AnchorStore::new(&root);
+        std::fs::write(root.join("has.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("hasnot.txt"), "hay\n").unwrap();
+
+        let out = anchor_grep(
+            &store,
+            &root,
+            &GrepOptions {
+                pattern: "needle".into(),
+                literal: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.sections.len(), 1);
+        assert!(out.sections[0].ends_with("has.txt ==="));
+        // The non-matching file was screened out, so it was never mapped.
+        assert!(!store.is_mapped(&root.join("hasnot.txt")));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

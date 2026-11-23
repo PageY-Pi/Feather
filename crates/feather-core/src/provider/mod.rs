@@ -69,7 +69,11 @@ impl Default for CacheHints {
             tools: false,
             stable_message_index: None,
             sticky_ttl_seconds: None,
-            min_breakpoint_tokens: 1024,
+            // Matches `feather_cache::DEFAULT_MIN_BREAKPOINT_TOKENS`. Kept in
+            // sync by hand because `feather-core` cannot depend on the optimizer;
+            // a breakpoint smaller than a model's minimum cacheable prefix is
+            // silently ignored by the provider yet still billed as a write.
+            min_breakpoint_tokens: 2048,
         }
     }
 }

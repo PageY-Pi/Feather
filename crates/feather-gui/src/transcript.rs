@@ -219,6 +219,9 @@ pub fn show(
             }
             cache.dirty_from = rows.len();
             rebuild_prefix_from(&cache.values, &mut cache.prefix, dirty_from);
+            // Rows measured during this frame replace their stale heights, so the
+            // total moves by their net change — no need to re-sum every row.
+            let mut height_delta = 0.0f32;
             let old_prefix = &cache.prefix;
             let anchor = old_prefix
                 .partition_point(|y| *y <= viewport.min.y)
@@ -276,6 +279,7 @@ pub fn show(
                     } else if index == anchor {
                         correction += intra_correction;
                     }
+                    height_delta += delta;
                     cache.values[index] = height;
                     // Record for the next frame: this row's prefix entry and
                     // every entry after it are now stale.
@@ -284,7 +288,15 @@ pub fn show(
                     }
                 }
             }
-            new_total = cache.values.iter().sum::<f32>() + 20.0 + if waiting { 76.0 } else { 0.0 };
+            // `prefix[n]` is 10.0 plus the sum of every row height (10.0 is the
+            // top inset). The old expression was `sum(heights) + 20.0`, so the
+            // inset supplies one 10.0 and only 10.0 is added back here.
+            // `height_delta` carries the net change from rows re-measured this
+            // frame, which is why no O(rows) re-sum is needed.
+            new_total = cache.prefix.last().copied().unwrap_or(10.0).max(10.0)
+                + height_delta
+                + 10.0
+                + if waiting { 76.0 } else { 0.0 };
             ui.set_min_size(egui::vec2(available, new_total));
             if waiting && range.end == rows.len() {
                 let rect = egui::Rect::from_min_size(
@@ -552,6 +564,41 @@ mod tests {
         let mut shrunk = full.clone();
         rebuild_prefix_from(&values[..40], &mut shrunk, 40);
         assert_eq!(shrunk, prefix(&values[..40]));
+    }
+    /// The scroll height must equal the sum of row heights plus the frame insets.
+    ///
+    /// `show` used to re-sum every row height per frame; it now derives the total
+    /// from the prefix plus the net delta of rows re-measured that frame. The
+    /// prefix carries a 10.0 top inset, so an off-by-the-inset error here would
+    /// silently clip or over-scroll the transcript — invisible to the other
+    /// transcript tests, which only compare prefixes.
+    #[test]
+    fn scroll_total_matches_the_row_height_sum() {
+        let values: Vec<f32> = (0..300).map(|i| 40.0 + (i % 11) as f32 * 7.25).collect();
+        let built = prefix(&values);
+        let sum: f32 = values.iter().sum();
+        // prefix[n] = inset + sum(heights); the stored total is that plus the
+        // second inset (was `sum + 20.0`).
+        let legacy_total = sum + 20.0;
+        let derived_total = built.last().copied().unwrap() + 10.0;
+        assert!(
+            (legacy_total - derived_total).abs() < 0.01,
+            "derived total {derived_total} must equal the legacy {legacy_total}"
+        );
+
+        // Same identity after a suffix-only rebuild, which is the per-frame path.
+        for dirty in [0usize, 5, 150, 299] {
+            let mut rebuilt = built.clone();
+            for entry in rebuilt.iter_mut().skip(dirty + 1) {
+                *entry = 0.0;
+            }
+            rebuild_prefix_from(&values, &mut rebuilt, dirty);
+            let total = rebuilt.last().copied().unwrap() + 10.0;
+            assert!(
+                (total - legacy_total).abs() < 0.01,
+                "total drifted after rebuild from dirty_from={dirty}: {total} vs {legacy_total}"
+            );
+        }
     }
     #[test]
     fn range_is_bounded_for_large_histories() {

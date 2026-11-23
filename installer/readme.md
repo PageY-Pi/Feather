@@ -1,6 +1,6 @@
-# Feather 1.3.1 Windows installer
+# Feather 1.3.2 Windows installer
 
-Share `dist/Feather-1.3.1-Setup-x64.exe` (Windows x64). Unsigned: Windows may
+Share `dist/Feather-1.3.2-Setup-x64.exe` (Windows x64). Unsigned: Windows may
 show SmartScreen; this build has not been code-signed.
 
 Per-user installation (no admin):
@@ -86,6 +86,13 @@ Build:
    every line in `%TEMP%\feather-prereq-probe.txt` reads PASS.
 
 This version:
+- 1.3.2 is a correctness and cost pass with no interface change. A failed
+  request is now classified before it is retried (a 400/401/404 used to be
+  retried five times for about 105 s of backoff), a full or locked anchors
+  database makes edits report an error instead of aborting the process, a
+  compacted summary no longer poisons the next turn's prompt cache, and session
+  snapshots store only what changed instead of re-serialising the whole
+  conversation on every tool-loop iteration.
 - 1.3.1 gives `bash` a `timeout` argument in seconds, so a build or a full
   test suite can ask for the time it needs instead of dying on a fixed cap. The
   task tools also stop rendering as `{}` and share a checked-box mark.

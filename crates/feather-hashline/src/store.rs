@@ -10,7 +10,7 @@ use crate::engine::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// How many file maps stay resident. A mapped 400-line source file costs about
 /// 76 KB (line `String`s plus an anchor, a hash, and two index entries per
@@ -124,6 +124,10 @@ pub struct AnchorStore {
     /// prove the file is unchanged, so this is the cheap fast path; a mismatch
     /// falls back to the exact content comparison.
     stamps: Mutex<HashMap<PathBuf, (Option<std::time::SystemTime>, u64)>>,
+    /// First failure to persist an anchor table. Persistence is best-effort
+    /// (see `persist_record`), so the error is retained here until the host
+    /// drains it instead of panicking inside a tool call.
+    persist_error: Mutex<Option<String>>,
 }
 
 impl AnchorStore {
@@ -136,6 +140,7 @@ impl AnchorStore {
 
             last_touched: Mutex::new(HashMap::new()),
             stamps: Mutex::new(HashMap::new()),
+            persist_error: Mutex::new(None),
         }
     }
 
@@ -281,29 +286,23 @@ impl AnchorStore {
             .map_err(|_| EngineError::Encode(format!("{} is not valid UTF-8", path.display())))?;
         let seed = Self::seed_for(path, &content);
         let mut map = AnchorMap::new(path.to_path_buf(), content, seed)?;
-        let store = self.records().map_err(EngineError::Io)?;
-        let key = norm_key(path).display().to_string();
-        let rec = store.get::<PersistRecord>(&key).map_err(EngineError::Io)?;
-        if let Some(rec) = rec {
-            if rec.hashes.len() == map.len()
-                && rec
-                    .hashes
-                    .iter()
-                    .zip(map.lines.iter())
-                    .all(|(h, l)| *h == feather_core::message::fnv1a(l.as_bytes()))
-            {
-                map.adopt_persist(rec);
+        // Persistence must never gate reading. If the anchor database cannot be
+        // opened (locked by another instance, disk full, corrupt file) the map
+        // built above is already complete and correct — anchors come from
+        // content. Failing the whole read here turned an optimisation into a
+        // hard dependency: a locked redb file made files unreadable rather than
+        // merely unrememberable across restarts.
+        let store = match self.records() {
+            Ok(store) => Some(store),
+            Err(error) => {
+                self.report_persist_error(error);
+                None
             }
-        } else {
-            let legacy = self.sidecar_path(path);
-            if legacy.exists() {
-                let rec: PersistRecord = serde_json::from_slice(
-                    &std::fs::read(&legacy).map_err(|e| EngineError::Io(e.to_string()))?,
-                )
-                .map_err(|e| EngineError::Io(e.to_string()))?;
-                store.put(&key, &rec).map_err(EngineError::Io)?;
-                std::fs::rename(&legacy, legacy.with_extension("json.legacy"))
-                    .map_err(|e| EngineError::Io(e.to_string()))?;
+        };
+        let key = norm_key(path).display().to_string();
+        if let Some(store) = store.as_ref() {
+            let rec = store.get::<PersistRecord>(&key).map_err(EngineError::Io)?;
+            if let Some(rec) = rec {
                 if rec.hashes.len() == map.len()
                     && rec
                         .hashes
@@ -312,6 +311,26 @@ impl AnchorStore {
                         .all(|(h, l)| *h == feather_core::message::fnv1a(l.as_bytes()))
                 {
                     map.adopt_persist(rec);
+                }
+            } else {
+                let legacy = self.sidecar_path(path);
+                if legacy.exists() {
+                    let rec: PersistRecord = serde_json::from_slice(
+                        &std::fs::read(&legacy).map_err(|e| EngineError::Io(e.to_string()))?,
+                    )
+                    .map_err(|e| EngineError::Io(e.to_string()))?;
+                    store.put(&key, &rec).map_err(EngineError::Io)?;
+                    std::fs::rename(&legacy, legacy.with_extension("json.legacy"))
+                        .map_err(|e| EngineError::Io(e.to_string()))?;
+                    if rec.hashes.len() == map.len()
+                        && rec
+                            .hashes
+                            .iter()
+                            .zip(map.lines.iter())
+                            .all(|(h, l)| *h == feather_core::message::fnv1a(l.as_bytes()))
+                    {
+                        map.adopt_persist(rec);
+                    }
                 }
             }
         }
@@ -361,6 +380,17 @@ impl AnchorStore {
             maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
         }
         Ok(maps.peek(path).map(|m| m.len()).unwrap_or(0))
+    }
+
+    /// Whether `path` currently has a cached anchor map.
+    ///
+    /// Does not touch the map cache beyond a lookup and never maps the file, so a
+    /// caller can assert that an operation avoided mapping entirely.
+    pub fn is_mapped(&self, path: &Path) -> bool {
+        self.maps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(path)
     }
 
     pub fn replace(
@@ -559,10 +589,45 @@ impl AnchorStore {
         self.persist_record(&map.persist_record());
     }
 
+    /// Persist one file's anchor table, best-effort.
+    ///
+    /// The in-memory map is the authority for the current session: anchors are
+    /// re-derivable from line content, and `build_map` re-adopts a persisted
+    /// table only when every line hash still matches. Persistence is therefore
+    /// an optimisation that saves a rebuild after a restart, never a
+    /// correctness requirement — so a failing redb write (disk full, an
+    /// antivirus scanner holding the file on Windows, a second process, a
+    /// corrupt database) must not abort the process from inside a tool call.
+    /// It is recorded as a diagnostic instead.
     fn persist_record(&self, rec: &PersistRecord) {
-        self.records()
-            .and_then(|s| s.put(&norm_key(Path::new(&rec.path)).display().to_string(), rec))
-            .expect("persist anchor state");
+        let key = norm_key(Path::new(&rec.path)).display().to_string();
+        if let Err(error) = self.records().and_then(|s| s.put(&key, rec)) {
+            // Reported once, not per file: a disk-full or lock-held condition
+            // would otherwise emit a line for every edited file. The mapping is
+            // still authoritative in memory, so this is a warning about
+            // post-restart rebuild cost, not about current correctness.
+            self.report_persist_error(error);
+        }
+    }
+
+    /// Surface the first anchor-persistence failure on stderr, once.
+    fn report_persist_error(&self, error: String) {
+        let mut seen = self.persist_error.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.is_none() {
+            eprintln!(
+                "feather: anchor state could not be persisted ({error}); anchors stay \
+                 valid for this session and will be rebuilt from file content on restart"
+            );
+            *seen = Some(error);
+        }
+    }
+
+    /// Take the first anchor-persistence failure, if any, for reporting.
+    pub fn take_persist_error(&self) -> Option<String> {
+        self.persist_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Forget a file's mapping (write/rewrite).
@@ -710,6 +775,28 @@ impl AnchorStore {
 /// (`./a.rs`, `A.RS`, relative vs absolute) must share ONE map and ONE
 /// sidecar, or edits through one spelling silently miss the other's.
 pub(crate) fn norm_key(path: &Path) -> PathBuf {
+    // Memoised: this runs on every tool call, several times per call (map key,
+    // sidecar name, seed, persisted record), and each miss costs a
+    // `canonicalize` syscall walk plus a full-path `to_lowercase` allocation.
+    // The answer for a given spelling cannot change within a process unless the
+    // file is moved, and a moved file is re-read through a fresh `read` anyway.
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = guard.get(path) {
+        return hit.clone();
+    }
+    // Bound it: a session touches many files, and the cache must not grow for
+    // the life of the process.
+    if guard.len() >= 4096 {
+        guard.clear();
+    }
+    let key = norm_key_uncached(path);
+    guard.insert(path.to_path_buf(), key.clone());
+    key
+}
+
+fn norm_key_uncached(path: &Path) -> PathBuf {
     let input = feather_core::workspace_path::normalize_input(path);
     let cand = std::fs::canonicalize(&input)
         .map(|p| p.to_string_lossy().into_owned())
@@ -880,6 +967,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A failed anchor-table write must not abort the process.
+    ///
+    /// Persistence is an optimisation: the in-memory map is authoritative and a
+    /// restarted session rebuilds anchors from file content. Aborting here (which
+    /// `persist_record` used to do via `expect`) killed the whole application from
+    /// inside a normal tool call on nothing worse than a full disk or a locked
+    /// database — and redb locks the file, so a second feather instance was
+    /// enough to trigger it.
+    #[test]
+    fn persist_failure_is_reported_not_fatal() {
+        let h = home("persist-fail");
+        let f = h.join("code.rs");
+        std::fs::write(&f, "alpha\nbeta\n").unwrap();
+
+        // Make the anchor database impossible to open: a directory where the redb
+        // file belongs. This is the same failure shape as a permissions error or
+        // a locked file — `records()` returns Err — without depending on running
+        // as an unprivileged user or holding a platform-specific lock.
+        std::fs::create_dir_all(h.join("anchors.redb")).unwrap();
+
+        let store = AnchorStore::new(&h);
+        // Mapping, editing and reading must all still work: only persistence is
+        // degraded. Previously `invalidate`/`persist` reached `expect` and panicked.
+        let rows = store.read(&f, None, None).expect("read must survive");
+        assert_eq!(rows.len(), 2);
+        let first = Anchor::parse(rows[0].split_once('│').unwrap().0).unwrap();
+        store
+            .replace(&f, first, first, "ALPHA")
+            .expect("edit must survive");
+        assert_eq!(store.total_lines(&f).unwrap(), 2);
+
+        // The failure is recorded for the host to report, and is stable (the
+        // message does not change per file).
+        let reported = store.take_persist_error();
+        assert!(
+            reported.is_some(),
+            "a failed persist must be recorded, not swallowed silently"
+        );
+        // Draining clears it so it is reported once.
+        assert!(store.take_persist_error().is_none());
+
+        let _ = std::fs::remove_dir_all(h);
+    }
     /// The cache must not grow without bound: a long session over a large repo
     /// maps every file it touches, and each map costs ~76 KB.
     #[test]

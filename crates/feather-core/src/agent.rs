@@ -37,8 +37,14 @@ pub trait CachePlanner: Send + Sync {
     }
     /// Record provider usage so hit-rate metrics accumulate.
     fn record(&self, usage: &Usage);
-    /// One-off requests (summaries) must not write cache entries.
+    /// Mark the next `plan`/`plan_cached` call as a one-off (summarization) so
+    /// it writes no cache entries. Callers must pair it with
+    /// [`CachePlanner::end_one_off`]: the flag is per-request state, and a flag
+    /// left set silently disables caching for the turn that follows.
     fn demote_one_off(&self);
+    /// Clear a pending one-off demotion. Idempotent, and a no-op when the flag
+    /// was never set, so it is safe on every exit path of a summarizing call.
+    fn end_one_off(&self) {}
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +91,9 @@ pub enum AgentEvent {
         call: ToolCall,
     },
     ToolProgress {
-        call: ToolCall,
+        /// Shared, so a tool that streams hundreds of updates does not deep-clone
+        /// its argument tree once per update.
+        call: Arc<ToolCall>,
         text: String,
     },
     ToolEnd {
@@ -1236,10 +1244,10 @@ impl Agent {
         let mut kept = compaction::without_thinking(&context[cut..]);
         let to_summarize = &context[..cut];
 
-        // one-off request: cache writes disabled
-        if let Some(p) = &self.planner {
-            p.demote_one_off();
-        }
+        // The one-off demotion is applied at the request itself (below), not
+        // here: this function has several early returns between this point and
+        // the summary request, and a flag set here would leak onto the next real
+        // turn if any of them fired.
         let serialized = compaction::serialize_messages(
             to_summarize.iter().filter(|m| {
                 !(m.role == crate::message::Role::User
@@ -1286,7 +1294,22 @@ impl Agent {
             session_id: self.session.id().to_string(),
         };
         let mut _sink = Usage::default();
-        let summary_msg = self.stream_assistant(&sum_req, &mut _sink, false).await?;
+        // The summary request is a one-off: it must not write cache entries, and
+        // it must not disturb the prefix tracking the next real turn depends on.
+        // The flag is per-request state, so it is cleared as soon as the request
+        // returns — on the failure paths too, which is why the result is bound
+        // before `?` rather than propagated directly.
+        let attempt = {
+            if let Some(p) = &self.planner {
+                p.demote_one_off();
+            }
+            let result = self.stream_assistant(&sum_req, &mut _sink, false).await;
+            if let Some(p) = &self.planner {
+                p.end_one_off();
+            }
+            result
+        };
+        let summary_msg = attempt?;
         // A cancelled summarization must not rewrite the context. `stream_assistant`
         // already recorded the usage on the session, so no extra add here.
         if self.is_aborted() || summary_msg.stop_reason == Some(StopReason::Aborted) {
@@ -1394,18 +1417,28 @@ async fn execute_progress(
         return crate::tool::ToolOutcome::err(format!("unknown tool: {}", call.name));
     };
     let _ = events.send(AgentEvent::ToolStart { call: call.clone() });
+    // A streaming tool can emit hundreds of updates, and every `ToolProgress`
+    // used to deep-clone the whole `ToolCall` — including a `serde_json::Value`
+    // argument tree that readers never look at. Sharing one `Arc` makes each
+    // update a refcount bump instead.
+    let shared: Arc<ToolCall> = Arc::new(call.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let fut = tool.execute_with_progress(call.arguments.clone(), abort, tx);
     tokio::pin!(fut);
     let outcome = loop {
         tokio::select! {
             result = &mut fut => break result,
-            Some(text) = rx.recv() => { let _ = events.send(AgentEvent::ToolProgress { call: call.clone(), text }); }
+            Some(text) = rx.recv() => {
+                let _ = events.send(AgentEvent::ToolProgress {
+                    call: Arc::clone(&shared),
+                    text,
+                });
+            }
         }
     };
     while let Ok(text) = rx.try_recv() {
         let _ = events.send(AgentEvent::ToolProgress {
-            call: call.clone(),
+            call: Arc::clone(&shared),
             text,
         });
     }

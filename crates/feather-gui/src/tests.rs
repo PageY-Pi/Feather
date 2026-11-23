@@ -376,7 +376,7 @@ fn tool_progress_streams_into_the_row_without_finalizing() {
     let mut app = fixture();
     app.on_agent_event(AgentEvent::ToolStart { call: call("a") });
     app.on_agent_event(AgentEvent::ToolProgress {
-        call: call("a"),
+        call: std::sync::Arc::new(call("a")),
         text: "line 1\nline 2".into(),
     });
     assert_eq!(app.rows[0].tool_output.as_deref(), Some("line 1\nline 2"));

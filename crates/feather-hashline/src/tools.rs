@@ -100,11 +100,15 @@ impl AgentTool for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file as anchor rows `anchor│content` (5-character, lowercase letters only). A 4-letter anchor is from an older session — re-read instead. \
-Prefer the hashline tools for anything that touches files: read, replace, replace_within, insert, copy, move, write — the shell (python/sed) is for running code, never for editing files. \
-Line numbers are not shown and are not accepted by edit tools — edit by anchor. \
-Page long files with offset (1-indexed) and limit; when the output says truncated, continue with the hinted offset/limit. \
-Images, binary, directory, and UTF-16/UTF-32 text are rejected; an empty file returns one empty row you can replace to seed content."
+        // Kept short on purpose: this string is billed on every request. The
+        // shell-vs-anchor editing policy already lives in the system prompt, so
+        // repeating it here paid for it twice; the legacy 4-letter-anchor note
+        // only matters for sessions predating the alphabet change and is now a
+        // clause rather than a sentence.
+        "Read a text file as anchor rows `anchor│content` (5 lowercase letters). A 4-letter anchor predates this build — re-read. \
+Line numbers are not shown and are not accepted by edit tools; edit by anchor. \
+Page with offset (1-indexed) and limit; when output says truncated, continue from the hinted offset/limit. \
+Images, binary, directories, and UTF-16/32 text are rejected; an empty file returns one empty row you can replace to seed content."
     }
 
     fn parameters(&self) -> Value {
