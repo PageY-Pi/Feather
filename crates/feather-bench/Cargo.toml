@@ -1,0 +1,20 @@
+[package]
+name = "feather-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Internal measurement harness only — never published, never a runtime dep.
+publish = false
+
+[[bin]]
+name = "feather-bench"
+path = "src/main.rs"
+
+[dependencies]
+feather-core = { workspace = true }
+feather-cache = { workspace = true }
+feather-hashline = { workspace = true }
+serde_json = { workspace = true }
+# Control case: a bare redb transaction, so the ruler can separate transaction
+# cost from serialisation cost instead of attributing both to the latter.
+redb = { workspace = true }

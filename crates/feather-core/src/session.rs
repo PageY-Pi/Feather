@@ -25,6 +25,21 @@ pub struct Session {
     /// Feather home the session belongs to (empty for in-memory sessions);
     /// used to refresh the discovery catalog.
     home: PathBuf,
+    /// Weak handle to the discovery catalog, so the per-turn registration does
+    /// not reopen the database (and pay a redb startup) every turn. Weak keeps
+    /// the file lock releasable once no session needs it.
+    catalog: std::sync::Mutex<Option<std::sync::Weak<redb::Database>>>,
+    /// The `modified_ms` this session last wrote to the catalog.
+    ///
+    /// The catalog is a rebuildable index — `list_sessions` reconstructs any
+    /// missing row from the session directory — and the first prompt already
+    /// registers the session so it is discoverable while the turn runs. Writing
+    /// it again on *every* turn therefore buys almost nothing: it only keeps the
+    /// "recently active" ordering fresh, and a durable redb commit per turn cost
+    /// 18 ms of a 45 ms `commit_turn` (measured by `feather-bench` with and
+    /// without the write). Skipping writes that would not move the ordering
+    /// meaningfully keeps that ordering usable without paying it every turn.
+    catalog_written_ms: std::sync::atomic::AtomicU64,
     store: Option<SessionStore>,
     child_store: Option<(std::sync::Arc<crate::substore::SubagentStore>, String)>,
     child_seq: u64,
@@ -85,6 +100,15 @@ pub enum SessionError {
     Git(String),
 }
 
+/// How stale the discovery catalog's `modified_ms` may get before a turn
+/// rewrites it.
+///
+/// The catalog orders sessions by "recently active" for the picker; a minute of
+/// staleness does not change which session a user picks, while a durable write
+/// per turn costs 18 ms of a 45 ms `commit_turn`. Sessions that can be
+/// discovered at all come from `list_sessions`, which re-registers any row whose
+/// directory still exists, so this value trades freshness — never existence.
+const CATALOG_REFRESH_MS: u64 = 60_000;
 /// One-line note for a repaired context. It rides [`Session::notes`], which is
 /// flushed to the UI as a Notice on the next committed turn — user-visible,
 /// never fed back to the model — so a repaired session is not silently
@@ -119,6 +143,8 @@ impl Session {
             cwd: cwd.to_path_buf(),
             dir,
             home: feather_home.to_path_buf(),
+            catalog: std::sync::Mutex::new(None),
+            catalog_written_ms: std::sync::atomic::AtomicU64::new(0),
             store: Some(store),
             child_store: None,
             child_seq: 0,
@@ -160,6 +186,8 @@ impl Session {
             cwd: cwd.to_path_buf(),
             dir: PathBuf::new(),
             home: PathBuf::new(),
+            catalog: std::sync::Mutex::new(None),
+            catalog_written_ms: std::sync::atomic::AtomicU64::new(0),
             store: None,
             child_store: None,
             child_seq: 0,
@@ -276,6 +304,8 @@ impl Session {
             cwd,
             dir: dir.to_path_buf(),
             home: feather_home.to_path_buf(),
+            catalog: std::sync::Mutex::new(None),
+            catalog_written_ms: std::sync::atomic::AtomicU64::new(0),
             store: Some(store),
             child_store: None,
             child_seq: 0,
@@ -516,9 +546,11 @@ impl Session {
         // message snapshot from advancing. Rewind still has file_snapshots for
         // anchor-tool edits; git remains an auxiliary workspace restore path.
         let (_, writes) = crate::compaction::file_ops(&self.messages);
-        let owned = crate::file_snapshots::FileSnapshots::new(&self.dir)
-            .tracked_paths()
-            .unwrap_or_default();
+        // One instance for the whole turn: `tracked_paths()` here and `commit()`
+        // below share the underlying database handle, so the checkpoint database
+        // is opened once per turn instead of twice.
+        let file_snapshots = crate::file_snapshots::FileSnapshots::new(&self.dir);
+        let owned = file_snapshots.tracked_paths().unwrap_or_default();
         let mut files = writes
             .into_iter()
             .filter(|file| {
@@ -587,7 +619,7 @@ impl Session {
                 self.push(Message::user_text(text))?;
             }
         }
-        crate::file_snapshots::FileSnapshots::new(&self.dir).commit(next_turn)?;
+        file_snapshots.commit(next_turn)?;
         // Reuse the chunk keys the previous snapshot already stored for the
         // unchanged prefix. `message_hashes` is maintained incrementally by
         // `push`, so this costs one hash comparison per message instead of a
@@ -603,7 +635,15 @@ impl Session {
         if let Some(store) = self.store.as_ref() {
             store.touch(crate::message::now_millis(), &self.first_prompt)?;
         }
-        self.register_catalog()?;
+        // Only refresh the catalog when this turn moved the session's
+        // "recently active" position by a meaningful amount. The first prompt
+        // already registered the session (so it is discoverable mid-turn), and
+        // `list_sessions` rebuilds any missing row from disk, so a per-turn
+        // durable commit was buying ordering freshness at 18 ms a turn
+        // (45 ms -> 27 ms with the write removed, measured by `feather-bench`).
+        self.register_catalog_if(|previous, now| {
+            previous == 0 || now.saturating_sub(previous) >= CATALOG_REFRESH_MS
+        })?;
         Ok(self.turn)
     }
 
@@ -747,17 +787,63 @@ impl Session {
     /// Refresh the discovery catalog with this session's metadata. Best-effort
     /// for memory sessions (no home).
     fn register_catalog(&self) -> Result<(), SessionError> {
+        self.register_catalog_if(|_, _| true)
+    }
+
+    /// Refresh the catalog only when `should_write` agrees.
+    ///
+    /// `commit_turn` passes a predicate that skips writes which would not move
+    /// this session's place in the "recently active" ordering by a meaningful
+    /// amount. See `catalog_written_ms` for why that write is not load-bearing.
+    fn register_catalog_if(
+        &self,
+        should_write: impl FnOnce(u64, u64) -> bool,
+    ) -> Result<(), SessionError> {
         if self.home.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let modified_ms = crate::message::now_millis();
+        let previous = self
+            .catalog_written_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !should_write(previous, modified_ms) {
             return Ok(());
         }
         let meta = SessionMeta {
             id: self.id.clone(),
             cwd: self.cwd.clone(),
             created_ms: self.created_ms,
-            modified_ms: crate::message::now_millis(),
+            modified_ms,
             first_prompt: self.first_prompt.clone(),
         };
-        crate::session_catalog::register_session(&self.home, &self.dir, &meta)
+        // Hold the catalog handle for the session's lifetime instead of letting
+        // the free function reopen it. A reopen costs a redb startup (~6 ms) plus
+        // its own durable commit; keeping the handle makes later writes cheap.
+        // If another session in this process already closed the handle we simply
+        // reopen it.
+        // Take the cached handle out of the lock before doing anything else.
+        // The guard must not be alive while the `else` arm re-locks the same
+        // mutex — that is a self-deadlock, not a contention problem.
+        let cached = self
+            .catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let written = match cached {
+            Some(db) => crate::session_catalog::register_session_with(&db, &self.dir, &meta),
+            None => {
+                let db = crate::session_catalog::open_catalog_for(&self.home)?;
+                *self.catalog.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(std::sync::Arc::downgrade(&db));
+                crate::session_catalog::register_session_with(&db, &self.dir, &meta)
+            }
+        };
+        if written.is_ok() {
+            self.catalog_written_ms
+                .store(modified_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        written
     }
 }
 impl Drop for Session {
@@ -1185,6 +1271,83 @@ mod tests {
         assert!(!file.to_string_lossy().ends_with(".jsonl"));
         assert!(file.exists());
         assert!(!s.dir().join("session.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// Commits inside the refresh window must not each cost a catalog write,
+    /// and skipping those writes must not cost discoverability.
+    ///
+    /// This is the behavioural half of the 18 ms-per-turn optimization: the
+    /// first prompt registers the session, `CATALOG_REFRESH_MS` throttles the
+    /// rest, and `list_sessions` is what actually has to keep working.
+    #[test]
+    fn repeated_turns_skip_redundant_catalog_writes_but_stay_discoverable() {
+        let h = home("catalog-throttle");
+        let cwd = h.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut s = Session::new(&h, &cwd).unwrap();
+
+        // The first push registers the session, so the clock starts non-zero.
+        s.push(Message::user_text("first")).unwrap();
+        let after_first = s
+            .catalog_written_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after_first > 0,
+            "the first prompt must register the session immediately"
+        );
+
+        // A turn right after that must leave the timestamp untouched: the write
+        // would not move the ordering, so it is skipped.
+        s.commit_turn().unwrap();
+        assert_eq!(
+            s.catalog_written_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            after_first,
+            "a turn inside the refresh window must not rewrite the catalog"
+        );
+
+        // Skipping the write must not make the session undiscoverable.
+        let found = crate::session_catalog::list_sessions(&h, &cwd)
+            .unwrap()
+            .into_iter()
+            .any(|info| info.id == s.id);
+        assert!(
+            found,
+            "the session must still be listed after a skipped write"
+        );
+
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// The predicate used by `commit_turn` must eventually allow a write, or
+    /// `modified_ms` would stay frozen for the whole session.
+    #[test]
+    fn catalog_refresh_window_is_bounded() {
+        let h = home("catalog-window");
+        let cwd = h.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut s = Session::new(&h, &cwd).unwrap();
+        s.push(Message::user_text("first")).unwrap();
+
+        // Pretend the last write happened long ago: the same predicate the
+        // commit path uses must now agree to write.
+        s.catalog_written_ms
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let mut wrote = false;
+        s.register_catalog_if(|previous, now| {
+            wrote = previous == 0 || now.saturating_sub(previous) >= CATALOG_REFRESH_MS;
+            wrote
+        })
+        .unwrap();
+        assert!(wrote, "a stale catalog must be refreshed");
+        assert!(
+            s.catalog_written_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 1,
+            "a successful write must advance the recorded timestamp"
+        );
+
         let _ = std::fs::remove_dir_all(&h);
     }
 }

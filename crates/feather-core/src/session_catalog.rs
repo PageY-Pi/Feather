@@ -78,8 +78,17 @@ fn open_catalog(path: &Path) -> Result<Arc<Database>, SessionError> {
         return Ok(db);
     }
     let mut last = String::new();
-    for _ in 0..40 {
-        match crate::database::create(path) {
+    // Prefer opening the existing catalog: `create` rewrites the file, so using
+    // it on every call paid to rebuild a database that was already there. It is
+    // still the fallback for a genuinely new home directory, and the retry loop
+    // stays for the case where another process is mid-create.
+    for attempt in 0..40 {
+        let opened = if attempt == 0 && path.is_file() {
+            crate::database::open(path)
+        } else {
+            crate::database::create(path)
+        };
+        match opened {
             Ok(db) => {
                 let db = Arc::new(db);
                 ensure_table(&db)?;
@@ -143,6 +152,54 @@ pub fn register_session(home: &Path, dir: &Path, meta: &SessionMeta) -> Result<(
     Ok(())
 }
 
+/// Register a session using a caller-held catalog handle.
+///
+/// `Session::register_catalog` runs once per turn. Calling `register_session`
+/// there reopens `catalog.redb` every turn — one redb startup plus one durable
+/// commit, measured at 16-20 ms per turn by `feather-bench --probe`. The catalog
+/// is not one of the databases `delete_session` probes for its liveness check,
+/// so a caller may legitimately hold the handle across turns; this entry point
+/// is how it does so without the free function growing a cache it cannot bound.
+pub fn register_session_with(
+    db: &Database,
+    dir: &Path,
+    meta: &SessionMeta,
+) -> Result<(), SessionError> {
+    let entry = CatalogEntry {
+        id: meta.id.clone(),
+        dir: dir.to_path_buf(),
+        cwd: meta.cwd.clone(),
+        created_ms: meta.created_ms,
+        modified_ms: meta.modified_ms,
+        first_prompt: meta.first_prompt.clone(),
+    };
+    let txn = db
+        .begin_write()
+        .map_err(|e| SessionError::Catalog(e.to_string()))?;
+    {
+        let mut table = txn
+            .open_table(CATALOG)
+            .map_err(|e| SessionError::Catalog(e.to_string()))?;
+        let bytes = serde_json::to_vec(&entry)?;
+        table
+            .insert(entry.id.as_str(), bytes.as_slice())
+            .map_err(|e| SessionError::Catalog(e.to_string()))?;
+    }
+    txn.commit()
+        .map_err(|e| SessionError::Catalog(e.to_string()))
+}
+
+/// Open the catalog database for a Feather home.
+///
+/// Exposed so `Session` can hold one handle across its lifetime; see
+/// [`register_session_with`].
+pub fn open_catalog_for(home: &Path) -> Result<Arc<Database>, SessionError> {
+    let path = catalog_path(home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    open_catalog(&path)
+}
 /// Delete only an inactive direct child session, never an arbitrary path.
 pub fn delete_session(home: &Path, dir: &Path) -> Result<(), SessionError> {
     let root = std::fs::canonicalize(home.join("sessions"))?;

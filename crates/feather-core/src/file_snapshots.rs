@@ -10,6 +10,7 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
 };
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("file_history");
 const BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("file_blobs");
@@ -197,15 +198,33 @@ fn save_meta(db: &redb::Database, meta: &Metadata, blobs: &[(State, Vec<u8>)]) -
 #[derive(Clone)]
 pub struct FileSnapshots {
     dir: PathBuf,
+    /// Lazily-opened handle to `checkpoints.redb`.
+    ///
+    /// `Session::commit_turn` calls `tracked_paths()` and then `commit()` on the
+    /// same session directory, and each used to open the database independently —
+    /// two redb startups (~5.9 ms each, measured by `feather-bench --probe`) on
+    /// the turn boundary. Caching the handle on the instance makes the second
+    /// call free. Sharing the `Arc` across clones means a clone reuses the same
+    /// handle; when the last clone drops, the database closes and releases the
+    /// file lock that `delete_session` probes for.
+    store: Arc<OnceLock<Records>>,
 }
 impl FileSnapshots {
     pub fn new(session_dir: &Path) -> Self {
         Self {
             dir: session_dir.to_path_buf(),
+            store: Arc::new(OnceLock::new()),
         }
     }
+    /// The session's checkpoint database, opened at most once per instance.
     fn store(&self) -> io::Result<Records> {
-        Records::open(&self.dir.join("checkpoints.redb")).map_err(io::Error::other)
+        if let Some(store) = self.store.get() {
+            return Ok(store.clone());
+        }
+        let opened = Records::open(&self.dir.join("checkpoints.redb")).map_err(io::Error::other)?;
+        // Another clone may have won the race; either handle is equivalent, and
+        // `Records::open` already deduplicates a path that is open in-process.
+        Ok(self.store.get_or_init(|| opened).clone())
     }
     /// Must succeed before the file is mutated. An existing tracked file's
     /// externally changed content becomes the expected pre-edit state.
