@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod grep;
+pub mod image;
 pub mod store;
 pub mod tools;
 

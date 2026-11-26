@@ -289,6 +289,25 @@ impl AnchorStore {
                 bytes.len()
             )));
         }
+        // A picture is the one binary a model is routinely asked about, and it
+        // cannot be served as rows at all -- so say what would work instead of
+        // what failed. This runs before the NUL and UTF-8 checks because an image
+        // can fall down either one: PNG data usually contains NUL and would report
+        // `looks binary (NUL byte)`, while a short or truncated header has no NUL
+        // and reports `is not valid UTF-8`. Both name a byte-level symptom and
+        // neither tells the caller the file is a picture. Every provider carries
+        // images as user-turn blocks and none can put one inside a tool result,
+        // which is why no tool can read one.
+        if crate::image::is_image(path, &bytes) {
+            return Err(EngineError::Binary(format!(
+                "{} is an image; images are attached by the user, not read as rows \
+                 (ask the user to attach it, e.g. `@{}`)",
+                path.display(),
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )));
+        }
         if bytes.contains(&0) {
             return Err(EngineError::Binary(format!(
                 "{} looks binary (NUL byte); the hashline tools refuse binary files",
@@ -1565,6 +1584,36 @@ mod tests {
     }
 
     #[test]
+    fn a_png_is_refused_as_an_image_not_as_a_nul_byte() {
+        // The user-facing symptom: ask the model to look at a screenshot, it calls
+        // `read`, and the old message was `looks binary (NUL byte)`, which names
+        // neither the real situation nor any way forward. An image cannot be served
+        // as anchor rows at all (a picture has no lines and no provider accepts an
+        // image inside a tool result), so the only useful answer is "the user
+        // attaches this, you cannot read it".
+        let h = home("img");
+        let f = h.join("shot.png");
+        std::fs::write(&f, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let s = AnchorStore::new(&h);
+        let err = match s.read(&f, None, None) {
+            Err(EngineError::Binary(m)) => m,
+            other => panic!("a PNG must be refused as binary; got {other:?}"),
+        };
+        assert!(
+            err.contains("is an image"),
+            "must name the situation: {err}"
+        );
+        assert!(
+            err.contains("@shot.png"),
+            "must tell the caller how to attach it: {err}"
+        );
+        assert!(
+            !err.contains("NUL byte"),
+            "the byte-level detail is what made this unhelpful: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
     fn binary_refused() {
         let h = home("bin");
         let f = h.join("bin.dat");

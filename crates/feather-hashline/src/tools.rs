@@ -126,7 +126,8 @@ impl AgentTool for ReadTool {
         "Read a text file as anchor rows `anchor│content` (5 lowercase letters). A 4-letter anchor predates this build — re-read. \
 Line numbers are not shown and are not accepted by edit tools; edit by anchor. \
 Page with offset (1-indexed) and limit; when output says truncated, continue from the hinted offset/limit. \
-Images, binary, directories, and UTF-16/32 text are rejected; an empty file returns one empty row you can replace to seed content."
+Images are not readable: a picture has no lines, and it reaches you only when the user attaches it. \
+Binary, directories, and UTF-16/32 text are rejected; an empty file returns one empty row you can replace to seed content."
     }
 
     fn parameters(&self) -> Value {

@@ -20,8 +20,21 @@ pub fn expand_mentions(line: &str, cwd: &std::path::Path) -> (String, Vec<ImageA
     let mut out = String::from(line);
     let mut images: Vec<ImageAttachment> = Vec::new();
     for tok in line.split_whitespace() {
-        let Some(p) = tok.strip_prefix('@') else {
+        // A mention is written inside prose, so the path it quotes is routinely
+        // followed by the sentence's own punctuation: `@shot.png?`. Trimming it
+        // before the filesystem sees it is the difference between an attachment
+        // and `ENOENT` (Windows: "文件名、目录名或卷标语法不正确。 (os error 123)").
+        // Only characters that cannot end a real filename are stripped, and a
+        // quoted mention keeps its literal text so a path ending in punctuation
+        // still works when the user quotes it.
+        let quoted = tok.starts_with("`@") || tok.starts_with("\"@") || tok.starts_with("'@");
+        let Some(raw) = tok.trim_start_matches(['`', '"', '\'']).strip_prefix('@') else {
             continue;
+        };
+        let p = if quoted {
+            raw.trim_end_matches(['`', '"', '\''])
+        } else {
+            raw.trim_end_matches(['?', '.', ',', ';', ':', '!', ')', ']', '}', '>', '*'])
         };
         if p.is_empty() || p.len() > 512 {
             continue;
@@ -168,6 +181,29 @@ mod tests {
         assert!(out.contains("error="), "{out}");
         assert!(has_mentions("look at @nope.txt"));
         assert!(!has_mentions("no mentions here"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_the_path() {
+        // `what is wrong in @shot.png?` used to pass `shot.png?` to the file
+        // system, so the mention failed on Windows with "文件名、目录名或卷标语法不正确。
+        // (os error 123)" and on every OS with ENOENT. A question mark, comma or
+        // full stop after an attached path is prose, not a filename.
+        let dir = temp("p");
+        let bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        std::fs::write(dir.join("shot.png"), &bytes).unwrap();
+        for prompt in [
+            "what is wrong in @shot.png?",
+            "look at @shot.png, then explain",
+            "compare @shot.png.",
+        ] {
+            let (_out, images) = expand_mentions(prompt, &dir);
+            assert_eq!(images.len(), 1, "`{prompt}` must attach the image");
+        }
+        // A path that genuinely ends in punctuation still works when quoted.
+        let (_out, images) = expand_mentions("see `@shot.png`", &dir);
+        assert_eq!(images.len(), 1, "quoted mentions must attach too");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

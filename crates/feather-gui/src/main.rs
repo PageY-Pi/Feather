@@ -1053,7 +1053,15 @@ impl FeatherApp {
     /// Every send path funnels through here so an attachment can never be
     /// silently dropped by a path that only knew about `String`.
     fn take_prompt_message(&mut self, text: String) -> feather_core::message::Message {
-        let mut message = feather_core::message::Message::user_text(text);
+        // An image cannot reach the model any other way. `read` refuses binary
+        // files by design (it returns anchor rows; images have no lines), and no
+        // provider's tool_result field can carry a picture -- Anthropic wraps it
+        // as a text block, OpenAI and Responses send a bare string. So the only
+        // route in is an image block on the *user* turn, which is what an
+        // `@path` mention produces. The CLI has always expanded these; the GUI
+        // did not, so `@shot.png` arrived as literal text and the model's
+        // follow-up `read` failed with `[E_BINARY] ... looks binary (NUL byte)`.
+        let mut message = feather::mentions::message_from_mentions(&text, &self.root);
         for image in std::mem::take(&mut self.pending_images) {
             message
                 .content

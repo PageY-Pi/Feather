@@ -2052,6 +2052,82 @@ fn an_image_without_any_text_still_sends() {
         "an image-only turn must produce a row"
     );
 }
+#[test]
+fn a_png_mention_is_not_expanded_in_the_gui() {
+    // The reported bug: the model is asked to look at an image, calls `read`,
+    // and gets `[E_BINARY] ... looks binary (NUL byte)`. `read` cannot return a
+    // picture at all (ToolOutcome carries text; every provider's tool_result is
+    // a text-only field), so an image has to arrive as an `@`-mention on the
+    // *user* turn. Only the CLI expands those -- `feather/src/main.rs` calls
+    // `mentions::message_from_mentions`, and the GUI never did. The mention
+    // therefore stayed literal text and the attachment never existed.
+    let dir = std::env::temp_dir().join(format!(
+        "feather-mention-test-{}",
+        feather_core::message::now_millis()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Magic bytes only: `expand_mentions` classifies by extension and does not
+    // decode the picture, so a real PNG would not test anything more.
+    std::fs::write(
+        dir.join("shot.png"),
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+    )
+    .unwrap();
+    let mut app = fixture();
+    app.root = dir.clone();
+    let message = app.take_prompt_message("what is wrong in @shot.png?".into());
+    assert!(
+        message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "an @-mentioned image must become an image block; got {:#?}",
+        message.content
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_real_png_mention_carries_the_whole_file_as_base64() {
+    // The synthetic test above proves an image block appears; this proves the
+    // bytes in it are the file, because a truncated or mis-encoded payload is
+    // accepted by the model layer and then rejected by the provider mid-run.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/feather-logo.png");
+    let Ok(real) = std::fs::read(&src) else {
+        // Assets are absent in some stripped checkouts; the synthetic test still
+        // covers the routing, so skip rather than fail on a missing fixture.
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "feather-realpng-test-{}",
+        feather_core::message::now_millis()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("logo.png"), &real).unwrap();
+    let mut app = fixture();
+    app.root = dir.clone();
+    let message = app.take_prompt_message("what is in @logo.png?".into());
+    let block = message
+        .content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::Image { media_type, data } => Some((media_type.clone(), data.clone())),
+            _ => None,
+        })
+        .expect("a real PNG must be attached");
+    assert_eq!(block.0, "image/png");
+    assert!(
+        block.1.len() > real.len(),
+        "base64 of {} bytes must be longer than the source, got {}",
+        real.len(),
+        block.1.len()
+    );
+    // Compare the decoded payload to the file: the length check alone would pass
+    // for any base64 of the right size.
+    let decoded = crate::clipboard_image::decode_base64_for_display(&block.1);
+    assert_eq!(decoded, real, "the attached bytes must be the file's bytes");
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn removing_a_chip_drops_only_that_attachment() {
