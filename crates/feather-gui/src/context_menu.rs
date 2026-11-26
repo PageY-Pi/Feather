@@ -84,6 +84,25 @@ pub fn build_unreg_args() -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Whether `exe` is a `cargo` build artifact rather than an installed copy.
+///
+/// `is_transient` covers throwaway extraction directories; it deliberately does
+/// *not* cover `target/`, because an explicit `--install-context-menu` from a
+/// developer's build tree is a legitimate opt-in. The automatic repair is a
+/// different caller: it runs on every launch, so without this guard a plain
+/// `cargo run` would silently repoint the user's Explorer menu at
+/// `target\debug`, and the `cargo clean` that follows would break the menu with
+/// no action by the user at all. Verified by running a debug build against a
+/// deliberately broken registration: before this guard it rewrote the entry to
+/// `target\debug\feather-gui.exe`.
+fn is_build_output(exe: &std::path::Path) -> bool {
+    let path = exe
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    path.contains("\\target\\debug\\") || path.contains("\\target\\release\\")
+}
+
 /// Location under the user's temp directory — where release-verification runs
 /// unpack a throwaway copy of the executables.
 pub fn is_transient(exe: &std::path::Path) -> bool {
@@ -160,8 +179,18 @@ fn registered_command(key: &str) -> Option<String> {
 /// stable location, rewrite the entries to this executable. Returns the stale
 /// path that was replaced, if any. A live registration is never touched, so a
 /// menu deliberately pointed at another build stays where the user put it.
+/// Whether a launch from `exe` is allowed to rewrite the shell menu.
+///
+/// Split out so the decision is testable on its own. The first version of the
+/// guard test asserted `repair_if_stale(...) == None` for a `target/debug` path,
+/// which passed even with the guard removed: no menu entry was stale at the time, so
+/// the function returned `None` for an unrelated reason. The predicate is the thing
+/// that has to be right.
+fn may_repair(exe: &std::path::Path) -> bool {
+    !is_transient(exe) && !is_build_output(exe)
+}
 pub fn repair_if_stale(exe: &std::path::Path) -> Option<std::path::PathBuf> {
-    if is_transient(exe) {
+    if !may_repair(exe) {
         return None;
     }
     let stale = LOCATIONS.iter().find_map(|(suffix, _)| {
@@ -282,20 +311,46 @@ mod tests {
         )));
     }
 
-    /// The recovery has to fire on a stale entry and stay out of the way otherwise.
+    /// The automatic repair must stand down in the two places it would do harm.
     ///
-    /// Only the two guards are asserted, not the registry rewrite: `repair_if_stale`
+    /// Only the guards are asserted, not the registry rewrite: `repair_if_stale`
     /// calls `install`, which writes HKCU, and a test must not touch the developer's
-    /// real Explorer menu. The guards are what decide whether a write happens at all,
-    /// and both were reachable-by-nobody before the GUI called this on startup.
+    /// real Explorer menu. The guards are what decide whether a write happens at all.
     #[test]
     fn repair_only_acts_from_a_stable_location() {
-        // A transient copy never repairs: a `cargo run` build must not rewrite the
-        // user's menu to point at `target/debug`.
+        // A throwaway extraction directory never repairs.
         let temp = std::env::temp_dir().join("feather-repair-guard.exe");
         assert_eq!(repair_if_stale(&temp), None);
+
+        // Nor does a cargo build artifact. This is the case a launch-time repair
+        // gets wrong: `cargo run` would otherwise repoint the user's Explorer menu
+        // at `target\debug`, and the next `cargo clean` would break it. Caught by
+        // running a debug build against a deliberately broken registration, which
+        // rewrote the entry before this guard existed.
+        for build in ["debug", "release"] {
+            let exe = std::path::Path::new("C:/work/feather/target")
+                .join(build)
+                .join("feather-gui.exe");
+            assert!(
+                is_build_output(&exe),
+                "{} must be recognised as a build artifact",
+                exe.display()
+            );
+            assert!(
+                !may_repair(&exe),
+                "{} must not be allowed to repair the menu",
+                exe.display()
+            );
+            assert_eq!(repair_if_stale(&exe), None);
+        }
+
+        // The installed location is the one that may repair.
+        assert!(!is_build_output(std::path::Path::new(
+            "C:/Users/Page/AppData/Local/Programs/Feather/feather-gui.exe"
+        )));
     }
 
+    #[test]
     fn transient_install_is_refused_without_the_opt_in() {
         let temp = std::env::temp_dir().join("feather-transient-refusal-test.exe");
         // Only exercise the guard: no registry write happens on the Err path.
