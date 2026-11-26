@@ -1081,17 +1081,17 @@ impl Agent {
         for failed_attempt in 0..crate::provider::retry::MAX_ATTEMPTS {
             match self.stream_assistant_once(req, publish).await {
                 Ok((msg, usage)) => {
-                    self.record_provider_usage(total_usage, usage);
+                    self.record_provider_usage(total_usage, usage, publish);
                     return Ok(msg);
                 }
                 Err(failure)
                     if matches!(failure.error, crate::provider::ProviderError::Aborted) =>
                 {
-                    self.record_provider_usage(total_usage, failure.usage);
+                    self.record_provider_usage(total_usage, failure.usage, publish);
                     return Err(AgentError::Aborted);
                 }
                 Err(failure) => {
-                    self.record_provider_usage(total_usage, failure.usage);
+                    self.record_provider_usage(total_usage, failure.usage, publish);
                     let Some(plan) = crate::provider::retry::plan(&failure.error, failed_attempt)
                     else {
                         if publish {
@@ -1333,13 +1333,22 @@ impl Agent {
         self.estimate_bias.observe(estimated, prompt);
     }
 
-    fn record_provider_usage(&mut self, total_usage: &mut Usage, usage: Usage) {
+    /// `calibrates` says whether this request's bill may train `EstimateBias`.
+    ///
+    /// A summary request must not: it sends `SUMMARY_SYSTEM`, a single synthesized
+    /// user message and *no tool schemas*, while `request_input_tokens` — the estimate
+    /// it would be compared against — models the real system prompt plus 17 tool
+    /// definitions. Feeding that pair to `observe` teaches the ratio a relationship
+    /// that does not hold for any real turn, which is worse than one missing sample.
+    fn record_provider_usage(&mut self, total_usage: &mut Usage, usage: Usage, calibrates: bool) {
         *total_usage = crate::session::add_usage(*total_usage, usage);
         self.session.add_usage(usage);
-        // Only a request that billed prompt tokens says anything about the
-        // estimate. A provider that reports zero (some gateways omit usage on
-        // errors) is ignored by `observe` itself.
-        self.observe_estimate(&usage);
+        // Only a request that billed prompt tokens says anything about the estimate.
+        // A provider that reports zero (some gateways omit usage on errors) is ignored
+        // by `observe` itself, so there is no second check here.
+        if calibrates {
+            self.observe_estimate(&usage);
+        }
         if let Some(p) = &self.planner {
             p.record(&usage);
         }
@@ -1653,6 +1662,56 @@ mod retry_tests {
         ));
         assert!(Arc::ptr_eq(&request.messages, &second.messages));
         assert!(Arc::ptr_eq(&request.tools, &second.tools));
+    }
+
+    /// A summary request must not train the estimate correction.
+    ///
+    /// Its system prompt, message list and (empty) tool set are all different from the
+    /// request `request_input_tokens` models, so the ratio between the two is
+    /// meaningless — and because a summary is billed in full while the estimate covers
+    /// the *real* prompt plus every tool schema, it lands well off 1.0. Letting it
+    /// through would bias the next turn's compaction threshold on a request that will
+    /// never be sent again.
+    #[test]
+    fn a_summary_request_does_not_calibrate_the_estimate() {
+        let mut agent = Agent::new(
+            config(),
+            Session::memory(std::path::Path::new("fixture"), "summary-bias"),
+            Arc::new(ToolRegistry::new()),
+            ProviderRef::Scripted(test_support::ScriptedProvider::new(Vec::new())),
+            None,
+        );
+        let raw = agent.request_input_tokens();
+        let mut total = Usage::default();
+        // What a summary bills: its own tiny prompt, nothing like `raw`.
+        let summary_bill = Usage {
+            input: 40_000,
+            output: 100,
+            ..Usage::default()
+        };
+
+        agent.record_provider_usage(&mut total, summary_bill, false);
+        assert_eq!(
+            agent.estimate_bias.samples, 0,
+            "a summary request must not count as a calibration sample"
+        );
+        assert_eq!(
+            agent.estimate_bias.adjust(raw),
+            raw,
+            "and must not move the multiplier"
+        );
+        // Its cost still lands in the session totals: not calibrating is not the same
+        // as not accounting.
+        assert_eq!(total.input, 40_000);
+
+        // A real turn does calibrate, so the gate is not simply "never learn".
+        agent.record_provider_usage(&mut total, summary_bill, true);
+        assert_eq!(agent.estimate_bias.samples, 1);
+        assert!(
+            agent.estimate_bias.ratio > 1.0,
+            "40 000 billed against a small estimate must raise the ratio, got {}",
+            agent.estimate_bias.ratio
+        );
     }
 
     /// The learned correction has to change the compaction decision, or it is dead
