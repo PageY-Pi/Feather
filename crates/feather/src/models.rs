@@ -464,6 +464,21 @@ pub fn cost_for(model: &str) -> Option<ModelCost> {
     .flatten()
 }
 
+/// Whether the catalog says this model accepts image input.
+///
+/// `None` means the model is not in the catalog, so nothing is known: callers
+/// must not treat that as a refusal, or a custom endpoint would be blocked from
+/// images it actually supports. The catalog declares the modality in
+/// `models[].input` (see `opencode-go/deepseek-v4.1-flash`, which lists both
+/// `text` and `image`), and this is the one place that field is read on the send
+/// path — `ui_vision` reads it separately for its own preflight.
+pub fn accepts_images(model: &str) -> Option<bool> {
+    with_catalog(&config::feather_home(), |cat| {
+        find(cat, model).map(|(_, _, m)| m.input.iter().any(|i| i == "image"))
+    })
+    .flatten()
+}
+
 pub fn load() -> Option<ModelsFile> {
     load_cached(&config::feather_home())
 }

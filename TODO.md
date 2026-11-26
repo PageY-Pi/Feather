@@ -271,6 +271,37 @@ and re-run after any tool change.
   result set stays a success. Test proves the old behaviour returned
   `Ok("No results found.")` for an unrecognised page.
 
+- [x] **Image input works, but only from the CLI.** Measured rather than assumed:
+  `opencode-go/deepseek-v4.1-flash` declares `"input": ["text", "image"]` in the
+  catalog and really does read images. `ui_vision` on a logo returned concrete
+  detail (top-right quill dot, lower-right barb, mixed stroke terminals) that can
+  only come from seeing the pixels, and `feather -m opencode-go/deepseek-v4.1-flash
+  "…@crates/feather-gui/assets/feather-logo.png"` described it correctly. All four
+  providers encode images natively (Anthropic `source`, OpenAI `image_url` data
+  URL, Responses `input_image`, pi blocks); `tests/multimodal.rs` already covers
+  ordering and the image-only case.
+- [x] **Nothing checked the declared modality on the send path.** `models[].input`
+  was read only by `ui_vision`'s own preflight, so attaching an image to a
+  text-only model sent it anyway and the user got an opaque HTTP 400 mid-run.
+  `models::accepts_images` now reads the field and `rpc::check_image_support`
+  refuses before the image reaches the session, naming the model. Unknown models
+  are not refused — a custom endpoint may accept images and the catalog has no
+  opinion. Reverting the check reproduces `unwrap_err() on an Ok value`.
+- [ ] **The GUI cannot send an image at all.** `rpc::user_message` accepts an
+  `images` array and has tests for it, but nothing in `feather-gui` builds one:
+  no clipboard read, no drag-and-drop, no `@` mention expansion (`mentions::
+  message_from_mentions` is called only from `main.rs`, the CLI path). The
+  `app.clipboard.pasteImage` binding promised `alt+v` and had no arm in
+  `handle_action`, so it was removed rather than left silently inert. Real work
+  remains: read the clipboard image (or dropped file), base64 it, and populate
+  `images` on the request. That is a GUI feature, not a wiring bug.
+- [x] **A second dead binding, same shape as the first.** Worth noting how it was
+  found: grepping for the action name across the whole crate returned exactly one
+  hit — the binding table itself. Any action with no consumer outside
+  `keybindings.rs` is unbound in practice, and that grep is the cheap way to find
+  the rest (`app.editor.external`, `app.suspend`, `app.session.fork`,
+  `app.session.tree`, `app.session.togglePath` all look the same).
+
 ## Research note — persistent memory (2026-11-24)
 
 Question: does persistent memory help, or does it record wrong judgments and

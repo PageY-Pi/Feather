@@ -398,6 +398,26 @@ pub fn wire_message(m: &Message) -> Value {
     }
     v
 }
+/// Refuse images when the catalog says the active model is text-only.
+///
+/// Without this the image went to the provider anyway and came back as an opaque
+/// HTTP 400 in the middle of a run, long after the user attached it. The catalog
+/// already records the modality (`models[].input`), so the check is local and the
+/// message can name the model. An unknown model is not refused: a custom endpoint
+/// may well accept images, and the catalog simply has nothing to say about it.
+fn check_image_support(message: &Message, model: &str) -> Result<(), String> {
+    let has_image = message
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Image { .. }));
+    if !has_image || models::accepts_images(model) != Some(false) {
+        return Ok(());
+    }
+    Err(format!(
+        "model `{model}` does not accept image input; remove the attachment or switch to a \
+         vision-capable model (see `subagent_models` for the configured ids)"
+    ))
+}
 fn user_message(command: &Value) -> Result<Message, String> {
     let text = command["message"]
         .as_str()
@@ -1141,6 +1161,9 @@ where
     let mut queue = agent.input_queue();
     let mut cached_state = state(&agent);
     let mut cached_messages: Vec<Message> = agent.session().messages().to_vec();
+    // Captured before `agent` moves into `idle`: the image-capability check runs
+    // per request, but the model cannot be read back out of a moved value.
+    let model_id = agent.model_id();
     let mut idle = Some(agent);
     let mut running: Option<
         tokio::task::JoinHandle<(
@@ -1286,7 +1309,13 @@ where
                     "prompt" | "steer" | "follow_up" => match user_message(&command) {
                         Err(e) => Err(e),
                         Ok(message) => {
-                            if kind != "prompt" || running.is_some() || compacting.is_some() {
+                            // Reject an attachment the model cannot read before it
+                            // reaches the session, so the failure is a tool-level
+                            // error the caller can act on rather than a provider
+                            // 400 surfacing mid-run.
+                            if let Err(e) = check_image_support(&message, &model_id) {
+                                Err(e)
+                            } else if kind != "prompt" || running.is_some() || compacting.is_some() {
                                 let behavior = if kind == "steer" { "steer" } else if kind == "follow_up" { "followUp" } else { command["streamingBehavior"].as_str().unwrap_or("") };
                                 if !["steer", "followUp"].contains(&behavior) { Err("Agent is streaming; specify streamingBehavior: steer or followUp".into()) }
                                 else {
@@ -1681,6 +1710,39 @@ mod tests {
         assert_eq!(wire["content"][1]["mimeType"], "image/png");
         assert_eq!(m.text(), "hi\u{2028}there");
         assert!(user_message(&json!({"text":"not pi's field"})).is_err());
+    }
+
+    /// An image sent to a text-only model is refused locally, before it reaches
+    /// the session. Previously the image went to the provider and came back as an
+    /// opaque HTTP 400 mid-run, so the user saw a failure far from the cause.
+    #[test]
+    fn images_are_refused_only_for_models_the_catalog_calls_text_only() {
+        let with_image = user_message(&json!({
+            "message":"look",
+            "images":[{"type":"image","mimeType":"image/png","data":"AAAA"}]
+        }))
+        .unwrap();
+        let text_only = Message::user_text("no image here");
+
+        // Unknown model: nothing is known, so do not refuse. A custom endpoint may
+        // accept images and the catalog has no opinion.
+        assert!(check_image_support(&with_image, "not-in-the-catalog/whatever").is_ok());
+        // No image: the model's modality is irrelevant.
+        assert!(check_image_support(&text_only, "opencode-go/deepseek-v4.1-flash").is_ok());
+
+        // A catalogued text-only model is refused, and the message names it.
+        let text_only_model = models::with_catalog(&crate::config::feather_home(), |cat| {
+            cat.providers
+                .values()
+                .flat_map(|p| p.models.iter())
+                .find(|m| !m.input.iter().any(|i| i == "image"))
+                .map(|m| m.id.clone())
+        })
+        .flatten()
+        .expect("catalog has at least one text-only model");
+        let err = check_image_support(&with_image, &text_only_model).unwrap_err();
+        assert!(err.contains(&text_only_model), "{err}");
+        assert!(err.contains("image"), "{err}");
     }
 
     #[test]
