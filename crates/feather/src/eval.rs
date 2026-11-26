@@ -447,6 +447,40 @@ pub fn scenarios() -> Vec<Scenario> {
             }),
         },
         Scenario {
+            name: "an_unknown_task_id_names_the_next_step",
+            // "Track multi-step work with task_create/task_update."
+            rule: Some("Track multi-step work with task_create/task_update"),
+            setup: Box::new(|_: &Path| {}),
+            steps: Box::new(|_| {
+                vec![(
+                    // The empty-store case. `task_update` cannot tell "unknown id" from
+                    // "no tasks at all" by `update`'s return value, so an error that
+                    // only says "no task t1" sends the model to `task_list`, which
+                    // answers "no tasks" — a loop with no exit. It has to name the way
+                    // out, and that way is `task_create`, not `task_list`.
+                    Step::new(
+                        "task_update",
+                        serde_json::json!({ "id": "t1", "status": "done" }),
+                    ),
+                    Expect::ErrContains("no tasks yet"),
+                )]
+            }),
+        },
+        Scenario {
+            name: "a_missing_task_id_is_an_error_not_a_blank_id",
+            // "Track multi-step work with task_create/task_update."
+            rule: Some("Track multi-step work with task_create/task_update"),
+            setup: Box::new(|_: &Path| {}),
+            steps: Box::new(|_| {
+                vec![(
+                    // An empty store *and* a missing id: the error must still be about
+                    // the argument, because that is the thing the caller can fix.
+                    Step::new("task_update", serde_json::json!({})),
+                    Expect::ErrContains("id is required"),
+                )]
+            }),
+        },
+        Scenario {
             name: "tasks_are_tracked_by_id_not_title",
             // "Track multi-step work with task_create/task_update."
             rule: Some("Track multi-step work with task_create/task_update"),

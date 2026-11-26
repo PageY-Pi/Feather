@@ -324,7 +324,29 @@ impl AgentTool for TaskUpdateTool {
             }
             match self.0.update(&id, status, title) {
                 Some(t) => ToolOutcome::ok(format!("{} [{}] {}", t.id, t.status, t.title)),
-                None => ToolOutcome::err(format!("task_update: no task {id}")),
+                // `update` returns `None` both when the id is unknown and when there
+                // are no tasks at all, and those need different next steps: the first
+                // is "re-read the ids", the second is "create the task first". Saying
+                // only "no task X" sends a model with an empty store to `task_list`,
+                // which answers "no tasks" — a loop with no way out.
+                None => {
+                    let known = self.0.list();
+                    if known.is_empty() {
+                        ToolOutcome::err(format!(
+                            "task_update: no task {id} — this session has no tasks yet. \
+                             Create it first with `task_create` (title, description)."
+                        ))
+                    } else {
+                        let ids = known
+                            .iter()
+                            .map(|t| t.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ToolOutcome::err(format!(
+                            "task_update: no task {id} — the existing ids are {ids}"
+                        ))
+                    }
+                }
             }
         })
     }
