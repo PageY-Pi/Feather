@@ -1,31 +1,41 @@
 //! Which search backend does a given model actually reach, and does it work?
 //!
-//! Run: `cargo run --release -p feather --example search_backend -- deepseek/deepseek-flash`
+//! Run: `cargo run --release -p feather --example search_backend -- <model> <query> [proxy-url]`
 //!
-//! This exists because the answer depended on three things that are easy to guess
-//! wrong: the provider id (which selects the backend), the base URL host (which can
-//! override that choice), and whether the machine can reach the host at all. The probe
-//! reports the resolved route before running it, so a wrong route is visible even when
-//! the request would have failed anyway.
+//! The route depends on the network, not on the model: a usable proxy means DuckDuckGo,
+//! no proxy means the DeepSeek Search API. Both halves are easy to guess wrong, and the
+//! failure mode is invisible — `web_search` reports "DuckDuckGo request failed" without
+//! naming the route it picked.
+//!
+//! Pass a proxy URL as the third argument to test the other half without changing system
+//! settings. It is installed with `transport::set_proxy_url`, exactly as startup does, so
+//! `web_search` sees it through the same path production code reads.
 use feather_core::tool::AgentTool;
 use serde_json::json;
 use std::time::Instant;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let model = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let model = args
+        .next()
         .unwrap_or_else(|| "deepseek/deepseek-flash".to_string());
-    let query = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "rust async runtime".to_string());
+    let query = args.next().unwrap_or_else(|| "rust async".to_string());
+    let proxy = args.next();
 
     println!("model: {model}");
     println!("query: {query}");
+    match &proxy {
+        Some(url) => {
+            feather_core::provider::transport::set_proxy_url(url).expect("valid proxy url");
+            println!("route: proxy {url} (injected for this run)");
+        }
+        None => println!(
+            "route: {}",
+            feather_core::provider::transport::current_route()
+        ),
+    }
 
-    // `context()` is private, so the route is observed through the tool's own
-    // behaviour: a native backend reports `native:<provider>`, a fallback reports
-    // nothing. That is the distinction the fix depends on.
     let tool = feather::web::WebSearchTool {
         model: model.clone(),
         base_url: None,

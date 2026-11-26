@@ -421,19 +421,26 @@ struct Native {
 }
 fn context(model: &str, base_override: Option<&str>) -> Option<Native> {
     let catalog = models::load()?;
-    context_in(&catalog, model, base_override)
+    context_in(&catalog, model, base_override, proxy_available())
 }
 
-/// The route decision, with the catalog passed in.
+/// The route decision, with the catalog and the proxy state passed in.
 ///
-/// Split out from [`context`] so the decision is testable. It was not, and the first
-/// version of these tests proved it: they called `deepseek_fallback` directly, so
-/// deleting the call to it from `context` left every test green while the feature was
-/// off. A test that cannot fail when the wiring is removed is not testing the wiring.
+/// Split out so both inputs are testable. It was not, and the first version of these
+/// tests proved it: they called the fallback helper directly, so deleting the call from
+/// the route decision left every test green while the feature was off. A test that
+/// cannot fail when the wiring is removed is not testing the wiring.
+///
+/// The rule is about the *network*, not the model: a usable proxy means DuckDuckGo,
+/// which needs one on this kind of network; no proxy means the DeepSeek Search API,
+/// which does not. Tying this to the model's provider was the earlier mistake — it
+/// sent `opencode-go/deepseek-v4.1-flash` to a DuckDuckGo scrape that took 15.2 s and
+/// failed, while every other gateway model had the same problem for the same reason.
 fn context_in(
     catalog: &models::ModelsFile,
     model: &str,
     base_override: Option<&str>,
+    proxy: bool,
 ) -> Option<Native> {
     let (pid, p, m) = models::find(catalog, model)?;
     let base = base_override
@@ -452,17 +459,41 @@ fn context_in(
         Backend::Ddg if deepseek_host(base) => Backend::Deepseek,
         kind => kind,
     };
+    // A provider with real native search keeps it: Anthropic, OpenAI, Google and ZAI
+    // reach their own search endpoint regardless of the proxy, so overriding them
+    // would spend a second provider's credentials for no reason.
     if kind != Backend::Ddg {
         return Some(native_from(pid, p, m, base, kind));
     }
-    // The provider offers no native search — a reseller such as `opencode-go`,
-    // whose base is a gateway rather than a model host. Falling back to
-    // DuckDuckGo is only right when nothing better exists, because that fallback
-    // is a scrape of an HTML page: measured on one machine it took 15.2 s and
-    // failed outright while the DeepSeek Search API answered in 827 ms. So when a
-    // DeepSeek-family model is selected *and* the catalog holds a usable
-    // `deepseek` provider, search goes there instead.
-    deepseek_fallback(catalog, model)
+    // No native search. Which fallback is usable depends on the network, not on the
+    // model: with a proxy, DuckDuckGo works; without one it cannot be reached at all,
+    // while the DeepSeek Search API is a plain HTTPS endpoint that needs no proxy.
+    with_proxy(proxy, catalog)
+}
+
+/// The fallback chosen for a provider that offers no native search.
+///
+/// With a proxy, DuckDuckGo is reachable and wins because it is free and needs no
+/// account. Without one it cannot be reached at all, so the DeepSeek Search API takes
+/// over — it is plain HTTPS to a host that answers on this network.
+fn with_proxy(proxy: bool, catalog: &models::ModelsFile) -> Option<Native> {
+    if proxy {
+        // `None` means "no native route", which makes the caller use DuckDuckGo through
+        // whatever route is configured.
+        return None;
+    }
+    deepseek_fallback(catalog)
+}
+
+/// Whether a usable proxy is configured for this process.
+///
+/// Reads the resolved route rather than probing: the route is already the answer to
+/// "does traffic leave through a proxy", set at startup from the catalog and from
+/// loopback discovery. Probing here would repeat work on every search and still not
+/// tell us whether DuckDuckGo is reachable through it — the measured failure was a
+/// 15.2 s timeout behind a proxy that answered CONNECT but not DuckDuckGo.
+fn proxy_available() -> bool {
+    matches!(transport::current_route(), transport::Route::Proxy { .. })
 }
 
 /// A `Native` built from one catalog row.
@@ -496,21 +527,20 @@ fn native_from(
     }
 }
 
-/// Search through the official DeepSeek provider for a model that has no native
-/// search of its own.
+/// Search through the official DeepSeek provider when no proxy is available.
 ///
-/// Two conditions, both deliberate. The selected model must look like a DeepSeek
-/// model, because sending an unrelated model's query to a DeepSeek account would
-/// spend its balance on a search the user never associated with that provider. And
-/// the `deepseek` row must carry a credential — without one the request would fail
-/// with 401 and the caller would fall back to DuckDuckGo anyway, one round trip
-/// later. A custom provider whose base is DeepSeek's own host is already handled by
-/// the caller, so this only covers gateways.
-fn deepseek_fallback(catalog: &models::ModelsFile, model: &str) -> Option<Native> {
-    let id = model.rsplit('/').next().unwrap_or(model);
-    if !id.to_ascii_lowercase().contains("deepseek") {
-        return None;
-    }
+/// The `deepseek` row must carry a credential on a real `deepseek.com` host; without a
+/// key the request would 401 and the caller would fall through to DuckDuckGo anyway,
+/// one wasted round trip later. A custom provider whose base already is DeepSeek's own
+/// host is handled earlier by [`context_in`], so this covers the gateway case.
+///
+/// The search is independent of which model is selected: `/tools/search` takes a query,
+/// and the account — not the model — is what makes it work.
+fn deepseek_fallback(catalog: &models::ModelsFile) -> Option<Native> {
+    // No model-name condition. The Search API takes a query, not a model, so the
+    // selected model is irrelevant to whether the search works; what matters is that
+    // the account exists and carries a key. Gating on the model name was the earlier
+    // mistake, and it left every non-DeepSeek gateway model with no usable search.
     let p = catalog.providers.get("deepseek")?;
     // `/tools/search` takes a query, not a model, so any row will do — but a row must
     // exist, because the `Native` carries an id and the catalog is the only source for
@@ -916,7 +946,7 @@ impl AgentTool for WebSearchTool {
         "web_search"
     }
     fn description(&self) -> &'static str {
-        "Search the web for a query. Uses native ZAI MCP, Anthropic, OpenAI/xAI Responses, Google grounding or the DeepSeek Search API when available; otherwise DuckDuckGo, with explicit fallback on native errors. Returns text and source URLs (untrusted). Native requests may incur provider fees; output capped at 50 KiB/2000 lines."
+        "Search the web for a query. Uses native ZAI MCP, Anthropic, OpenAI/xAI Responses or Google grounding when the provider offers it; otherwise DuckDuckGo through the configured proxy when one is set, or the DeepSeek Search API when it is not. Falls back explicitly on native errors. Returns text and source URLs (untrusted). Native requests may incur provider fees; output capped at 50 KiB/2000 lines."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})
@@ -988,65 +1018,89 @@ mod tests {
         providers.insert("deepseek".to_string(), mk(&["deepseek-flash"], key));
         providers.insert(
             "opencode-go".to_string(),
-            mk(&["deepseek-v4.1-flash", "glm-5.3"], Some("gateway-key")),
+            mk(
+                &["deepseek-v4.1-flash", "glm-5.3", "hungerg-free"],
+                Some("gateway-key"),
+            ),
         );
         models::ModelsFile { providers }
     }
 
+    /// The rule is about the network, not the model: proxy means DuckDuckGo, no proxy
+    /// means the DeepSeek Search API.
+    ///
+    /// The earlier version keyed on the model name, which meant every gateway model
+    /// except DeepSeek's own had no usable search on a network where DuckDuckGo cannot
+    /// be reached. Verified live: `opencode-go/deepseek-v4.1-flash` took 15.2 s and
+    /// failed while `deepseek/deepseek-flash` answered in 0.827 s.
     #[test]
-    fn a_gateway_deepseek_model_searches_through_the_official_provider() {
+    fn a_proxy_means_duckduckgo_and_no_proxy_means_the_deepseek_api() {
         let catalog = catalog_with_deepseek(Some("official-key"));
-        // Through `context_in`, not `deepseek_fallback` directly: the earlier version
-        // of this test called the helper, so deleting the call from the route decision
-        // left it green while `web_search` still went to DuckDuckGo.
-        let native = context_in(&catalog, "opencode-go/deepseek-v4.1-flash", None)
-            .expect("a gateway DeepSeek model must reach the official Search API");
-        assert_eq!(native.kind, Backend::Deepseek);
-        assert_eq!(
-            native.base, DEEPSEEK,
-            "the fallback must target the official host, not the gateway"
-        );
-        assert_eq!(
-            native.key.as_deref(),
-            Some("official-key"),
-            "it must use the official credential, not the gateway's"
-        );
+
+        // No proxy: any model whose provider has no native search uses the official
+        // Search API, because that is the only reachable option.
+        for model in [
+            "opencode-go/deepseek-v4.1-flash",
+            "opencode-go/glm-5.3",
+            "opencode-go/hungerg-free",
+        ] {
+            let native = context_in(&catalog, model, None, false).unwrap_or_else(|| {
+                panic!("{model} must reach the Search API when no proxy is configured")
+            });
+            assert_eq!(native.kind, Backend::Deepseek, "{model}");
+            assert_eq!(
+                native.base, DEEPSEEK,
+                "{model} must target the official host, not the gateway"
+            );
+            assert_eq!(
+                native.key.as_deref(),
+                Some("official-key"),
+                "{model} must use the official credential, not the gateway's"
+            );
+        }
+
+        // With a proxy, DuckDuckGo is reachable and is preferred: free, no account.
+        // `None` means "no native route", which is what makes the caller choose DDG.
+        for model in [
+            "opencode-go/deepseek-v4.1-flash",
+            "opencode-go/glm-5.3",
+            "opencode-go/hungerg-free",
+        ] {
+            assert!(
+                context_in(&catalog, model, None, true).is_none(),
+                "{model} must use DuckDuckGo when a proxy is available"
+            );
+        }
     }
 
     #[test]
-    fn a_missing_deepseek_credential_leaves_search_on_the_fallback() {
-        // Without a key the request would 401 and fall back to DuckDuckGo anyway, one
-        // wasted round trip later. `None` here means "no native route", which is what
-        // makes `web_search` choose DDG deliberately rather than by accident.
+    fn the_search_api_is_unreachable_without_a_credential() {
+        // Without a key the request would 401 and then fall to DuckDuckGo anyway, one
+        // wasted round trip later. `None` here makes `web_search` report the DuckDuckGo
+        // failure instead of a 401 for an account the user may not know is involved.
         let catalog = catalog_with_deepseek(None);
-        assert!(context_in(&catalog, "opencode-go/deepseek-v4.1-flash", None).is_none());
+        assert!(context_in(&catalog, "opencode-go/glm-5.3", None, false).is_none());
         let catalog = catalog_with_deepseek(Some("   "));
         assert!(
-            context_in(&catalog, "opencode-go/deepseek-v4.1-flash", None).is_none(),
+            context_in(&catalog, "opencode-go/glm-5.3", None, false).is_none(),
             "a blank key is not a credential"
         );
     }
 
     #[test]
-    fn the_fallback_does_not_capture_models_from_other_families() {
-        // Spending a DeepSeek account's balance on an unrelated model's query is the
-        // failure this guard prevents; glm-5.3 really does fall through to DDG.
+    fn a_native_provider_keeps_its_own_search() {
+        // Anthropic, OpenAI, Google and ZAI reach their own search endpoints whether or
+        // not a proxy exists, so the fallback must not capture them: doing so would
+        // spend a second provider's balance for no reason.
         let catalog = catalog_with_deepseek(Some("official-key"));
-        assert!(context_in(&catalog, "opencode-go/glm-5.3", None).is_none());
-        assert!(context_in(&catalog, "opencode-go/hungerg-free", None).is_none());
-        // A bare model id with no provider prefix still resolves.
-        assert!(context_in(&catalog, "deepseek-flash", None).is_some());
+        for proxy in [false, true] {
+            let native = context_in(&catalog, "deepseek/deepseek-flash", None, proxy)
+                .expect("the official provider has native search");
+            assert_eq!(native.kind, Backend::Deepseek);
+            assert_eq!(native.pid, "deepseek");
+        }
     }
 
-    #[test]
-    fn a_native_provider_keeps_its_own_route() {
-        // Anything with a native backend returns before the fallback, so the official
-        // provider's model must keep pointing at its own row.
-        let catalog = catalog_with_deepseek(Some("official-key"));
-        let native = context_in(&catalog, "deepseek/deepseek-flash", None).unwrap();
-        assert_eq!(native.kind, Backend::Deepseek);
-        assert_eq!(native.pid, "deepseek");
-    }
     #[test]
     fn private_targets_and_credentials_are_rejected() {
         for ip in [
