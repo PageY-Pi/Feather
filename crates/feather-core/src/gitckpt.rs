@@ -311,13 +311,34 @@ impl GitCheckpoints {
     /// per-session ref so Git garbage collection cannot erase it.
     /// A repo Feather creates itself is restored
     /// exactly; a pre-existing repo only ever sees managed file contents.
+    /// Commit a turn's checkpoint, keeping every checkpoint this session has made.
+    ///
+    /// No window: the caller chose to keep everything. Production uses
+    /// [`Self::commit_turn_windowed`], which knows the rewind horizon.
     pub fn commit_turn(
         &self,
         turn: u64,
         session_dir: &Path,
         files: &[String],
     ) -> std::io::Result<Option<String>> {
-        Ok(self.commit_turn_report(turn, session_dir, files)?.hash)
+        Ok(self.commit_turn_report(turn, 0, session_dir, files)?.hash)
+    }
+
+    /// Commit a turn's checkpoint, dropping refs older than `keep_from_turn`.
+    ///
+    /// The floor comes from the session, which derives it from its instruction list:
+    /// a rewind window is measured in instructions and one instruction spans dozens
+    /// of snapshot turns, so this function cannot compute it from `turn`.
+    pub fn commit_turn_windowed(
+        &self,
+        turn: u64,
+        keep_from_turn: u64,
+        session_dir: &Path,
+        files: &[String],
+    ) -> std::io::Result<Option<String>> {
+        Ok(self
+            .commit_turn_report(turn, keep_from_turn, session_dir, files)?
+            .hash)
     }
 
     /// Validate the touched paths *without* spawning git.
@@ -364,15 +385,17 @@ impl GitCheckpoints {
     pub fn commit_prepared(
         &self,
         turn: u64,
+        keep_from_turn: u64,
         session_dir: &Path,
         files: Vec<String>,
     ) -> std::io::Result<CheckpointReport> {
-        self.commit_turn_report(turn, session_dir, &files)
+        self.commit_turn_report(turn, keep_from_turn, session_dir, &files)
     }
 
     pub fn commit_turn_report(
         &self,
         turn: u64,
+        keep_from_turn: u64,
         session_dir: &Path,
         files: &[String],
     ) -> std::io::Result<CheckpointReport> {
@@ -457,25 +480,26 @@ impl GitCheckpoints {
                 files: added,
             },
         );
-        // Rewind is bounded, so checkpoints past the horizon are unreachable and
-        // only accumulate git objects. Drop them from the map and delete their refs;
-        // the objects themselves are left to git's own gc, which is the only safe
-        // way to remove them (a ref deletion alone does not free anything).
-        const HORIZON: u64 = crate::session::REWIND_HORIZON_TURNS;
-        if turn > HORIZON {
-            let oldest = turn - HORIZON;
-            let expired: Vec<u64> = map.keys().copied().filter(|t| *t < oldest).collect();
-            for stale in expired {
-                let ref_name = format!(
-                    "refs/feather/{}/turn-{stale}",
-                    session_dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy())
-                        .unwrap_or_default()
-                );
-                let _ = Self::run(&repo, &["update-ref", "-d", &ref_name]);
-                map.remove(&stale);
-            }
+        // Rewind is bounded, so checkpoints before the floor are unreachable and only
+        // accumulate git objects. The floor arrives from the session, which computes
+        // it from its instruction list — a turn count here would be the wrong unit
+        // (one instruction spans dozens of turns). Only the refs are deleted: the
+        // objects are left to git's own gc, since deleting a ref frees nothing.
+        let expired: Vec<u64> = map
+            .keys()
+            .copied()
+            .filter(|t| *t < keep_from_turn)
+            .collect();
+        for stale in expired {
+            let ref_name = format!(
+                "refs/feather/{}/turn-{stale}",
+                session_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
+            );
+            let _ = Self::run(&repo, &["update-ref", "-d", &ref_name]);
+            map.remove(&stale);
         }
         Self::save_map(session_dir, &map)?;
         Ok(CheckpointReport {
@@ -844,6 +868,7 @@ mod tests {
         let report = ck
             .commit_turn_report(
                 1,
+                0,
                 &session,
                 &[
                     "ignored.log".into(),

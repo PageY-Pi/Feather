@@ -40,6 +40,12 @@ const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// One turn's checkpoint request.
 struct Job {
     turn: u64,
+    /// Oldest turn a rewind may still reach; checkpoints before it are dropped.
+    ///
+    /// Computed by the session from its instruction list, because this worker has no
+    /// access to the conversation and a turn count cannot express "the last ten
+    /// instructions" — one instruction spans dozens of turns.
+    keep_from_turn: u64,
     cwd: PathBuf,
     session_dir: PathBuf,
     files: Vec<String>,
@@ -118,7 +124,23 @@ impl CheckpointWorker {
 
     /// Queue a checkpoint. Returns immediately; the git work happens on the
     /// worker thread.
+    /// Queue a checkpoint, keeping every one the session has made.
     pub fn submit(&self, turn: u64, cwd: &Path, session_dir: &Path, files: Vec<String>) {
+        self.submit_windowed(turn, 0, cwd, session_dir, files)
+    }
+
+    /// Queue a checkpoint, dropping refs older than `keep_from_turn`.
+    ///
+    /// The floor arrives from the session because the window is measured in user
+    /// instructions and this worker only sees turn numbers.
+    pub fn submit_windowed(
+        &self,
+        turn: u64,
+        keep_from_turn: u64,
+        cwd: &Path,
+        session_dir: &Path,
+        files: Vec<String>,
+    ) {
         let Some(jobs) = &self.jobs else {
             return;
         };
@@ -127,6 +149,7 @@ impl CheckpointWorker {
         if jobs
             .send(Job {
                 turn,
+                keep_from_turn,
                 cwd: cwd.to_path_buf(),
                 session_dir: session_dir.to_path_buf(),
                 files,
@@ -220,6 +243,7 @@ fn run_job(job: Job) -> CheckpointOutcome {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::gitckpt::GitCheckpoints::open(&job.cwd).commit_prepared(
             job.turn,
+            job.keep_from_turn,
             &job.session_dir,
             job.files,
         )

@@ -122,38 +122,70 @@ change, not a schedule.
   JSON, so a newline there is already escaped — a test pins that, because it is
   JSON encoding rather than the escaper that keeps that path safe.
 
-- [x] **Session storage is now bounded at 10 turns.** The previous entry correctly
-  diagnosed this as a retention policy rather than leaked rows, and left the
-  decision open. The decision: keep the ten most recent turns for `/rewind` and drop
-  the rest, because ten turns undoes a wrong direction and nothing older is worth
-  paying to keep.
+- [x] **Session storage is bounded at the last 10 user instructions.**
+  The previous entry correctly diagnosed this as a retention policy rather than leaked
+  rows, and left the decision open. The decision: keep everything back to the start of
+  the tenth-newest instruction, drop the rest.
 
-  Measured on a copy of a real session (2372 turns, 96.9 MiB, 4849 chunks):
-  `prune_to_last(10)` dropped 2362 turns, took the chunk count 4849 → 751, and left
-  the newest turn's 751 messages loading intact. The file stayed at 96.9 MiB until
-  `Database::compact()` ran, which brought it to **7.7 MiB — 8% of before**.
+  **The first implementation used the wrong unit and had to be redone.** It bounded
+  *snapshot turns* at ten. A turn is one model round trip — `commit_turn` runs after
+  every assistant message in the tool loop — so on the real 2372-turn session that
+  covered roughly **one-seventieth of a single instruction**. Measured, on that
+  session: 32 instructions across 2372 turns, ~74 turns each. Ten turns kept the
+  newest sliver of one instruction and discarded the rest of the window the user
+  asked for.
 
-  Two findings worth keeping, because both were surprises:
+  The unit is now a user instruction, recognised as a `User` message with no
+  `tool_call_id` that is neither a compaction summary nor a runtime diagnostic — the
+  same rule the audit trail uses. `Session` records the turn each instruction starts
+  on, and every pruning path takes its floor from that list, so one instruction's
+  dozens of turns survive or fall together and a rewind lands on a real instruction
+  boundary instead of mid-loop.
+
+  Measured on a copy of that session, at both units:
+
+  | window | snapshots kept | MiB | share |
+  |---|---|---|---|
+  | 10 turns (wrong unit) | 10 | 7.7 | 8% |
+  | 10 instructions (asked for) | 777 | 28.6 | 30% |
+
+  The instruction window keeps ~77× more history than the turn window, which is what
+  the original number was silently costing.
+
+  Three findings worth keeping, because each one misled a first attempt:
   - **Pruning without compaction saves nothing.** redb holds the file's high-water
     mark, so `vacuum` reclaiming chunks is invisible on disk until compaction. Both
-    steps are required.
+    steps are required, which is why `compact_file` exists and why compaction needs
+    an exclusive handle (drop the store, clear the `Weak` cache entry, reopen).
   - **A synthetic test proved the opposite of the truth.** The first version of
     `prune_vacates_chunks_only_the_dropped_turns_referenced` used a growing prefix
     and measured 21 → 21 chunks, because the newest snapshot references *every*
     message in its list. Chunks only become reclaimable when the newest context is
     genuinely smaller than the old ones — which in practice is compaction's doing.
     The test was rewritten around that shape, and says so.
+  - **A probe that assumed contexts hold all prior instructions was wrong too.** A
+    real session held at most four instructions in any single snapshot, because
+    compaction had already rewritten them away. Instruction boundaries cannot be
+    recovered by inspecting contexts; they have to be recorded.
 
-  Applied to all three stores that grew, with one shared constant so they cannot
-  drift: `SnapshotStore::prune_to_last` + `compact_file` (messages),
-  `FileSnapshots::prune_before` (per-file versions and their blobs),
-  and expired `refs/feather/.../turn-N` refs in `gitckpt`. Each keeps the live
-  pointer and the newest N turns; none of them can prune the turn resume reads.
+  The boundary list is persisted in the snapshot store's own `instruction_turns`
+  table, so a resume keeps its window. Two tests pin the parts that would silently
+  regress: `one_instruction_spanning_many_turns_is_not_cut_in_half` (counting turns
+  instead of instructions fails it) and `the_rewind_window_survives_a_reopen`
+  (dropping the persistence fails it — the earlier looser version of that test
+  passed with persistence deliberately broken, so the bound was tightened until it
+  failed).
 
-  Deliberately not done: no age- or byte-based horizon, only turn count. Turns are
-  the unit the user asked for and the unit `/rewind` speaks. If ten turns of fat
-  tool output ever grow too large, the ceiling is context size, not snapshot
-  count — a different problem with a different fix.
+  Applied to all three stores that grew, sharing `rewind_floor()`: message snapshots
+  (`prune_before` + `compact_file`), per-file versions and their content-addressed
+  blobs (`FileSnapshots::prune_before`), and expired `refs/feather/.../turn-N` refs
+  in `gitckpt`. Each also keeps the turn the live pointer names, because resume reads
+  that pointer and pruning it would turn a rewind into a corrupt session.
+
+  Deliberately not done: no age- or byte-based horizon, only instruction count.
+  Instructions are the unit `/rewind` speaks. If ten instructions of fat tool output
+  ever get too large, the ceiling is context size, which is a different problem with
+  a different fix.
 - [ ] **`session.commit` costs ~29 ms per turn.** The slowest write path in the
   bench. Part of it is `flush_audit`'s durable commit and part the
   `file_ops(&self.messages)` scan over the whole history each turn. Worth

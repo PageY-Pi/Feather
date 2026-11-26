@@ -25,6 +25,15 @@ const SNAPSHOTS: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("sn
 /// not the maximum turn.
 const META: TableDefinition<'static, &str, u64> = TableDefinition::new("meta");
 const CURRENT_TURN_KEY: &str = "current_turn";
+/// Durable turn index of every user instruction, oldest first.
+///
+/// Rewind is bounded in *instructions*, but a snapshot turn is one model round trip
+/// and one instruction spans dozens of them. The mapping has to survive a reopen, or
+/// a resumed session would lose its horizon and start growing without bound again.
+/// Keyed by position in the list, valued by snapshot turn, so appending is a keyed
+/// insert rather than a whole-list rewrite.
+const INSTRUCTION_TURNS: TableDefinition<'static, u64, u64> =
+    TableDefinition::new("instruction_turns");
 /// Number of messages `snapshot_reusing` had to serialize, returned to the caller.
 ///
 /// The point of the reuse hint is that a commit costs the changed suffix, not the
@@ -168,6 +177,7 @@ impl SnapshotStore {
             txn.open_table(CHUNKS)?;
             txn.open_table(SNAPSHOTS)?;
             txn.open_table(META)?;
+            txn.open_table(INSTRUCTION_TURNS)?;
         }
         txn.commit()?;
         snapshot_cache()
@@ -380,6 +390,46 @@ impl SnapshotStore {
     /// session restores the current context and not a stale future turn.
     /// Falls back to `latest_turn()` for stores written before the pointer
     /// existed.
+    /// Turns at which the surviving user instructions began, oldest first.
+    ///
+    /// Persisted so a reopened session keeps its rewind horizon. Without this a resume
+    /// starts with an empty list and the store grows unbounded again — the bug this
+    /// whole mechanism exists to fix, reintroduced silently on the resume path.
+    pub fn instruction_turns(&self) -> Result<Vec<u64>, SnapshotError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(INSTRUCTION_TURNS)?;
+        let mut out = Vec::new();
+        for row in table.range::<u64>(..)? {
+            let (_, v) = row?;
+            out.push(v.value());
+        }
+        Ok(out)
+    }
+
+    /// Replace the persisted instruction boundary list.
+    ///
+    /// Truncating and rewriting rather than diffing: the list is at most a few dozen
+    /// entries, and a wholesale write cannot leave a half-updated boundary list behind
+    /// if the process dies mid-call.
+    pub fn set_instruction_turns(&self, turns: &[u64]) -> Result<(), SnapshotError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(INSTRUCTION_TURNS)?;
+            let existing: Vec<u64> = table
+                .range::<u64>(..)?
+                .filter_map(|row| row.ok().map(|(k, _)| k.value()))
+                .collect();
+            for key in existing {
+                table.remove(key)?;
+            }
+            for (index, turn) in turns.iter().enumerate() {
+                table.insert(index as u64, *turn)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn current_turn(&self) -> Result<u64, SnapshotError> {
         let txn = self.db.begin_read()?;
         let meta = txn.open_table(META)?;
@@ -462,41 +512,29 @@ impl SnapshotStore {
         Ok((stored, referenced))
     }
 
-    /// Keep only the newest `keep` turns, and never fewer than the live one.
+    /// Drop every snapshot older than `keep_from_turn`.
     ///
-    /// Sessions used to keep every turn forever, which is what unlimited `/rewind`
-    /// costs and why a real profile reached 878 MB of snapshots: each snapshot
-    /// stores the *full* message list, so the history holds one copy of the
-    /// conversation per turn. Ten turns is enough to undo a wrong direction
-    /// without paying for a session's entire past.
+    /// A snapshot turn is one model round trip, so "keep the newest N turns" is the
+    /// wrong knob — it was tried and measured wrong. One user instruction spans dozens
+    /// of turns, so a turn horizon keeps a sliver of a single instruction and throws
+    /// away the window the user was promised. There is deliberately no `prune_to_last`
+    /// for that reason: the only supported unit is an instruction.
+    /// `Session` records the turn each instruction starts on and passes that floor
+    /// here, which cuts on a real instruction boundary rather than mid-loop.
     ///
-    /// Two invariants, both load-bearing:
-    /// - the turn `current_turn()` points at is always kept, even if it is older
-    ///   than the horizon. Resuming reads that pointer, so pruning it would turn a
-    ///   rewind into a corrupt session.
-    /// - pruning removes snapshot *records* only. Chunks are left for
-    ///   [`Self::vacuum`], because a chunk shared with a surviving turn is still
-    ///   live and only the referenced-set knows which.
-    pub fn prune_to_last(&self, keep: u64) -> Result<usize, SnapshotError> {
-        let keep = keep.max(1);
+    /// The live turn is always kept even when it sits outside the window: resume
+    /// reads that pointer, so pruning it would corrupt the session.
+    pub fn prune_before(&self, keep_from_turn: u64) -> Result<usize, SnapshotError> {
         let live = self.current_turn()?;
-        let turns: Vec<u64> = {
+        let doomed: Vec<u64> = {
             let rd = self.db.begin_read()?;
             let snaps = rd.open_table(SNAPSHOTS)?;
             snaps
-                .range::<u64>(..)?
+                .range::<u64>(..keep_from_turn)?
                 .filter_map(|row| row.ok().map(|(k, _)| k.value()))
+                .filter(|turn| *turn != live)
                 .collect()
         };
-        if turns.len() as u64 <= keep {
-            return Ok(0);
-        }
-        // The newest `keep` turns, plus the pointed-at turn wherever it sits.
-        let horizon = turns[turns.len() - keep as usize];
-        let doomed: Vec<u64> = turns
-            .into_iter()
-            .filter(|t| *t < horizon && *t != live)
-            .collect();
         if doomed.is_empty() {
             return Ok(0);
         }
@@ -508,16 +546,16 @@ impl SnapshotStore {
             }
         }
         txn.commit()?;
-        // The point of pruning is disk, and redb only returns freed pages when the
-        // chunks go too — otherwise every pruned turn's messages stay resident
-        // forever, still reachable-by-nothing but still on the file.
+        // Freed pages are not disk until the chunks go and the file is compacted;
+        // see `compact_file`. Vacuum here, compaction is the caller's step because
+        // it needs an exclusive handle.
         self.vacuum()?;
         Ok(doomed.len())
     }
 
     /// Return freed pages to the filesystem.
     ///
-    /// `prune_to_last` removes rows and `vacuum` drops the now-unreferenced
+    /// `prune_before` removes rows and `vacuum` drops the now-unreferenced
     /// chunks, but redb keeps the file's high-water mark: measured on a real
     /// 2372-turn session, pruning to 10 turns took the chunk count from 4849 to
     /// 751 while the file stayed at 96.9 MiB. Compaction brought it to 7.7 MiB.
@@ -840,7 +878,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.list().unwrap().len(), 20);
-        let dropped = store.prune_to_last(10).unwrap();
+        let dropped = store.prune_before(11).unwrap();
         assert_eq!(dropped, 10, "half the turns should go");
         let left: Vec<u64> = store.list().unwrap().iter().map(|(t, _, _)| *t).collect();
         assert_eq!(left, (11..=20).collect::<Vec<u64>>(), "newest ten survive");
@@ -867,7 +905,7 @@ mod tests {
         }
         // Rewound to turn 3, which is far outside a ten-turn horizon.
         store.set_current(3).unwrap();
-        store.prune_to_last(10).unwrap();
+        store.prune_before(11).unwrap();
         let left: Vec<u64> = store.list().unwrap().iter().map(|(t, _, _)| *t).collect();
         assert!(
             left.contains(&3),
@@ -904,7 +942,7 @@ mod tests {
                 .unwrap();
         }
         let (stored_before, _) = store.chunk_census().unwrap();
-        let dropped = store.prune_to_last(10).unwrap();
+        let dropped = store.prune_before(11).unwrap();
         assert_eq!(dropped, 10);
         let (stored_after, referenced) = store.chunk_census().unwrap();
         assert!(

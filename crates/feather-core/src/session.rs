@@ -63,6 +63,15 @@ pub struct Session {
     /// wrong snapshot, because every reused entry is re-verified by hash.
     snapshot_chunks: SnapshotChunks,
     turn: u64,
+    /// Snapshot turn at which each user instruction began, oldest first.
+    ///
+    /// `turn` counts model round trips, not instructions — `commit_turn` runs once
+    /// per assistant message, so one user prompt spans dozens of turns (measured on
+    /// a real session: 2372 turns for 32 instructions, ~74 each). "Rewind ten
+    /// instructions" therefore cannot be turn arithmetic; it needs one marker per
+    /// instruction. This records the turn each instruction's snapshot lands on, so
+    /// the horizon is an index into this list rather than a subtraction.
+    instruction_turns: Vec<u64>,
     created_ms: u64,
     first_prompt: String,
     /// Audit rows pushed since the last turn commit, in push order.
@@ -109,12 +118,14 @@ pub enum SessionError {
 /// discovered at all come from `list_sessions`, which re-registers any row whose
 /// directory still exists, so this value trades freshness — never existence.
 const CATALOG_REFRESH_MS: u64 = 60_000;
-/// How many turns `/rewind` can reach back.
+/// How many user instructions `/rewind` can reach back.
 ///
-/// Each snapshot stores the full message list, so this is really "how many copies
-/// of the conversation do we keep". Ten is enough to undo a wrong direction; the
-/// 2372-turn measurement behind the number is on [`Session::prune_rewind_history`].
-pub const REWIND_HORIZON_TURNS: u64 = 10;
+/// Instructions, not snapshot turns. One instruction spans dozens of turns because
+/// `commit_turn` runs after every assistant message in the tool loop — a real
+/// session measured 2372 turns for 32 instructions, so a ten-*turn* horizon covered
+/// well under a single instruction. Ten instructions is the stated requirement:
+/// enough to undo a wrong direction.
+pub const REWIND_HORIZON_INSTRUCTIONS: usize = 10;
 /// One-line note for a repaired context. It rides [`Session::notes`], which is
 /// flushed to the UI as a Notice on the next committed turn — user-visible,
 /// never fed back to the model — so a repaired session is not silently
@@ -163,6 +174,7 @@ impl Session {
             checkpoints: Some(crate::checkpoint_worker::CheckpointWorker::start()),
             snapshots: Some(snapshots),
             snapshot_chunks: SnapshotChunks::default(),
+            instruction_turns: Vec::new(),
             turn: 0,
             created_ms: now,
             first_prompt: String::new(),
@@ -206,6 +218,7 @@ impl Session {
             checkpoints: None,
             snapshots: None,
             snapshot_chunks: SnapshotChunks::default(),
+            instruction_turns: Vec::new(),
             turn: 0,
             created_ms: crate::message::now_millis(),
             first_prompt: String::new(),
@@ -296,6 +309,10 @@ impl Session {
         // the session is usable instead of bricked.
         let mut notes = Vec::new();
         let repaired = crate::compaction::repair_tool_pairs(&mut messages);
+        // Instruction boundaries are persisted in the snapshot store (see
+        // `SnapshotStore::instruction_turns`), so a resumed session keeps exactly the
+        // window it had instead of guessing one from message roles.
+        let instruction_turns = snapshots.instruction_turns().unwrap_or_default();
         if repaired > 0 {
             notes.push(repaired_context_diagnostic(repaired, "resume"));
         }
@@ -324,6 +341,7 @@ impl Session {
             checkpoints: Some(crate::checkpoint_worker::CheckpointWorker::start()),
             snapshots: Some(snapshots),
             snapshot_chunks: SnapshotChunks::default(),
+            instruction_turns,
             turn,
             created_ms: meta.created_ms,
             first_prompt,
@@ -473,6 +491,18 @@ impl Session {
     /// Append a message to the linear list and the raw redb audit history.
     pub fn push(&mut self, msg: Message) -> Result<(), SessionError> {
         let message_hash = crate::message::json_hash(&msg)?;
+        // A new user instruction opens a new rewind window. A tool result is also
+        // User-role, so `tool_call_id` is what distinguishes them; a compaction
+        // summary arrives as a User message but is not something the user asked for.
+        let starts_instruction = msg.role == crate::message::Role::User
+            && msg.tool_call_id.is_none()
+            && !msg.text().starts_with("## Conversation summary")
+            && !msg.text().starts_with("<feather-runtime-diagnostic>");
+        if starts_instruction {
+            // The snapshot that will describe this instruction is committed at the
+            // *end* of the turn it starts, so record the turn it will land on.
+            self.instruction_turns.push(self.turn + 1);
+        }
         if let Some((store, id)) = &self.child_store {
             store
                 .push_message(id, self.child_seq, &msg)
@@ -593,7 +623,13 @@ impl Session {
         };
         self.runtime_diagnostics.extend(path_diagnostics);
         if let Some(worker) = self.checkpoints.as_ref() {
-            worker.submit(next_turn, &self.cwd, &self.dir, accepted);
+            worker.submit_windowed(
+                next_turn,
+                self.rewind_floor(),
+                &self.cwd,
+                &self.dir,
+                accepted,
+            );
         }
         // Collect outcomes from earlier turns. A failure is reported once, on
         // the turn that follows it.
@@ -626,14 +662,14 @@ impl Session {
             }
         }
         file_snapshots.commit(next_turn)?;
-        // Same horizon as the message snapshots: a file version from outside the
-        // rewind window can no longer be restored, so it is only disk. Kept next to
-        // the commit so the two cannot drift apart.
-        if next_turn > REWIND_HORIZON_TURNS {
-            let oldest = next_turn - REWIND_HORIZON_TURNS;
+        // Same window as the message snapshots, in the same unit: a file version from
+        // before the oldest kept instruction can no longer be restored, so it is only
+        // disk. Derived from the same list so the two cannot drift apart.
+        let file_floor = self.rewind_floor();
+        if file_floor > 0 {
             // Best-effort: a fat checkpoint file is a maintenance problem, and the
             // turn is already durable by this point.
-            let _ = file_snapshots.prune_before(oldest);
+            let _ = file_snapshots.prune_before(file_floor);
         }
         // Reuse the chunk keys the previous snapshot already stored for the
         // unchanged prefix. `message_hashes` is maintained incrementally by
@@ -663,25 +699,52 @@ impl Session {
         Ok(self.turn)
     }
 
-    /// Bound how far `/rewind` can go, by dropping snapshots older than the horizon.
+    /// Bound `/rewind` to the last [`REWIND_HORIZON_INSTRUCTIONS`] instructions.
     ///
-    /// Every snapshot stores the *full* message list, so a session used to keep one
-    /// copy of its whole conversation per turn — one real session reached 96.9 MiB
-    /// across 2372 turns. Pruning to ten turns and compacting measured 96.9 MiB ->
-    /// 7.7 MiB on a copy of that session, with the newest turn's 751 messages still
-    /// loading intact. Ten is the user's stated horizon: enough to undo a wrong
-    /// direction, not enough to keep paying for a session's entire past.
+    /// The unit is a user instruction, not a snapshot turn. `commit_turn` runs after
+    /// every assistant message in the tool loop, so one instruction spans dozens of
+    /// turns — measured on a real session, 2372 turns for 32 instructions (~74 each).
+    /// Bounding `turn` directly therefore kept well under one instruction's worth of
+    /// history, which is why this works from `instruction_turns` instead.
     ///
-    /// Runs only when the horizon is actually crossed, so the common turn costs one
-    /// integer compare. Failures are reported as a note and otherwise ignored: the
-    /// turn is already durably committed by this point, and a fat file is a
+    /// The cut is the first snapshot at or after the *eleventh*-newest instruction,
+    /// so everything back to the start of the tenth-newest instruction survives and
+    /// a rewind to it lands on a real instruction boundary rather than mid-loop.
+    ///
+    /// Every snapshot stores the full message list, so this is what keeps a session
+    /// from holding one copy of its conversation per round trip. Failures are notes,
+    /// not errors: the turn is already durably committed and a fat file is a
     /// maintenance problem, not a broken session.
+    /// Oldest snapshot turn the rewind window may restore to, or `0` when unbounded.
+    ///
+    /// One helper so the three stores that prune cannot disagree about the window.
+    /// `0` means "nothing to prune yet", which every pruning path treats as a no-op.
+    fn rewind_floor(&self) -> u64 {
+        if self.instruction_turns.len() <= REWIND_HORIZON_INSTRUCTIONS {
+            return 0;
+        }
+        self.instruction_turns[self.instruction_turns.len() - REWIND_HORIZON_INSTRUCTIONS]
+    }
+
     fn prune_rewind_history(&mut self) {
-        if self.turn <= REWIND_HORIZON_TURNS {
+        let keep_from_turn = self.rewind_floor();
+        if keep_from_turn == 0 {
             return;
         }
+        let keep_from_index = self.instruction_turns.len() - REWIND_HORIZON_INSTRUCTIONS;
+        // Drop the instruction records that fell out of the window so this list does
+        // not grow for the life of the session either.
+        self.instruction_turns.drain(..keep_from_index);
+        // Persist the trimmed list so a reopen sees the same window. Failure is not
+        // fatal — it only costs the horizon on the next resume — so it is a note.
+        if let Some(store) = self.snapshots.as_ref() {
+            if let Err(e) = store.set_instruction_turns(&self.instruction_turns) {
+                self.notes
+                    .push(format!("rewind window not saved for the next resume ({e})"));
+            }
+        }
         let pruned = match self.snapshots.as_ref() {
-            Some(store) => match store.prune_to_last(REWIND_HORIZON_TURNS) {
+            Some(store) => match store.prune_before(keep_from_turn) {
                 Ok(0) => return,
                 Ok(n) => n,
                 Err(e) => {
