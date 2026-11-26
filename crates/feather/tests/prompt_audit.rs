@@ -415,6 +415,14 @@ fn every_prompt_rule_has_a_behavioural_scenario() {
     );
 }
 
+/// The audit above runs on a hand-written table; this runs it on the descriptions a
+/// model actually reads.
+///
+/// It was written without `#[test]`, so it never ran — `cargo test` compiled it and
+/// reported nothing, and the `function ... is never used` warning was the only trace.
+/// A disabled test is worse than no test: the file reads as if the live descriptions
+/// are covered.
+#[test]
 fn the_live_tool_descriptions_reference_only_real_tools() {
     let names = registry_tools();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
