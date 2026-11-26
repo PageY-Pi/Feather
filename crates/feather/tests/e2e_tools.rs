@@ -40,6 +40,7 @@ fn registry(root: &Path, anchor_home: &Path) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     reg.add(Arc::new(ReadTool {
         store: store.clone(),
+        images: false,
     }))
     .add(Arc::new(WriteTool {
         store: store.clone(),

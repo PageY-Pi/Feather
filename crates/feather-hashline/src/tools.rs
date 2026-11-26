@@ -72,6 +72,44 @@ fn parse_anchor(v: &Value, key: &str) -> Result<Anchor, ToolOutcome> {
 /// whether a line "looks like a path".
 const FILE_HEADER: &str = "file: ";
 
+/// The most image bytes `read` will attach.
+///
+/// A byte cap, not a pixel cap, because decoding to measure pixels costs ~560 ms on
+/// the tool path and this crate has no decoder. 4 MiB matches `mentions::MAX_IMAGE_BYTES`
+/// so a picture readable by one path is not silently unreadable by the other.
+const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Minimal base64 (RFC 4648, padded).
+///
+/// Duplicated rather than shared because the two existing copies live in
+/// `feather::mentions` and the GUI, and `feather` depends on this crate — sharing would
+/// invert that. Twelve lines of bit shuffling are cheaper than a new dependency.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Name the edited file in the first output line, then the diff body.
 fn with_file_header(path: &std::path::Path, body: String) -> String {
     format!("{FILE_HEADER}{}\n{body}", path.display())
@@ -110,6 +148,20 @@ fn engine_out(res: Result<String, EngineError>) -> ToolOutcome {
 // ---------------------------------------------------------------------------
 pub struct ReadTool {
     pub store: Arc<AnchorStore>,
+    /// Whether a picture should come back as an image block instead of an error.
+    ///
+    /// Off by default. A text-only model cannot use a picture, and sending one spends
+    /// money to learn that; the caller turns this on from `models::accepts_images`.
+    /// Keeping it a field rather than a global means a subagent running on a different
+    /// model cannot accidentally inherit the parent's vision setting.
+    pub images: bool,
+}
+
+impl ReadTool {
+    /// A reader that returns pictures as image blocks.
+    pub fn with_images(store: Arc<AnchorStore>, images: bool) -> Self {
+        Self { store, images }
+    }
 }
 
 impl AgentTool for ReadTool {
@@ -126,7 +178,7 @@ impl AgentTool for ReadTool {
         "Read a text file as anchor rows `anchor│content` (5 lowercase letters). A 4-letter anchor predates this build — re-read. \
 Line numbers are not shown and are not accepted by edit tools; edit by anchor. \
 Page with offset (1-indexed) and limit; when output says truncated, continue from the hinted offset/limit. \
-Images are not readable: a picture has no lines, and it reaches you only when the user attaches it. \
+An image file (PNG/JPEG/GIF/WebP, up to 4 MiB) comes back as a picture you can see, not as rows — pass no offset or limit to get it. \
 Binary, directories, and UTF-16/32 text are rejected; an empty file returns one empty row you can replace to seed content."
     }
 
@@ -156,6 +208,42 @@ Binary, directories, and UTF-16/32 text are rejected; an empty file returns one 
             let p = crate::store::norm_key(std::path::Path::new(&path));
             if p.is_dir() {
                 return ToolOutcome::err("[E_IS_DIR] path is a directory, not a file");
+            }
+            // A picture cannot be served as anchor rows, so when the model can see
+            // images it comes back as an image block instead of the binary refusal
+            // below. The bytes are read here rather than in `store.read` because the
+            // store's job is anchors and text; an image has neither.
+            if self.images && offset.is_none() && limit.is_none() {
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        if let Some(media_type) = crate::image::media_type_of(&bytes) {
+                            if bytes.len() > MAX_IMAGE_BYTES {
+                                return ToolOutcome::err(format!(
+                                    "[E_IMAGE_TOO_LARGE] {} is {} bytes; the limit is {}",
+                                    p.display(),
+                                    bytes.len(),
+                                    MAX_IMAGE_BYTES
+                                ));
+                            }
+                            let mut outcome = ToolOutcome::ok(format!(
+                                "image {} ({media_type}, {} bytes, attached below)",
+                                p.display(),
+                                bytes.len()
+                            ));
+                            outcome
+                                .images
+                                .push((media_type.to_string(), base64(&bytes)));
+                            outcome.details = Some(serde_json::json!({
+                                "media_type": media_type,
+                                "bytes": bytes.len(),
+                            }));
+                            return outcome;
+                        }
+                    }
+                    // A missing or unreadable file falls through to the store, which
+                    // owns those error messages and words them better than this could.
+                    Err(_) => {}
+                }
             }
             match self.store.read(&p, offset, limit) {
                 Ok(rows) => {
@@ -604,6 +692,7 @@ pub fn hashline_tools(
     vec![
         Arc::new(ReadTool {
             store: store.clone(),
+            images: false,
         }),
         Arc::new(WriteTool {
             store: store.clone(),
@@ -639,6 +728,123 @@ mod tests {
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Smallest possible PNG header plus an IDAT — enough for the magic-byte sniff, and
+    /// deliberately not a *decodable* image: nothing here decodes, and a real picture
+    /// would only make the test slower without testing more.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde";
+
+    #[tokio::test]
+    async fn a_vision_capable_read_returns_the_picture_as_an_image() {
+        let dir = tmp("read-image");
+        let f = dir.join("shot.png");
+        std::fs::write(&f, PNG).unwrap();
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        let tool = ReadTool {
+            store,
+            images: true,
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = tool
+            .execute(serde_json::json!({ "path": f.to_str().unwrap() }), rx)
+            .await;
+
+        assert!(
+            !outcome.is_error,
+            "a readable picture is not an error: {}",
+            outcome.text
+        );
+        assert_eq!(
+            outcome.images.len(),
+            1,
+            "the picture must arrive as an image block, not as text"
+        );
+        let (media_type, data) = &outcome.images[0];
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            base64_decode(data),
+            PNG,
+            "the base64 payload must round-trip the exact bytes; a corrupt payload is a \
+             picture the model cannot see"
+        );
+        assert!(
+            outcome.text.contains("attached below"),
+            "the text must say the picture is separate: {}",
+            outcome.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_text_only_read_refuses_a_picture_with_a_useful_message() {
+        let dir = tmp("read-image-off");
+        let f = dir.join("shot.png");
+        std::fs::write(&f, PNG).unwrap();
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        let tool = ReadTool {
+            store,
+            images: false,
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = tool
+            .execute(serde_json::json!({ "path": f.to_str().unwrap() }), rx)
+            .await;
+
+        assert!(outcome.is_error, "a text-only model cannot read a picture");
+        assert!(
+            outcome.images.is_empty(),
+            "no image may be attached when the flag is off"
+        );
+        assert!(
+            outcome.text.contains("is an image"),
+            "the refusal must name the situation, not a byte-level symptom: {}",
+            outcome.text
+        );
+    }
+
+    /// A paged request must not return the whole picture: the caller asked for rows.
+    #[tokio::test]
+    async fn a_paged_read_of_a_picture_falls_through_to_the_binary_refusal() {
+        let dir = tmp("read-image-paged");
+        let f = dir.join("shot.png");
+        std::fs::write(&f, PNG).unwrap();
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        let tool = ReadTool {
+            store,
+            images: true,
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = tool
+            .execute(
+                serde_json::json!({ "path": f.to_str().unwrap(), "offset": 1 }),
+                rx,
+            )
+            .await;
+        assert!(
+            outcome.is_error,
+            "offset was given, so the caller wanted rows and a picture has none"
+        );
+    }
+
+    /// Decode for the round-trip assertion above. Asserting on a re-encode would pass
+    /// with a broken encoder that happens to be self-consistent.
+    fn base64_decode(text: &str) -> Vec<u8> {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for byte in text.bytes() {
+            let Some(v) = T.iter().position(|c| *c == byte) else {
+                continue;
+            };
+            acc = (acc << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        out
     }
 
     #[tokio::test]

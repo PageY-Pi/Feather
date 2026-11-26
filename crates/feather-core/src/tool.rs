@@ -20,6 +20,13 @@ pub struct ToolOutcome {
     /// Structured side-channel: for the TUI/telemetry, never sent to the LLM.
     #[serde(default)]
     pub details: Option<serde_json::Value>,
+    /// Images the model should see, as `(media_type, base64)` pairs.
+    ///
+    /// Empty for every existing tool, so this is purely additive. A tool that reads a
+    /// picture puts it here rather than in `text`, because base64 in a text block is
+    /// charged as text and tells the model nothing about the pixels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<(String, String)>,
 }
 
 impl ToolOutcome {
@@ -28,6 +35,7 @@ impl ToolOutcome {
             text: text.into(),
             is_error: false,
             details: None,
+            images: Vec::new(),
         }
     }
 
@@ -36,6 +44,7 @@ impl ToolOutcome {
             text: text.into(),
             is_error: true,
             details: None,
+            images: Vec::new(),
         }
     }
 }

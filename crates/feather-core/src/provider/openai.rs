@@ -120,11 +120,47 @@ impl OpenAiProvider {
                     }
                     out.push(msg);
                 }
-                Role::ToolResult => out.push(json!({
-                    "role": "tool",
-                    "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
-                    "content": m.text(),
-                })),
+                Role::ToolResult => {
+                    // A tool result may carry pictures. `role:"tool"` accepts a string
+                    // only, so the images cannot ride there; they are lifted out into the
+                    // following user message below, which is what pi does on this wire.
+                    // Text still goes in the tool message, because a gateway that ignores
+                    // the attachment would otherwise see an empty result.
+                    let images: Vec<&ContentBlock> = m
+                        .content
+                        .iter()
+                        .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                        .collect();
+                    let text = m.text();
+                    let text = if text.trim().is_empty() && !images.is_empty() {
+                        "(see attached image)".to_string()
+                    } else {
+                        text
+                    };
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+                        "content": text,
+                    }));
+                    if images.is_empty() {
+                        continue;
+                    }
+                    let mut blocks = vec![json!({
+                        "type": "text",
+                        "text": "Attached image(s) from tool result:",
+                    })];
+                    for block in images {
+                        if let ContentBlock::Image { media_type, data } = block {
+                            blocks.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": format!("data:{media_type};base64,{data}") },
+                            }));
+                        }
+                    }
+                    // A separate user message, not an extra block on the tool message:
+                    // OpenAI-compatible gateways reject an array in `role:"tool"`.
+                    out.push(json!({ "role": "user", "content": blocks }));
+                }
                 Role::System => {}
             }
         }

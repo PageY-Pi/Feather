@@ -295,9 +295,10 @@ impl AnchorStore {
         // can fall down either one: PNG data usually contains NUL and would report
         // `looks binary (NUL byte)`, while a short or truncated header has no NUL
         // and reports `is not valid UTF-8`. Both name a byte-level symptom and
-        // neither tells the caller the file is a picture. Every provider carries
-        // images as user-turn blocks and none can put one inside a tool result,
-        // which is why no tool can read one.
+        // neither tells the caller the file is a picture. `ReadTool` serves an image as
+        // an image block before reaching this point, so this refusal is what a caller
+        // gets when the model cannot see pictures (`ReadTool::images` false) or when the
+        // anchor store is used directly.
         if crate::image::is_image(path, &bytes) {
             return Err(EngineError::Binary(format!(
                 "{} is an image; images are attached by the user, not read as rows \

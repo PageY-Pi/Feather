@@ -152,7 +152,7 @@ impl AgentTool for BashTool {
                                 Some(note) => format!("{text}\n{note}"),
                                 None => text,
                             };
-                            ToolOutcome{text:format!("{text}\n[exit {}]",status.code().unwrap_or(-1)),is_error:!status.success(),details:None}
+                            ToolOutcome{text:format!("{text}\n[exit {}]",status.code().unwrap_or(-1)),is_error:!status.success(),details:None,images:Vec::new()}
                         },
                         Err(e)=>ToolOutcome::err(format!("bash: wait failed: {e}")),
                     },

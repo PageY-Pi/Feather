@@ -202,6 +202,10 @@ pub fn shrink_messages_to_tokens(messages: &mut Vec<Message>, budget: u64) {
                         text.chars().count()
                     }
                     ContentBlock::ToolCall(call) => call.arguments.to_string().chars().count(),
+                    // An image counts as nothing here on purpose. This loop elides the
+                    // largest block and `Image => return` cannot elide one, so counting
+                    // its base64 would make a big picture win the election and abort the
+                    // whole pass, leaving every other block untouched.
                     ContentBlock::Image { .. } => 0,
                 };
                 if largest.is_none_or(|(_, _, old)| len > old) {

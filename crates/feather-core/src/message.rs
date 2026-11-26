@@ -199,6 +199,31 @@ impl Message {
         }
     }
 
+    /// A tool result that carries images alongside its text.
+    ///
+    /// Separate from [`Message::tool_result`] on purpose: 49 call sites have no images
+    /// to pass, and changing that signature would churn all of them for nothing. An
+    /// empty `images` here is exactly the plain constructor, so the two cannot diverge.
+    ///
+    /// The blocks are ordered text-first because a result with no text at all reads as
+    /// empty to a model that ignores attachments, and every protocol that carries this
+    /// needs a text part to anchor the message.
+    pub fn tool_result_with_images(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        text: impl Into<String>,
+        is_error: bool,
+        images: Vec<(String, String)>,
+    ) -> Self {
+        let mut message = Self::tool_result(tool_call_id, tool_name, text, is_error);
+        for (media_type, data) in images {
+            message
+                .content
+                .push(ContentBlock::Image { media_type, data });
+        }
+        message
+    }
+
     /// The usual single text block can be borrowed. Multiple blocks keep the
     /// legacy newline joining semantics; only that case needs an allocation.
     pub fn text_cow(&self) -> std::borrow::Cow<'_, str> {

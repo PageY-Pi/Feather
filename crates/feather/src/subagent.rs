@@ -274,6 +274,11 @@ impl SubagentTool {
             .to_string();
         let mut context = self.context_window;
         let mut thinking = None;
+        // Read from the catalog entry already in hand rather than calling
+        // `accepts_images`, which would load the catalog a second time. That second
+        // load is ~0.5 s cold and lands inside the child's timeout window, which a
+        // deadline test measures as a missed deadline rather than as a slow lookup.
+        let mut accepts_images = true;
         if let Some(id) = requested {
             let Some(cat) = crate::models::load() else {
                 return ToolOutcome::err("subagent: model catalog unavailable");
@@ -301,6 +306,9 @@ impl SubagentTool {
             model = m.id.clone();
             // Same global-vs-model rule as the parent agent.
             context = crate::models::effective_context_window(self.context_window, Some(m));
+            // `m.input` is the same field `accepts_images` reads; taking it here
+            // avoids a second catalog load inside the child's deadline.
+            accepts_images = m.input.iter().any(|i| i == "image");
             if let Some(want) = args
                 .get("thinking")
                 .and_then(|v| v.as_str())
@@ -336,8 +344,13 @@ impl SubagentTool {
                 model: requested.unwrap_or(&self.model).to_string(),
                 base_url: None,
             }));
+        // The child's own model decides, not the parent's: a child on a text-only
+        // model would waste a request learning it cannot see the picture.
+        // The child's own catalog entry decided this above, not the parent's.
+        let child_images = accepts_images;
         all.add(Arc::new(ReadTool {
             store: anchors.clone(),
+            images: child_images,
         }))
         .add(Arc::new(WriteTool {
             store: anchors.clone(),
@@ -547,6 +560,7 @@ impl SubagentTool {
             text: receipt,
             is_error: error,
             details: Some(serde_json::json!({"id":id,"model":model})),
+            images: Vec::new(),
         }
     }
 }

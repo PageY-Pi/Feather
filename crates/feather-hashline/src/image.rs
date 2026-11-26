@@ -6,10 +6,11 @@
 //! `.dat` is still a picture, and a `.png` file holding text is not. Sniffing the
 //! magic bytes is what lets the error name the actual situation.
 //!
-//! Deliberately small. This is not a decoder: nothing here reads pixels, and the
-//! image itself never passes through this crate — providers carry images as
-//! base64 blocks on the *user* turn, and no provider can put one inside a tool
-//! result, which is why `read` cannot serve one.
+//! Deliberately small. This is not a decoder: nothing here reads pixels, and no
+//! resizing happens — `ReadTool` hands the bytes to the provider as-is. What this does
+//! decide is whether a file is a picture at all, which is what lets `read` return one as
+//! an image block instead of the binary refusal, and lets that refusal name the real
+//! situation when the model cannot see pictures.
 
 /// Leading bytes that identify a format the providers accept as an image block.
 ///

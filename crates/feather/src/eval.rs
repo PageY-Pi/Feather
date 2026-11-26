@@ -112,8 +112,12 @@ fn registry(root: &Path, anchor_home: &Path) -> ToolRegistry {
     let store = Arc::new(AnchorStore::new(anchor_home));
     let tasks = Arc::new(crate::tasks::TaskStore::open(anchor_home));
     let mut reg = ToolRegistry::new();
+    // Off in the offline eval harness: it drives a faux provider with no model catalog,
+    // so there is no capability to read, and an image block would only change transcripts
+    // these scenarios assert on.
     reg.add(Arc::new(ReadTool {
         store: store.clone(),
+        images: false,
     }))
     .add(Arc::new(WriteTool {
         store: store.clone(),

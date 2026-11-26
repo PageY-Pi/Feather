@@ -1018,11 +1018,12 @@ impl Agent {
                     outcomes.sort_by_key(|(offset, _)| *offset);
                     for (offset, outcome) in outcomes {
                         let call = &calls[index + offset];
-                        self.session.push(Message::tool_result(
+                        self.session.push(Message::tool_result_with_images(
                             call.id.clone(),
                             call.name.clone(),
                             outcome.text,
                             outcome.is_error,
+                            outcome.images,
                         ))?;
                     }
                     index = end;
@@ -1035,11 +1036,12 @@ impl Agent {
                         self.events.clone(),
                     )
                     .await;
-                    self.session.push(Message::tool_result(
+                    self.session.push(Message::tool_result_with_images(
                         call.id.clone(),
                         call.name.clone(),
                         outcome.text,
                         outcome.is_error,
+                        outcome.images,
                     ))?;
                     index += 1;
                 }

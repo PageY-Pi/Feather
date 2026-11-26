@@ -262,8 +262,14 @@ pub fn build_registry(
 ) -> ToolRegistry {
     let store = Arc::new(AnchorStore::new(anchor_home).with_snapshots(session_dir, root));
     let mut reg = ToolRegistry::new();
+    // A picture only comes back when the model can use one. `accepts_images` returns
+    // `None` for an unknown model, and `None` means "let it try": refusing on absent
+    // metadata would make the feature unreachable for every custom provider. The tool
+    // returns an image block either way — the gate is about spending, not correctness.
+    let images = crate::models::accepts_images(&settings.model) != Some(false);
     reg.add(Arc::new(ReadTool {
         store: store.clone(),
+        images,
     }))
     .add(Arc::new(WriteTool {
         store: store.clone(),
