@@ -182,8 +182,35 @@ and re-run after any tool change.
   needs a destination-mode field and 23 calls is too little data to prove the shape
   is right; the risk of guessing outweighs 247 tokens for now. Revisit when usage
   rises or a wrong-mode failure appears in the traffic.
-- [ ] **`subagent` failed 64 of 88 calls (72.7%).** Much worse than any hashline
-  tool. Not investigated.
+- [x] **`subagent` failed 64 of 88 calls (72.7%), investigated with
+  `--example subagent_failures`.** The causes split cleanly, and only 24 are the
+  tool surface's fault:
+
+  | cause | n | fixable by |
+  |---|---|---|
+  | timed out | 28 | the caller (deadline) |
+  | unknown model | 14 | surface |
+  | provider http/401/429 | 12 | network/auth |
+  | no credential | 5 | surface |
+  | `unsupported tool functions.read` | 5 | surface |
+
+  Fixed: the `functions.` prefix is now stripped from `tools` (5 failures were the
+  OpenAI namespace leaking into the argument, and the whole call was lost over
+  decoration); `unknown model` now ranks the configured models and names the
+  closest ids instead of dead-ending (14 failures, all near misses — `gpt-5.2`,
+  `gpt-5`, `sonnet`, `gpt-4o` — against a catalog the model had no way to read);
+  `no credential` now says which provider lacks a key. `model` and `timeoutMs`
+  gained descriptions. Cost: `subagent` went 111 → 202 tokens, +91 on every
+  request. Judged worth it because each failed call burns a whole turn, but it is
+  the most expensive tool definition after `bash` now.
+- [ ] **28 timeouts were self-inflicted, not the default.** Only 5 of 28 used the
+  300000 ms default; the rest set 45–180 s themselves (9 at 120 s, 4 at 180 s, 2 at
+  60 s). The schema now says real work needs minutes, but if timeouts persist the
+  next step is a floor on `timeoutMs` rather than more prose.
+- [ ] **A guessed model still costs a full round trip.** The ranking helps only
+  after the fact. If it keeps happening, the schema could make `model` an `enum` of
+  authenticated ids, built per request — at the cost of coupling the schema to
+  local credentials.
 - [x] **`not a live anchor` had a bug behind it, not just a cost.** The message
   blamed the model, but the anchor tools carry no `path`: `resolve_anchor` — how an
   edit finds its file — searched only the *resident* map cache (capped at 64

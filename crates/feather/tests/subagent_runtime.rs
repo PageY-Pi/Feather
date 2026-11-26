@@ -221,6 +221,36 @@ async fn child_tool_roundtrip_and_repeated_runs_are_recoverable_without_jsonl() 
     assert_no_jsonl(&temp.0);
 }
 
+/// A tool name decorated the way some providers send it must still resolve.
+///
+/// Five real calls sent `functions.read` / `functions.bash` — the OpenAI
+/// tool-call namespace leaking into the argument — and the whole subagent call
+/// was refused over the decoration, losing the work. This drives the real tool
+/// so the fix is proven on the path a caller takes, not just on the helper.
+#[tokio::test]
+async fn provider_decorated_tool_names_still_resolve() {
+    let temp = Temp::new();
+    let session = temp.0.join("session");
+    let child = tool(
+        &temp.0,
+        &session,
+        ProviderRef::Faux(FauxProvider::new(FauxScript::new().with_text("ok"))),
+    );
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let out = child
+        .execute(
+            serde_json::json!({"task":"decorated","tools":["functions.read","functions.bash"]}),
+            rx,
+        )
+        .await;
+    assert!(
+        !out.text.contains("unsupported tool"),
+        "a decorated tool name must not refuse the call: {}",
+        out.text
+    );
+    assert!(!out.is_error, "{}", out.text);
+}
+
 #[tokio::test]
 async fn concurrent_children_share_redb_without_id_or_anchor_collisions() {
     let temp = Temp::new();
