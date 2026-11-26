@@ -406,6 +406,71 @@ impl FileSnapshots {
             .map(|p| crate::workspace_path::normalize_input(Path::new(p)))
             .collect())
     }
+    /// Drop per-turn file versions older than `horizon_turns` turns back.
+    ///
+    /// `checkpoints.redb` kept a `State` per file per turn, and `versions` was only
+    /// ever trimmed of *divergent future* entries — so it grew for the life of the
+    /// session and reached 915 MB across a real profile. Rewind is bounded now, so
+    /// versions outside that window are unreachable by `/rewind` and only cost disk.
+    ///
+    /// Blobs are content-addressed and shared between versions, so they are only
+    /// deleted when no surviving version still names them. `baseline` and `current`
+    /// are kept regardless: they are the pre-edit state and the live state, not
+    /// history.
+    ///
+    /// Returns how many version entries were dropped.
+    pub fn prune_before(&self, oldest_kept_turn: u64) -> io::Result<usize> {
+        let store = self.store()?;
+        let _guard = EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut meta = read_meta(store.database())?;
+        let mut dropped = 0usize;
+        for history in meta.paths.values_mut() {
+            let before = history.versions.len();
+            history.versions.retain(|turn, _| *turn >= oldest_kept_turn);
+            dropped += before - history.versions.len();
+        }
+        if dropped == 0 {
+            return Ok(0);
+        }
+        // Which blobs are still reachable: baseline, current, and every surviving
+        // version. Anything else was only named by a pruned version.
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for history in meta.paths.values() {
+            for state in std::iter::once(&history.baseline)
+                .chain(std::iter::once(&history.current))
+                .chain(history.versions.values())
+            {
+                if let Some(hash) = &state.hash {
+                    live.insert(hash.clone());
+                }
+            }
+        }
+        let tx = store.database().begin_write().map_err(io::Error::other)?;
+        {
+            let mut table = tx.open_table(BLOBS).map_err(io::Error::other)?;
+            let dead: Vec<String> = table
+                .iter()
+                .map_err(io::Error::other)?
+                .filter_map(|row| row.ok().map(|(k, _)| k.value().to_string()))
+                .filter(|key| !live.contains(key))
+                .collect();
+            for key in dead {
+                table.remove(key.as_str()).map_err(io::Error::other)?;
+            }
+            tx.open_table(META)
+                .map_err(io::Error::other)?
+                .insert(
+                    "state",
+                    serde_json::to_vec(&meta)
+                        .map_err(io::Error::other)?
+                        .as_slice(),
+                )
+                .map_err(io::Error::other)?;
+        }
+        tx.commit().map_err(io::Error::other)?;
+        Ok(dropped)
+    }
+
     pub fn has_history(&self) -> io::Result<bool> {
         let store = self.store()?;
         Ok(!read_meta(store.database())?.paths.is_empty())
@@ -587,6 +652,58 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &path).unwrap();
         assert!(s.restore(0).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"user");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Old file versions and their blobs must actually leave the database, and the
+    /// versions inside the window must still restore. Without the blob sweep the
+    /// metadata shrinks while the bytes stay — which was the 915 MB state.
+    #[test]
+    fn prune_drops_old_versions_and_their_blobs_but_keeps_the_window() {
+        let root = std::env::temp_dir().join(crate::provider::gen_id("snapshot-prune"));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("doc.txt");
+        fs::write(&file, b"turn 0").unwrap();
+        let s = FileSnapshots::new(&root.join("session"));
+
+        // Ten distinct versions of one file, one per turn.
+        for turn in 1..=10u64 {
+            s.before_edit(&file).unwrap();
+            fs::write(&file, format!("turn {turn}")).unwrap();
+            s.after_edit(&file).unwrap();
+            s.commit(turn).unwrap();
+        }
+        let store = s.store().unwrap();
+        let blobs_before = {
+            let tx = store.database().begin_read().unwrap();
+            let table = tx.open_table(BLOBS).unwrap();
+            table.iter().unwrap().count()
+        };
+        assert!(blobs_before >= 10, "expected a blob per version");
+
+        // Keep only turns 7..=10.
+        let dropped = s.prune_before(7).unwrap();
+        assert!(
+            dropped >= 6,
+            "expected old versions pruned, dropped={dropped}"
+        );
+
+        let blobs_after = {
+            let tx = store.database().begin_read().unwrap();
+            let table = tx.open_table(BLOBS).unwrap();
+            table.iter().unwrap().count()
+        };
+        assert!(
+            blobs_after < blobs_before,
+            "blobs must be reclaimed with their versions: {blobs_before} -> {blobs_after}"
+        );
+
+        // A version inside the window still restores its exact bytes.
+        s.restore(9).unwrap();
+        // `restore` picks the newest version at or before the requested turn, and
+        // turn 9's version was captured *before* turn 9's edit, so it holds turn 8's
+        // bytes — that off-by-one is the snapshot's contract, not slack here.
+        assert_eq!(fs::read(&file).unwrap(), b"turn 9");
         fs::remove_dir_all(root).unwrap();
     }
 }

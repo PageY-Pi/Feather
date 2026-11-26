@@ -457,6 +457,26 @@ impl GitCheckpoints {
                 files: added,
             },
         );
+        // Rewind is bounded, so checkpoints past the horizon are unreachable and
+        // only accumulate git objects. Drop them from the map and delete their refs;
+        // the objects themselves are left to git's own gc, which is the only safe
+        // way to remove them (a ref deletion alone does not free anything).
+        const HORIZON: u64 = crate::session::REWIND_HORIZON_TURNS;
+        if turn > HORIZON {
+            let oldest = turn - HORIZON;
+            let expired: Vec<u64> = map.keys().copied().filter(|t| *t < oldest).collect();
+            for stale in expired {
+                let ref_name = format!(
+                    "refs/feather/{}/turn-{stale}",
+                    session_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy())
+                        .unwrap_or_default()
+                );
+                let _ = Self::run(&repo, &["update-ref", "-d", &ref_name]);
+                map.remove(&stale);
+            }
+        }
         Self::save_map(session_dir, &map)?;
         Ok(CheckpointReport {
             hash: Some(hash),

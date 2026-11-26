@@ -462,6 +462,89 @@ impl SnapshotStore {
         Ok((stored, referenced))
     }
 
+    /// Keep only the newest `keep` turns, and never fewer than the live one.
+    ///
+    /// Sessions used to keep every turn forever, which is what unlimited `/rewind`
+    /// costs and why a real profile reached 878 MB of snapshots: each snapshot
+    /// stores the *full* message list, so the history holds one copy of the
+    /// conversation per turn. Ten turns is enough to undo a wrong direction
+    /// without paying for a session's entire past.
+    ///
+    /// Two invariants, both load-bearing:
+    /// - the turn `current_turn()` points at is always kept, even if it is older
+    ///   than the horizon. Resuming reads that pointer, so pruning it would turn a
+    ///   rewind into a corrupt session.
+    /// - pruning removes snapshot *records* only. Chunks are left for
+    ///   [`Self::vacuum`], because a chunk shared with a surviving turn is still
+    ///   live and only the referenced-set knows which.
+    pub fn prune_to_last(&self, keep: u64) -> Result<usize, SnapshotError> {
+        let keep = keep.max(1);
+        let live = self.current_turn()?;
+        let turns: Vec<u64> = {
+            let rd = self.db.begin_read()?;
+            let snaps = rd.open_table(SNAPSHOTS)?;
+            snaps
+                .range::<u64>(..)?
+                .filter_map(|row| row.ok().map(|(k, _)| k.value()))
+                .collect()
+        };
+        if turns.len() as u64 <= keep {
+            return Ok(0);
+        }
+        // The newest `keep` turns, plus the pointed-at turn wherever it sits.
+        let horizon = turns[turns.len() - keep as usize];
+        let doomed: Vec<u64> = turns
+            .into_iter()
+            .filter(|t| *t < horizon && *t != live)
+            .collect();
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut snaps = txn.open_table(SNAPSHOTS)?;
+            for turn in &doomed {
+                snaps.remove(*turn)?;
+            }
+        }
+        txn.commit()?;
+        // The point of pruning is disk, and redb only returns freed pages when the
+        // chunks go too — otherwise every pruned turn's messages stay resident
+        // forever, still reachable-by-nothing but still on the file.
+        self.vacuum()?;
+        Ok(doomed.len())
+    }
+
+    /// Return freed pages to the filesystem.
+    ///
+    /// `prune_to_last` removes rows and `vacuum` drops the now-unreferenced
+    /// chunks, but redb keeps the file's high-water mark: measured on a real
+    /// 2372-turn session, pruning to 10 turns took the chunk count from 4849 to
+    /// 751 while the file stayed at 96.9 MiB. Compaction brought it to 7.7 MiB.
+    /// Without this step pruning is bookkeeping only.
+    ///
+    /// This needs a *unique* handle — `redb` returns `TransactionInProgress`
+    /// otherwise — and the process-wide `Weak` cache plus any live `Session`
+    /// clone both hold one. So the caller drops its store first and passes the
+    /// path; the cache is cleared so a later `open` rebuilds from the compacted
+    /// file rather than a stale handle.
+    pub fn compact_file(path: &Path) -> Result<bool, SnapshotError> {
+        snapshot_cache()
+            .lock()
+            .map_err(|e| SnapshotError::Db(e.to_string()))?
+            // Same key shape `open` inserts: canonical directory + file name.
+            .remove(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        let mut db = crate::database::open(path)?;
+        match db.compact() {
+            Ok(did) => Ok(did),
+            // Losing the shrink is not worth failing a turn over: the rows are
+            // already gone, so the session is correct and only the file is fat.
+            // It gets another chance next time the horizon is crossed.
+            Err(redb::CompactionError::TransactionInProgress) => Ok(false),
+            Err(e) => Err(SnapshotError::Db(e.to_string())),
+        }
+    }
+
     /// Best-effort compaction of chunks not referenced by any snapshot.
     pub fn vacuum(&self) -> Result<usize, SnapshotError> {
         let txn = self.db.begin_write()?;
@@ -743,6 +826,95 @@ mod tests {
         let removed = store.vacuum().unwrap();
         assert!(removed >= 1);
         assert_eq!(store.load(1).unwrap(), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning keeps the newest `keep` turns and drops the rest.
+    #[test]
+    fn prune_keeps_the_newest_turns_and_drops_the_rest() {
+        let dir = tmpdir("prune");
+        let store = SnapshotStore::open(&dir).unwrap();
+        for turn in 1..=20u64 {
+            store
+                .snapshot(turn, &[Message::user_text(format!("turn {turn}"))])
+                .unwrap();
+        }
+        assert_eq!(store.list().unwrap().len(), 20);
+        let dropped = store.prune_to_last(10).unwrap();
+        assert_eq!(dropped, 10, "half the turns should go");
+        let left: Vec<u64> = store.list().unwrap().iter().map(|(t, _, _)| *t).collect();
+        assert_eq!(left, (11..=20).collect::<Vec<u64>>(), "newest ten survive");
+        // The surviving turns must still load, or pruning destroyed rewind.
+        // Compared by text: `user_text` stamps `now_millis()`, so two structurally
+        // identical messages are never `==`.
+        let loaded = store.load(20).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].text(), "turn 20");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewind leaves the live pointer *behind* the newest snapshot. Pruning must
+    /// honour the pointer, or resuming after a rewind loads a turn that is gone and
+    /// the session is corrupt.
+    #[test]
+    fn prune_never_drops_the_turn_the_session_is_actually_on() {
+        let dir = tmpdir("prunelive");
+        let store = SnapshotStore::open(&dir).unwrap();
+        for turn in 1..=20u64 {
+            store
+                .snapshot(turn, &[Message::user_text(format!("turn {turn}"))])
+                .unwrap();
+        }
+        // Rewound to turn 3, which is far outside a ten-turn horizon.
+        store.set_current(3).unwrap();
+        store.prune_to_last(10).unwrap();
+        let left: Vec<u64> = store.list().unwrap().iter().map(|(t, _, _)| *t).collect();
+        assert!(
+            left.contains(&3),
+            "the live turn must survive pruning, left={left:?}"
+        );
+        assert_eq!(store.current_turn().unwrap(), 3);
+        let live = store.load(3).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].text(), "turn 3", "and it must still be readable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning also drops the chunks only the pruned turns referenced — that is
+    /// where the bytes are. A chunk shared with a survivor must stay.
+    #[test]
+    fn prune_vacates_chunks_only_the_dropped_turns_referenced() {
+        let dir = tmpdir("prunechunks");
+        let store = SnapshotStore::open(&dir).unwrap();
+        // The shape that makes chunks reclaimable is the one compaction produces:
+        // an old turn's message list contains text that the newest list no longer
+        // has. A growing *prefix* would keep every chunk reachable from the newest
+        // turn and prove nothing — measured 21 -> 21 when this test first did that.
+        let mut shared = Message::user_text("shared preamble");
+        for turn in 1..=20u64 {
+            shared.timestamp = 0;
+            store
+                .snapshot(
+                    turn,
+                    &[
+                        shared.clone(),
+                        Message::user_text(format!("only turn {turn}")),
+                    ],
+                )
+                .unwrap();
+        }
+        let (stored_before, _) = store.chunk_census().unwrap();
+        let dropped = store.prune_to_last(10).unwrap();
+        assert_eq!(dropped, 10);
+        let (stored_after, referenced) = store.chunk_census().unwrap();
+        assert!(
+            stored_after < stored_before,
+            "chunks only old turns used must go: {stored_before} -> {stored_after}"
+        );
+        assert_eq!(stored_after, referenced, "nothing unreferenced may remain");
+        // The shared preamble is referenced by every survivor, so it stays.
+        let survivor = store.load(20).unwrap();
+        assert_eq!(survivor.first().unwrap().text(), "shared preamble");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

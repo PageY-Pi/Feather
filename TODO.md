@@ -122,21 +122,38 @@ change, not a schedule.
   JSON, so a newline there is already escaped — a test pins that, because it is
   JSON encoding rather than the escaper that keeps that path safe.
 
-- [ ] **Session storage grows without bound, and it is history, not garbage.**
-  Measured on the real profile: 3.3 GB across 31 sessions, of which
-  `snapshots/` is 878 MB and `checkpoints.redb` 915 MB. The obvious hypothesis
-  was that `SnapshotStore::vacuum` was never called — it has no production
-  caller, only a test — so a measurement example (`examples/snapshot_gc.rs`,
-  plus `SnapshotStore::chunk_census`) was written to size the prize. It found
-  **zero dead chunks across 30 stores**: every stored chunk is referenced. The
-  growth is the retention policy itself, not leaked rows. Both stores delete
-  only *divergent-future* turns (`snapshot.rs` removes turns above the one being
-  written; `gitckpt.rs` drops refs above `turn`), and nothing ever ages out old
-  turns. That is a deliberate trade — unlimited `/rewind` — so the fix is a
-  policy decision, not a cleanup: pick a horizon (turns, bytes, or age), drop
-  older snapshots *and* their now-unreferenced chunks, and run `vacuum` on that
-  threshold. Until then the example stays as the ruler, so the claim can be
-  re-checked rather than re-argued.
+- [x] **Session storage is now bounded at 10 turns.** The previous entry correctly
+  diagnosed this as a retention policy rather than leaked rows, and left the
+  decision open. The decision: keep the ten most recent turns for `/rewind` and drop
+  the rest, because ten turns undoes a wrong direction and nothing older is worth
+  paying to keep.
+
+  Measured on a copy of a real session (2372 turns, 96.9 MiB, 4849 chunks):
+  `prune_to_last(10)` dropped 2362 turns, took the chunk count 4849 → 751, and left
+  the newest turn's 751 messages loading intact. The file stayed at 96.9 MiB until
+  `Database::compact()` ran, which brought it to **7.7 MiB — 8% of before**.
+
+  Two findings worth keeping, because both were surprises:
+  - **Pruning without compaction saves nothing.** redb holds the file's high-water
+    mark, so `vacuum` reclaiming chunks is invisible on disk until compaction. Both
+    steps are required.
+  - **A synthetic test proved the opposite of the truth.** The first version of
+    `prune_vacates_chunks_only_the_dropped_turns_referenced` used a growing prefix
+    and measured 21 → 21 chunks, because the newest snapshot references *every*
+    message in its list. Chunks only become reclaimable when the newest context is
+    genuinely smaller than the old ones — which in practice is compaction's doing.
+    The test was rewritten around that shape, and says so.
+
+  Applied to all three stores that grew, with one shared constant so they cannot
+  drift: `SnapshotStore::prune_to_last` + `compact_file` (messages),
+  `FileSnapshots::prune_before` (per-file versions and their blobs),
+  and expired `refs/feather/.../turn-N` refs in `gitckpt`. Each keeps the live
+  pointer and the newest N turns; none of them can prune the turn resume reads.
+
+  Deliberately not done: no age- or byte-based horizon, only turn count. Turns are
+  the unit the user asked for and the unit `/rewind` speaks. If ten turns of fat
+  tool output ever grow too large, the ceiling is context size, not snapshot
+  count — a different problem with a different fix.
 - [ ] **`session.commit` costs ~29 ms per turn.** The slowest write path in the
   bench. Part of it is `flush_audit`'s durable commit and part the
   `file_ops(&self.messages)` scan over the whole history each turn. Worth

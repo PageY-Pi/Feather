@@ -109,6 +109,12 @@ pub enum SessionError {
 /// discovered at all come from `list_sessions`, which re-registers any row whose
 /// directory still exists, so this value trades freshness — never existence.
 const CATALOG_REFRESH_MS: u64 = 60_000;
+/// How many turns `/rewind` can reach back.
+///
+/// Each snapshot stores the full message list, so this is really "how many copies
+/// of the conversation do we keep". Ten is enough to undo a wrong direction; the
+/// 2372-turn measurement behind the number is on [`Session::prune_rewind_history`].
+pub const REWIND_HORIZON_TURNS: u64 = 10;
 /// One-line note for a repaired context. It rides [`Session::notes`], which is
 /// flushed to the UI as a Notice on the next committed turn — user-visible,
 /// never fed back to the model — so a repaired session is not silently
@@ -620,6 +626,15 @@ impl Session {
             }
         }
         file_snapshots.commit(next_turn)?;
+        // Same horizon as the message snapshots: a file version from outside the
+        // rewind window can no longer be restored, so it is only disk. Kept next to
+        // the commit so the two cannot drift apart.
+        if next_turn > REWIND_HORIZON_TURNS {
+            let oldest = next_turn - REWIND_HORIZON_TURNS;
+            // Best-effort: a fat checkpoint file is a maintenance problem, and the
+            // turn is already durable by this point.
+            let _ = file_snapshots.prune_before(oldest);
+        }
         // Reuse the chunk keys the previous snapshot already stored for the
         // unchanged prefix. `message_hashes` is maintained incrementally by
         // `push`, so this costs one hash comparison per message instead of a
@@ -635,6 +650,7 @@ impl Session {
         if let Some(store) = self.store.as_ref() {
             store.touch(crate::message::now_millis(), &self.first_prompt)?;
         }
+        self.prune_rewind_history();
         // Only refresh the catalog when this turn moved the session's
         // "recently active" position by a meaningful amount. The first prompt
         // already registered the session (so it is discoverable mid-turn), and
@@ -645,6 +661,62 @@ impl Session {
             previous == 0 || now.saturating_sub(previous) >= CATALOG_REFRESH_MS
         })?;
         Ok(self.turn)
+    }
+
+    /// Bound how far `/rewind` can go, by dropping snapshots older than the horizon.
+    ///
+    /// Every snapshot stores the *full* message list, so a session used to keep one
+    /// copy of its whole conversation per turn — one real session reached 96.9 MiB
+    /// across 2372 turns. Pruning to ten turns and compacting measured 96.9 MiB ->
+    /// 7.7 MiB on a copy of that session, with the newest turn's 751 messages still
+    /// loading intact. Ten is the user's stated horizon: enough to undo a wrong
+    /// direction, not enough to keep paying for a session's entire past.
+    ///
+    /// Runs only when the horizon is actually crossed, so the common turn costs one
+    /// integer compare. Failures are reported as a note and otherwise ignored: the
+    /// turn is already durably committed by this point, and a fat file is a
+    /// maintenance problem, not a broken session.
+    fn prune_rewind_history(&mut self) {
+        if self.turn <= REWIND_HORIZON_TURNS {
+            return;
+        }
+        let pruned = match self.snapshots.as_ref() {
+            Some(store) => match store.prune_to_last(REWIND_HORIZON_TURNS) {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(e) => {
+                    self.notes.push(format!(
+                        "rewind history not pruned ({e}); the session still works, \
+                         its snapshot file is just larger than it needs to be"
+                    ));
+                    return;
+                }
+            },
+            None => return,
+        };
+        // Compaction needs an exclusive handle: this store clone and the
+        // process-wide cache both hold one, so drop ours and clear the cache entry
+        // before compacting, then reopen for the rest of the session.
+        let path = self.snapshots.as_ref().map(|s| s.path().to_path_buf());
+        let Some(path) = path else { return };
+        self.snapshots = None;
+        let compacted = crate::snapshot::SnapshotStore::compact_file(&path);
+        match crate::snapshot::SnapshotStore::open(path.parent().unwrap_or(&path)) {
+            Ok(store) => self.snapshots = Some(store),
+            Err(e) => {
+                // Without a store, rewind and resume both stop working — that is
+                // worse than a fat file, so say so rather than continuing quietly.
+                self.notes.push(format!(
+                    "rewind history is unavailable until this session is reopened: {e}"
+                ));
+                return;
+            }
+        }
+        if let Err(e) = compacted {
+            self.notes.push(format!(
+                "dropped {pruned} old rewind snapshots but could not shrink the file ({e})"
+            ));
+        }
     }
 
     /// Restore the message list from `turn` AND the working directory from
