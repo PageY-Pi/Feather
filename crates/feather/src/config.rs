@@ -79,8 +79,12 @@ impl From<&CompactionToml> for feather_core::compaction::CompactionSettings {
 #[serde(default)]
 pub struct SubagentSettings {
     pub enabled: bool,
-    /// hard cap: one subagent per task, no nesting beyond depth 1
-    pub max_depth: u32,
+    // No `max_depth`. The field existed, defaulted to 1, and was read by nothing: a
+    // settings key that changes no behaviour is worse than an absent one, because a
+    // user who raises it is entitled to think nesting became possible. No nesting is a
+    // structural property, not a tunable — `subagent` builds its child registry from
+    // an explicit tool list and refuses to inherit `subagent`, `subagent_models` or
+    // `agent` from the parent, so a child cannot spawn a child at any depth setting.
     pub max_tokens: u32,
     #[serde(default = "default_true")]
     pub use_policy: bool,
@@ -115,7 +119,6 @@ impl Default for Settings {
             subagent: SubagentSettings {
                 enabled: true,
                 use_policy: true,
-                max_depth: 1,
                 max_tokens: 4096,
             },
             bash: BashSettings {

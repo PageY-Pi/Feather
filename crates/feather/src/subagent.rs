@@ -9,6 +9,11 @@ use feather_core::{
 use feather_hashline::{store::AnchorStore, tools::*};
 use std::{path::PathBuf, sync::Arc};
 
+/// Tools a child may never inherit from its parent, so a subagent cannot spawn a
+/// subagent. This is the whole nesting rule: there is no depth counter and no
+/// `max_depth` setting (the setting existed, defaulted to 1, and nothing read it).
+const INHERIT_EXCLUDED: &[&str] = &["subagent", "subagent_models", "agent"];
+
 pub struct SubagentTool {
     pub provider: Arc<ProviderRef>,
     pub root: PathBuf,
@@ -361,9 +366,7 @@ impl SubagentTool {
         // isolated to this child, never sharing editable handles with siblings.
         if let Some(parent) = &self.inherited_tools {
             for name in parent.names() {
-                if all.get(name).is_none()
-                    && !matches!(name, "subagent" | "subagent_models" | "agent")
-                {
+                if all.get(name).is_none() && !INHERIT_EXCLUDED.contains(&name) {
                     all.add(parent.get(name).unwrap());
                 }
             }
@@ -620,6 +623,23 @@ impl AgentTool for SubagentModelsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child may never spawn another child. `subagent.max_depth` used to be offered
+    /// as the knob for this and nothing read it; the real mechanism is
+    /// `INHERIT_EXCLUDED`, applied when the child registry is built. Pin the list,
+    /// because deleting one name from it silently enables nesting.
+    #[test]
+    fn a_child_cannot_inherit_the_tools_that_spawn_children() {
+        for name in ["subagent", "subagent_models", "agent"] {
+            assert!(
+                INHERIT_EXCLUDED.contains(&name),
+                "{name} must stay excluded from inherited tools"
+            );
+        }
+        // The settings type carries no depth knob any more: the only way to express
+        // "allow nesting" is to add one, which is the point.
+        let _ = crate::config::SubagentSettings::default();
+    }
 
     #[test]
     fn provider_namespacing_in_tool_names_is_stripped() {
