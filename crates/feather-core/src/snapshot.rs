@@ -437,6 +437,31 @@ impl SnapshotStore {
         Ok(out)
     }
 
+    /// Count stored chunks and how many of them any snapshot still references.
+    ///
+    /// The gap is what [`Self::vacuum`] would delete. Exposed because that gap was
+    /// invisible: `vacuum` had no caller outside a test, so a session's store only
+    /// ever grew, and there was no way to see by how much without rewriting the
+    /// database. Returns `(stored, referenced)`.
+    pub fn chunk_census(&self) -> Result<(usize, usize), SnapshotError> {
+        let rd = self.db.begin_read()?;
+        let stored = {
+            let chunks = rd.open_table(CHUNKS)?;
+            chunks.iter()?.filter(|row| row.is_ok()).count()
+        };
+        let referenced = {
+            let snaps = rd.open_table(SNAPSHOTS)?;
+            let mut set = std::collections::HashSet::new();
+            for row in snaps.range::<u64>(..)? {
+                let (_, v) = row?;
+                let rec: SnapshotRecord = serde_json::from_slice(v.value())?;
+                set.extend(rec.chunk_keys);
+            }
+            set.len()
+        };
+        Ok((stored, referenced))
+    }
+
     /// Best-effort compaction of chunks not referenced by any snapshot.
     pub fn vacuum(&self) -> Result<usize, SnapshotError> {
         let txn = self.db.begin_write()?;
@@ -718,6 +743,37 @@ mod tests {
         let removed = store.vacuum().unwrap();
         assert!(removed >= 1);
         assert_eq!(store.load(1).unwrap(), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `chunk_census` must agree with `vacuum`: the gap it reports is exactly what
+    /// vacuum deletes. Reporting a gap that vacuum then leaves behind would make
+    /// the measurement in `examples/snapshot_gc.rs` a lie.
+    #[test]
+    fn census_reports_exactly_what_vacuum_would_remove() {
+        let dir = tmpdir("census");
+        let store = SnapshotStore::open(&dir).unwrap();
+        let a = vec![Message::user_text("a")];
+        store.snapshot(1, &a).unwrap();
+        // Same turn overwritten: the "a" chunk is now unreferenced.
+        let b = vec![Message::user_text("b")];
+        store.snapshot(1, &b).unwrap();
+
+        let (stored, referenced) = store.chunk_census().unwrap();
+        assert_eq!(
+            stored - referenced,
+            1,
+            "one chunk should be unreferenced after the overwrite"
+        );
+        let removed = store.vacuum().unwrap();
+        assert_eq!(
+            removed,
+            stored - referenced,
+            "vacuum must remove exactly the gap the census reported"
+        );
+        let (stored_after, referenced_after) = store.chunk_census().unwrap();
+        assert_eq!(stored_after, referenced_after, "nothing dead after vacuum");
+        assert_eq!(store.load(1).unwrap(), b, "the live snapshot still loads");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

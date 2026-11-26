@@ -121,6 +121,28 @@ change, not a schedule.
   messages with 20% adversarial content. Tool-call arguments are serialised as
   JSON, so a newline there is already escaped — a test pins that, because it is
   JSON encoding rather than the escaper that keeps that path safe.
+
+- [ ] **Session storage grows without bound, and it is history, not garbage.**
+  Measured on the real profile: 3.3 GB across 31 sessions, of which
+  `snapshots/` is 878 MB and `checkpoints.redb` 915 MB. The obvious hypothesis
+  was that `SnapshotStore::vacuum` was never called — it has no production
+  caller, only a test — so a measurement example (`examples/snapshot_gc.rs`,
+  plus `SnapshotStore::chunk_census`) was written to size the prize. It found
+  **zero dead chunks across 30 stores**: every stored chunk is referenced. The
+  growth is the retention policy itself, not leaked rows. Both stores delete
+  only *divergent-future* turns (`snapshot.rs` removes turns above the one being
+  written; `gitckpt.rs` drops refs above `turn`), and nothing ever ages out old
+  turns. That is a deliberate trade — unlimited `/rewind` — so the fix is a
+  policy decision, not a cleanup: pick a horizon (turns, bytes, or age), drop
+  older snapshots *and* their now-unreferenced chunks, and run `vacuum` on that
+  threshold. Until then the example stays as the ruler, so the claim can be
+  re-checked rather than re-argued.
+- [ ] **`session.commit` costs ~29 ms per turn.** The slowest write path in the
+  bench. Part of it is `flush_audit`'s durable commit and part the
+  `file_ops(&self.messages)` scan over the whole history each turn. Worth
+  profiling before changing: a faster commit that silently stops persisting
+  audit rows would be a correctness loss, and the bench invariant only checks
+  the message count.
 - [ ] **Evaluate persistent memory — leaning negative.** See the research note
   below. The short version: memory that stores *inferred judgments* inherits
   their errors and carries them across sessions with no expiry, while memory
