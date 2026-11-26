@@ -486,3 +486,80 @@ form the user controls.
 If something more is wanted later, extend the safe direction first: search the
 raw audit (`search_context`, above) beats storing a model's paraphrase of it,
 because the raw audit cannot be wrong — it is what actually happened.
+
+## RSI rounds — measured optimisation (2026-11-25)
+
+Instruction: scan the codebase, improve compute and memory, and stop when three
+consecutive rounds find nothing significant. Every entry below has a before and
+after number; anything that did not move was reverted rather than kept.
+
+### Round 1 — the turn boundary, 28.66 ms → 6.04 ms
+
+`crates/feather-bench` baseline put `session.commit` at **28,656,400 ns/op** with
+a 21,712 KiB peak. Three causes, each found by staging the call with
+`crates/feather/examples/commit_stages.rs` rather than by reading the code:
+
+- **A fresh `FileSnapshots` per turn.** Built inside `commit_turn`, so every turn
+  got its own `OnceLock` and reopened `checkpoints.redb` from cold: 10.06 ms cold
+  against 0.19 ms warm, confirmed with an `FEATHER_TRACE_OPEN` probe that logged
+  two cold opens followed by nothing but cache hits. The handle now lives on
+  `Session.file_snapshots`.
+- **A metadata write that stored nothing.** `FileSnapshots::commit` did a full
+  redb fsync to bump `meta.turn`, which is only read by the version `retain` loop
+  — and that loop has nothing to retain when `meta.paths` is empty. Returning
+  early took 10.05 → 8.08 ms.
+- **A duplicate audit touch.** `flush_audit` already commits
+  `(modified_ms, first_prompt)` in the same transaction as the turn's rows, and
+  `commit_turn` wrote them a second time. `Session.touched_this_turn` makes the
+  second write conditional: one fsync per turn instead of two, 8.08 → 6.04 ms.
+
+`tokenizer.message` 148.8 → 127 ns and `cache.plan` 140,100 → 133,200 came along
+for free. Peak RSS 21,712 → 10,728 KiB.
+
+One test was deliberately strengthened: the reopen test asserted
+`turns.len() <= 45` and **passed with persistence removed**. Tightening it to
+`<= 12` made it fail as it should.
+
+### Round 2 — the directory walk, `grep.anchor` 9.02 ms → 6.08 ms
+
+`grep::collect_files` classified every entry with `Path::is_dir()`, which follows
+links and always stats, and it allocated a `String` for every file name whether
+or not a glob was set. `DirEntry::file_type()` answers from the directory entry
+on Windows and from `d_type` on Linux, and the skip test can read the name as a
+`Cow<str>`.
+
+Guarded by `walk_descends_into_subdirectories_but_skips_ignored_and_hidden_ones`,
+which asserts the walk still recurses into a real subdirectory and still refuses
+`.hidden` and `target`. Verified failing first: forcing `is_dir = false` reports
+`the walk must recurse into a real subdirectory; got []`.
+
+### Round 2 — four things that measured flat, and were reverted
+
+Recording these matters as much as the wins, because each looked obviously right:
+
+- **`Durability::Eventual` on the per-turn snapshot.** A snapshot is a cache of
+  the conversation and the audit trail is the truth, so skipping the fsync should
+  be free. It changed nothing: `snapshot.full` 2,018,200 → 2,003,300 ns. The
+  2 ms is redb's own commit path, not the fsync.
+- **The same 2 ms is structural.** An empty one-row redb commit (`redb.commit`)
+  costs 1,966,500 ns against `snapshot.reuse`'s 1,981,300 ns for 409 messages.
+  Commit cost does not scale with content, so the only lever is *how many
+  commits happen*, not how fast one is.
+- **Testing the whole document before the per-line prefilter.** Removing what
+  looked like a redundant second scan made it *slower*: 6.08 → 6.17 ms. The regex
+  engine scans contiguous bytes more cheaply than a `strip_suffix` per line.
+- **Caching `FileSnapshots::tracked_paths`.** Warm redb reads measured **0.00 ms**
+  through the per-instance handle; there was nothing to cache.
+- **An incremental accumulator for `compaction::file_ops`.** It scans all messages
+  every turn, but at 1601 messages with real tool calls it costs **131 µs**
+  (`crates/feather/examples/file_ops_scale.rs`). O(n) with a tiny constant is not
+  a problem worth code.
+
+### Why the turn boundary stops here
+
+A turn now performs exactly two durable commits: the audit flush and the message
+snapshot. They live in different databases and each costs redb's ~2 ms floor, so
+6.04 ms is two floors plus ~2 ms of real work. Going lower means removing a
+commit, and both remaining ones are what makes a turn recoverable — the audit
+trail is the record of what happened and the snapshot is what makes resuming a
+96.9 MiB session cheap.

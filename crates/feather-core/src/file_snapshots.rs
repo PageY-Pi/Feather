@@ -273,9 +273,19 @@ impl FileSnapshots {
     /// Another session/user can legitimately change the disk between turns;
     /// conflicts are checked only before destructive restore, never here.
     pub fn commit(&self, turn: u64) -> io::Result<()> {
+        // No tracked paths means nothing to version: skip the durable write entirely.
+        //
+        // `commit` runs on every turn, and a write here is a full redb commit (fsync)
+        // whose only effect with an empty path map is bumping `meta.turn` — a field
+        // read solely by the `retain` below, which has nothing to retain. A session
+        // that never touched a tracked file therefore paid one fsync per turn to
+        // rewrite an empty JSON blob.
         let store = self.store()?;
         let _guard = EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut meta = read_meta(store.database())?;
+        if meta.paths.is_empty() {
+            return Ok(());
+        }
         for h in meta.paths.values_mut() {
             // A new prompt after rewind discards divergent future versions.
             h.versions.retain(|t, _| *t <= meta.turn);
@@ -704,6 +714,56 @@ mod tests {
         // turn 9's version was captured *before* turn 9's edit, so it holds turn 8's
         // bytes — that off-by-one is the snapshot's contract, not slack here.
         assert_eq!(fs::read(&file).unwrap(), b"turn 9");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An empty path map must not be written on every turn.
+    ///
+    /// `commit` runs once per turn and its write is a durable redb commit. With no
+    /// tracked paths the only field that changes is `meta.turn`, which nothing reads
+    /// except the version-retain loop — and that loop has nothing to retain. The
+    /// optimisation is only safe if a later `before_edit` still records state and a
+    /// later `commit` still versions it, so this asserts both halves.
+    #[test]
+    fn committing_with_no_tracked_paths_writes_nothing_and_stays_correct() {
+        let root = std::env::temp_dir().join(crate::provider::gen_id("snapshot-empty"));
+        fs::create_dir_all(&root).unwrap();
+        let s = FileSnapshots::new(&root.join("session"));
+
+        // Ten turns with nothing tracked: the early return is what keeps this cheap.
+        for turn in 1..=10u64 {
+            s.commit(turn).unwrap();
+        }
+        let store = s.store().unwrap();
+        let meta_turn = {
+            let db = store.database();
+            read_meta(db).unwrap().turn
+        };
+        assert_eq!(
+            meta_turn, 0,
+            "an empty commit must not persist a turn counter"
+        );
+
+        // The skipped writes must not have broken the real path: editing a file now
+        // still records a baseline, and committing still versions it.
+        let file = root.join("doc.txt");
+        fs::write(&file, b"v1").unwrap();
+        s.before_edit(&file).unwrap();
+        fs::write(&file, b"v2").unwrap();
+        s.after_edit(&file).unwrap();
+        s.commit(11).unwrap();
+
+        let meta = {
+            let db = store.database();
+            read_meta(db).unwrap()
+        };
+        assert_eq!(meta.turn, 11, "a non-empty commit must persist its turn");
+        assert!(
+            meta.paths
+                .values()
+                .any(|h| h.versions.keys().any(|t| *t == 11)),
+            "the tracked file must gain a version at turn 11"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
