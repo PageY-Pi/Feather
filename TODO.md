@@ -287,14 +287,23 @@ and re-run after any tool change.
   refuses before the image reaches the session, naming the model. Unknown models
   are not refused — a custom endpoint may accept images and the catalog has no
   opinion. Reverting the check reproduces `unwrap_err() on an Ok value`.
-- [ ] **The GUI cannot send an image at all.** `rpc::user_message` accepts an
-  `images` array and has tests for it, but nothing in `feather-gui` builds one:
-  no clipboard read, no drag-and-drop, no `@` mention expansion (`mentions::
-  message_from_mentions` is called only from `main.rs`, the CLI path). The
-  `app.clipboard.pasteImage` binding promised `alt+v` and had no arm in
-  `handle_action`, so it was removed rather than left silently inert. Real work
-  remains: read the clipboard image (or dropped file), base64 it, and populate
-  `images` on the request. That is a GUI feature, not a wiring bug.
+- [x] **The GUI can now paste and show images.** `alt+v` reads the Win32
+  clipboard (`CF_DIB`, 24- or 32-bit, top-down or bottom-up), re-encodes to PNG
+  once, and stages a removable chip; an image with no caption is a sendable
+  prompt. `rows_from_messages` now gates on attachments as well as text, so an
+  image-only turn survives a reload instead of disappearing. Measured cost for a
+  1 MP attachment: `image.base64` 196 µs, `image.decode` 1154 µs, `image.encode`
+  113 µs.
+- [ ] **Drag-and-drop is still missing.** Pasting works, but dropping a file onto
+  the window does nothing. `egui` reports dropped files in
+  `ctx.input(|i| i.raw.dropped_files)`, so the work is to read the path, reuse
+  `clipboard_image`'s decode, and stage it the same way `paste_image` does.
+- [ ] **A quad-at-a-time base64 decoder was measured and is slower.** The
+  obvious optimisation (index a `[u8; 4]`, one exact 3-byte store, no
+  per-character branch) ran 196 µs -> 435 µs, stable across six runs: the
+  bounds-checked writes cost more than the accumulator they replaced. Reverted,
+  and both the shipped function and the bench copy say so with the numbers. Do
+  not redo it without re-running `image.base64`.
 - [x] **A second dead binding, same shape as the first.** Worth noting how it was
   found: grepping for the action name across the whole crate returned exactly one
   hit — the binding table itself. Any action with no consumer outside
