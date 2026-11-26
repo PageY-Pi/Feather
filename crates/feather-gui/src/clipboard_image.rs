@@ -20,9 +20,16 @@ pub struct ClipboardImage {
     pub media_type: String,
     /// Base64, no data-URL prefix. The providers add that themselves.
     pub data: String,
-    /// Decoded pixel size, for the attachment chip and for tests.
+    /// The size of the image actually encoded (after the long-edge cap).
     pub width: u32,
     pub height: u32,
+    /// The clipboard's own size, when it differs from the encoded one.
+    ///
+    /// Present only when `MAX_LONG_EDGE` downscaled the paste. The notice tells the
+    /// user "1600x900, downscaled from 3840x2160", because silently handing back a
+    /// smaller image than they pasted is the kind of thing that turns into a bug
+    /// report about detail loss the code cannot explain.
+    pub downscaled_from: Option<(u32, u32)>,
 }
 
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
@@ -255,16 +262,22 @@ mod windows_clipboard {
         // thread right when the frame is already late.
         let mut buffer: image::RgbaImage = image::ImageBuffer::from_raw(width, height, rgba)
             .ok_or("clipboard image buffer size mismatch")?;
-        let (mut width, mut height) = (buffer.width(), buffer.height());
-        if width.max(height) > MAX_LONG_EDGE {
-            let scale = MAX_LONG_EDGE as f64 / width.max(height) as f64;
+        let source_size = (buffer.width(), buffer.height());
+        if source_size.0.max(source_size.1) > MAX_LONG_EDGE {
+            let long = source_size.0.max(source_size.1);
+            let scale = MAX_LONG_EDGE as f64 / long as f64;
             let (w, h) = (
-                ((width as f64 * scale).round() as u32).max(1),
-                ((height as f64 * scale).round() as u32).max(1),
+                ((source_size.0 as f64 * scale).round() as u32).max(1),
+                ((source_size.1 as f64 * scale).round() as u32).max(1),
             );
             buffer = image::imageops::resize(&buffer, w, h, image::imageops::FilterType::Triangle);
         }
-        (width, height) = (buffer.width(), buffer.height());
+        let (width, height) = (buffer.width(), buffer.height());
+        let downscaled_from = if (width, height) == source_size {
+            None
+        } else {
+            Some(source_size)
+        };
         let mut png = Vec::new();
         {
             use image::ImageEncoder;
@@ -283,6 +296,7 @@ mod windows_clipboard {
             data: base64(&png),
             width,
             height,
+            downscaled_from,
         })
     }
 }
@@ -318,6 +332,11 @@ mod tests {
         );
         // Aspect ratio preserved: 4000x500 -> 1568x196.
         assert_eq!(image.height, 196, "aspect ratio must be preserved");
+        assert_eq!(
+            image.downscaled_from,
+            Some((w, h)),
+            "the notice has to be able to say what the paste was reduced from"
+        );
         // And the reported size must match the bytes actually encoded: decode the
         // base64 back and read the PNG header, which is the only claim a provider sees.
         let png = tests_support::decode_base64(&image.data);
@@ -341,6 +360,10 @@ mod tests {
             .collect();
         let image = unsafe { windows_clipboard::encode_png(w, h, rgba) }.expect("encode");
         assert_eq!((image.width, image.height), (w, h));
+        assert_eq!(
+            image.downscaled_from, None,
+            "an image inside the cap must not claim it was downscaled"
+        );
     }
     #[test]
     fn base64_matches_the_rfc_vectors() {

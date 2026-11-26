@@ -2001,6 +2001,7 @@ fn a_staged_image_becomes_a_content_block_and_survives_reload() {
             data: "AAAA".into(),
             width: 2,
             height: 1,
+            downscaled_from: None,
         });
 
     // Sending moves the attachment into the message, not just the row.
@@ -2036,6 +2037,7 @@ fn an_image_without_any_text_still_sends() {
             data: "AAAA".into(),
             width: 1,
             height: 1,
+            downscaled_from: None,
         });
     assert!(
         !app.pending_images.is_empty(),
@@ -2165,6 +2167,7 @@ fn removing_a_chip_drops_only_that_attachment() {
                 data: "AAAA".into(),
                 width: w,
                 height: h,
+                downscaled_from: None,
             });
     }
     app.pending_images.remove(0);

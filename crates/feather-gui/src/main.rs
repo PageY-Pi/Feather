@@ -1079,11 +1079,18 @@ impl FeatherApp {
         match clipboard_image::read_image() {
             Some(image) => {
                 let (w, h) = (image.width, image.height);
+                // Say when the long-edge cap shrank the paste. Silently handing back a
+                // smaller picture than the one on the clipboard reads as detail loss
+                // the code never explained; naming the original size makes the cap
+                // visible at the moment it happens.
+                let note = match image.downscaled_from {
+                    Some((sw, sh)) => {
+                        format!("Attached clipboard image {w}x{h} (downscaled from {sw}x{sh})")
+                    }
+                    None => format!("Attached clipboard image {w}x{h}"),
+                };
                 self.pending_images.push(image);
-                self.rows.push(ChatRow::new(
-                    RowKind::Notice,
-                    format!("Attached clipboard image {w}x{h}"),
-                ));
+                self.rows.push(ChatRow::new(RowKind::Notice, note));
             }
             None => {
                 let reason = clipboard_image::last_error()
