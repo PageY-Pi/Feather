@@ -37,6 +37,18 @@ pub fn registry() -> Vec<Case> {
             run: tokenizer_message,
         },
         Case {
+            name: "image.base64",
+            run: image_base64_only,
+        },
+        Case {
+            name: "image.decode",
+            run: image_decode,
+        },
+        Case {
+            name: "image.encode",
+            run: image_encode,
+        },
+        Case {
             name: "cache.plan",
             run: cache_plan,
         },
@@ -205,6 +217,148 @@ fn snapshot_reuse(root: &std::path::Path, iterations: usize) -> Measurement {
             ),
         )
     })
+}
+
+/// Build a synthetic PNG of a given size, as raw bytes.
+///
+/// Not a solid colour: a solid image compresses to almost nothing, so base64 and
+/// decode cost would both be dominated by the tiny payload and the measurement
+/// would flatter the code. A gradient keeps the encoded size close to a real
+/// screenshot while staying deterministic.
+fn synthetic_png(width: u32, height: u32) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            rgba.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255]);
+        }
+    }
+    let mut png = Vec::new();
+    {
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+            .expect("encode synthetic png");
+    }
+    png
+}
+
+/// The attachment display path: base64 decode, then PNG decode.
+///
+/// This runs per visible row on every frame unless the texture is cached, which is
+/// exactly the claim `paint_row_image` makes. Measuring both halves separately
+/// says which one the cache is actually saving.
+fn image_base64_only(root: &std::path::Path, iterations: usize) -> Measurement {
+    let _ = root;
+    let png = synthetic_png(1024, 1024);
+    let b64 = feather_bench_base64(&png);
+    let oracle = png.len();
+    let mut sink = 0usize;
+    measure("image.base64", 8, iterations, || {
+        let bytes = feather_bench_base64_decode(&b64);
+        sink = bytes.len();
+        // Invariant: base64 decoding reproduces the original PNG byte length.
+        (
+            sink == oracle && sink > 0,
+            format!("png_bytes={sink} base64_len={}", b64.len()),
+        )
+    })
+}
+
+fn image_decode(root: &std::path::Path, iterations: usize) -> Measurement {
+    let _ = root;
+    // ~1 MP, in the range of a clipped screenshot.
+    let png = synthetic_png(1024, 1024);
+    let b64 = feather_bench_base64(&png);
+    let oracle = image::load_from_memory(&png)
+        .expect("oracle decode")
+        .to_rgba8();
+    let oracle_len = oracle.as_raw().len();
+    let mut sink = 0usize;
+    measure("image.decode", 8, iterations, || {
+        let bytes = feather_bench_base64_decode(&b64);
+        let decoded = image::load_from_memory(&bytes).expect("decode").to_rgba8();
+        sink = decoded.as_raw().len();
+        // Invariant: the decoded pixel buffer is exactly the oracle's size. A
+        // "faster" decoder that drops channels or resizes would fail here.
+        (
+            sink == oracle_len && sink > 0,
+            format!("rgba_bytes={sink} base64_len={}", b64.len()),
+        )
+    })
+}
+
+/// The attachment send path: base64 encoding of an already-PNG payload.
+fn image_encode(root: &std::path::Path, iterations: usize) -> Measurement {
+    let _ = root;
+    let png = synthetic_png(1024, 1024);
+    let oracle = feather_bench_base64(&png);
+    let oracle_len = oracle.len();
+    let mut sink = 0usize;
+    measure("image.encode", 16, iterations, || {
+        let encoded = feather_bench_base64(&png);
+        sink = encoded.len();
+        // Invariant: the encoded length matches an independent encoding. A
+        // vectorised encoder that mis-sizes output fails here.
+        (
+            sink == oracle_len && sink > 0,
+            format!("encoded_len={sink}"),
+        )
+    })
+}
+
+/// RFC 4648 base64, padded. Mirrors `clipboard_image::base64`.
+fn feather_bench_base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Mirrors `clipboard_image::decode_base64_for_display` (the shipped accumulator).
+/// Kept as a copy so the bench measures the shipped algorithm rather than a
+/// faster stand-in. It is deliberately not the quad variant: that rewrite measured
+/// slower (196 µs -> 435 µs on `image.base64`) and was reverted.
+fn feather_bench_base64_decode(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for b in text.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
 }
 
 /// Per-message token estimate, the inner loop of every request assembly.

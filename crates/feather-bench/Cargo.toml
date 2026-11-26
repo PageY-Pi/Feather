@@ -18,3 +18,6 @@ serde_json = { workspace = true }
 # Control case: a bare redb transaction, so the ruler can separate transaction
 # cost from serialisation cost instead of attributing both to the latter.
 redb = { workspace = true }
+# The image-attachment path: base64 decode plus PNG decode on every paint, unless
+# the texture is cached. Measuring it keeps the "cache it" claim checkable.
+image = { version = "0.25", default-features = false, features = ["png"] }

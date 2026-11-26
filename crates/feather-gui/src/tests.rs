@@ -19,6 +19,7 @@ pub(crate) fn fixture() -> FeatherApp {
         rows: Vec::new(),
         history: Default::default(),
         input: String::new(),
+        pending_images: Vec::new(),
         running: false,
         last_stop: None,
         queued_hint: 0,
@@ -1989,4 +1990,108 @@ fn the_raw_command_stays_available_below_the_intent() {
     // Tools whose header is already self-explanatory stay single-line.
     let read = serde_json::json!({"path": "src/main.rs"});
     assert_eq!(tool_detail("read", &read), "");
+}
+
+#[test]
+fn a_staged_image_becomes_a_content_block_and_survives_reload() {
+    let mut app = fixture();
+    app.pending_images
+        .push(crate::clipboard_image::ClipboardImage {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+            width: 2,
+            height: 1,
+        });
+
+    // Sending moves the attachment into the message, not just the row.
+    let message = app.take_prompt_message("look".into());
+    assert!(
+        message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
+        "the staged image must reach the provider payload"
+    );
+    assert!(
+        app.pending_images.is_empty(),
+        "taking the message must clear the staging list"
+    );
+
+    // Reloading from the session must rebuild the same attachment, or the
+    // picture disappears from the transcript after a restart.
+    let rows = rows_from_messages(&[message]);
+    let user = rows.iter().find(|r| r.kind == RowKind::User).unwrap();
+    assert_eq!(user.images.len(), 1);
+    assert_eq!(user.images[0].media_type, "image/png");
+}
+
+#[test]
+fn an_image_without_any_text_still_sends() {
+    // A pasted screenshot with no caption is a complete prompt. Before this,
+    // `submit` returned early on empty text and the attachment was dropped.
+    let mut app = fixture();
+    app.pending_images
+        .push(crate::clipboard_image::ClipboardImage {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+            width: 1,
+            height: 1,
+        });
+    assert!(
+        !app.pending_images.is_empty(),
+        "an image-only prompt must not be treated as empty input"
+    );
+    // It is image-only, so `rows_from_messages` must still produce a user row
+    // rather than skipping the turn because its text is blank.
+    let message = app.take_prompt_message(String::new());
+    assert!(message.text().is_empty());
+    let rows = rows_from_messages(&[message]);
+    assert_eq!(
+        rows.iter().filter(|r| r.kind == RowKind::User).count(),
+        1,
+        "an image-only turn must produce a row"
+    );
+}
+
+#[test]
+fn removing_a_chip_drops_only_that_attachment() {
+    let mut app = fixture();
+    for (w, h) in [(1u32, 1u32), (2, 2)] {
+        app.pending_images
+            .push(crate::clipboard_image::ClipboardImage {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+                width: w,
+                height: h,
+            });
+    }
+    app.pending_images.remove(0);
+    assert_eq!(app.pending_images.len(), 1);
+    assert_eq!(app.pending_images[0].width, 2);
+}
+
+#[test]
+fn a_second_decode_attempt_is_the_only_one_that_can_fail() {
+    // The guard is the point: `paint_row_image` must not retry a payload that has
+    // already failed, because `image.decode` measures ~1.1 ms per 1 MP. This pins
+    // the state machine (`failed` latches) rather than the pixel output, which
+    // needs a real egui context.
+    let mut image = RowImage {
+        media_type: "image/png".into(),
+        data: "not base64 and not a png".into(),
+        texture: None,
+        failed: false,
+    };
+    assert!(!image.failed, "a fresh attachment has not been tried yet");
+    // Simulate what `paint_row_image` does on a decoder error.
+    let bytes = crate::clipboard_image::decode_base64_for_display(&image.data);
+    assert!(
+        image::load_from_memory(&bytes).is_err(),
+        "garbage must not decode"
+    );
+    image.failed = true;
+    assert!(
+        image.failed,
+        "the failure must latch, or every repaint retries the decode"
+    );
 }

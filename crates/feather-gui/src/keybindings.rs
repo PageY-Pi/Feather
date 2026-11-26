@@ -210,12 +210,10 @@ pub const ACTIONS: &[(&str, &[&str])] = &[
     // pi: ctrl+z, no default on Windows
     ("app.suspend", &[]),
     ("app.editor.external", &["ctrl+g"]),
-    // No `app.clipboard.pasteImage`. pi binds it to alt+v, but the GUI has no
-    // image intake on any path: nothing here reads the clipboard, nothing builds
-    // the `images` array `rpc::user_message` accepts, and `handle_action` has no
-    // arm for it. A binding that silently does nothing is worse than an absent
-    // one, so the key is unbound until the intake exists. Images are reachable
-    // from the CLI via `@path/to.png` (see `mentions::expand_mentions`).
+    // pi: ctrl+v, alt+v on Windows — the GUI keeps ctrl+v for text and uses
+    // alt+v for an image, matching pi. `handle_action` has the arm, and
+    // `clipboard_image` is the intake that makes it real.
+    ("app.clipboard.pasteImage", &["alt+v"]),
     // -- sessions --
     ("app.session.new", &["ctrl+shift+n"]),
     ("app.session.tree", &[]),

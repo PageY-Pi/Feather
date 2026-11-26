@@ -20,7 +20,7 @@ fn render_notice(ui: &mut egui::Ui, row: &ChatRow) {
     ui.add(egui::Label::new(egui::RichText::new(&row.text).size(12.5).color(MUTED)).wrap());
 }
 /// A user prompt: a right-anchored bubble that hugs short single-line text.
-fn render_user(ui: &mut egui::Ui, row: &ChatRow) {
+fn render_user(ui: &mut egui::Ui, row: &mut ChatRow) {
     let max = (ui.available_width() * 0.82).min(650.0);
     let text_width = ui.fonts(|fonts| {
         fonts
@@ -51,6 +51,9 @@ fn render_user(ui: &mut egui::Ui, row: &ChatRow) {
                 // The bubble is right-anchored by its parent, but its
                 // contents are normal left-aligned paragraphs, not RTL.
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    for (index, image) in row.images.iter_mut().enumerate() {
+                        paint_row_image(ui, image, row.ui_key, index, bubble_width);
+                    }
                     ui.add(
                         egui::Label::new(egui::RichText::new(&row.text).size(15.5).color(TEXT))
                             .wrap(),
@@ -58,6 +61,73 @@ fn render_user(ui: &mut egui::Ui, row: &ChatRow) {
                 });
             });
     });
+}
+/// Draw one attached image inside the user bubble, decoding it on first paint.
+///
+/// The texture is cached on the `RowImage` itself: `render_user` runs for every
+/// visible row on every frame, and re-decoding a 4 MiB PNG each time would make
+/// scrolling a conversation with attachments unusable. `max_width` keeps a wide
+/// screenshot from forcing the bubble past its own maximum.
+fn paint_row_image(
+    ui: &mut egui::Ui,
+    image: &mut crate::RowImage,
+    row_key: u64,
+    index: usize,
+    max_width: f32,
+) {
+    // `!image.failed` keeps a corrupt payload from being decoded again every
+    // frame. `image.decode` costs ~1.1 ms at 1 MP, so retrying on each repaint
+    // would look like a frozen window rather than a broken image.
+    if image.texture.is_none() && !image.failed {
+        // Decode from the raw base64 payload. A failure here is not fatal: the row
+        // still shows its text, and the placeholder below says why.
+        let bytes = crate::clipboard_image::decode_base64_for_display(&image.data);
+        match image::load_from_memory(&bytes) {
+            Ok(decoded) => {
+                let rgba = decoded.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let texture = ui.ctx().load_texture(
+                    format!("row-{row_key}-image-{index}"),
+                    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+                    egui::TextureOptions::LINEAR,
+                );
+                image.texture = Some(texture);
+            }
+            Err(_) => image.failed = true,
+        }
+    }
+    match &image.texture {
+        Some(texture) => {
+            let size = texture.size_vec2();
+            let scale = (max_width / size.x).min(1.0);
+            let display = egui::vec2(size.x * scale, size.y * scale);
+            ui.add_space(4.0);
+            ui.add(
+                egui::Image::new(egui::load::SizedTexture::new(
+                    texture.id(),
+                    texture.size_vec2(),
+                ))
+                .fit_to_exact_size(display)
+                .rounding(10.0),
+            );
+            ui.add_space(4.0);
+        }
+        None => {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "[{} image could not be decoded]",
+                        image.media_type
+                    ))
+                    .size(12.0)
+                    .color(MUTED),
+                )
+                .wrap(),
+            );
+            ui.add_space(4.0);
+        }
+    }
 }
 
 /// The assistant card: one quiet frame, a compact identity row, and

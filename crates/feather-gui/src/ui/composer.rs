@@ -156,6 +156,10 @@ impl FeatherApp {
                     .shadow(soft_shadow())
                     .inner_margin(egui::Margin::symmetric(19.0, 15.0))
                     .show(ui, |ui| {
+                        // Staged image attachments sit above the text box, inside
+                        // the same rounded frame, so a pending image is visible
+                        // before send rather than only after it is in the transcript.
+                        self.pending_image_chips(ui);
                         let id = egui::Id::new("feather-composer");
                         // Submit keys are consumed by the named-action registry
                         // before TextEdit sees them; overrides remain authoritative.
@@ -450,5 +454,40 @@ impl FeatherApp {
                 if renderer_choice::trigger(ui,self.renderer){self.open_renderer_picker();}
             });
         });
+    }
+}
+
+impl FeatherApp {
+    /// One removable chip per staged image.
+    ///
+    /// No thumbnail is decoded here: the base64 is already the expensive part and
+    /// the chip only needs to say "an image is attached" plus let the user drop it
+    /// before sending. The transcript is where the picture is actually shown.
+    pub(crate) fn pending_image_chips(&mut self, ui: &mut egui::Ui) {
+        if self.pending_images.is_empty() {
+            return;
+        }
+        let mut remove: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for (index, image) in self.pending_images.iter().enumerate() {
+                let label = format!("image {}x{}  ×", image.width, image.height);
+                let response = ui.add(
+                    egui::Button::new(egui::RichText::new(label).size(12.0).color(TEXT))
+                        .fill(SOFT_ACCENT)
+                        .rounding(9.0),
+                );
+                if response
+                    .on_hover_text("click to remove this attachment")
+                    .clicked()
+                {
+                    remove = Some(index);
+                }
+            }
+        });
+        if let Some(index) = remove {
+            self.pending_images.remove(index);
+        }
+        ui.add_space(6.0);
     }
 }

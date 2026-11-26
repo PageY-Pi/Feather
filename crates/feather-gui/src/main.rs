@@ -14,6 +14,7 @@ mod app_runtime;
 mod cards;
 #[cfg(test)]
 mod chrome_tests;
+mod clipboard_image;
 mod commands;
 mod context_menu;
 mod font_store;
@@ -80,6 +81,36 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/feather-logo.png");
 // transcript model
 // ---------------------------------------------------------------------------
 
+/// An image shown inside a transcript row.
+///
+/// The texture is created lazily on first paint and then cached by `ui_key`, so a
+/// re-render (scroll, hover, streaming) does not re-decode the PNG. `None` means
+/// "not uploaded yet"; once decoded the handle lives for the row's lifetime.
+#[derive(Clone)]
+struct RowImage {
+    media_type: String,
+    data: String,
+    /// Uploaded texture, filled in on first paint.
+    texture: Option<egui::TextureHandle>,
+    /// Set once decoding has been attempted and failed.
+    ///
+    /// Without this, a payload that cannot be decoded is retried on every frame,
+    /// and `image.decode` measures ~1.1 ms for a 1 MP attachment — so one bad
+    /// image would hold the whole UI at well under 60 fps forever. The row shows
+    /// a placeholder instead, at zero per-frame cost.
+    failed: bool,
+}
+
+impl std::fmt::Debug for RowImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The base64 payload is huge and would swamp any Debug output.
+        f.debug_struct("RowImage")
+            .field("media_type", &self.media_type)
+            .field("bytes", &self.data.len())
+            .field("uploaded", &self.texture.is_some())
+            .finish()
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 enum RowKind {
     User,
@@ -107,6 +138,13 @@ struct ChatRow {
     tool_detail: String,
     started_at: Option<f64>,
     elapsed: Option<f64>,
+    /// Base64 images attached to this row, in send order.
+    ///
+    /// Kept on the row rather than looked up from the session so a reloaded
+    /// transcript and a live one render identically: `rows_from_messages` fills
+    /// this from the message content blocks, and `submit` fills it from the same
+    /// staged attachments it sends.
+    images: Vec<RowImage>,
     expanded: bool,
 }
 
@@ -126,6 +164,7 @@ impl ChatRow {
             tool_detail: String::new(),
             started_at: None,
             elapsed: None,
+            images: Vec::new(),
             expanded: false,
         }
     }
@@ -171,6 +210,11 @@ struct FeatherApp {
     rows: Vec<ChatRow>,
     history: history::History,
     input: String,
+    /// Images staged for the next submit. `alt+v` reads the clipboard into this
+    /// list; the composer shows a chip per entry. Kept beside `input` rather than
+    /// inside it so the text buffer stays a plain `String` (the composer, history
+    /// navigation and `/command` parsing all assume that).
+    pending_images: Vec<clipboard_image::ClipboardImage>,
     running: bool,
     last_stop: Option<StopReason>,
     queued_hint: usize,
@@ -329,6 +373,7 @@ impl FeatherApp {
             rows,
             history: transcript_history,
             input: String::new(),
+            pending_images: Vec::new(),
             running: false,
             last_stop: None,
             queued_hint: 0,
@@ -975,6 +1020,51 @@ impl FeatherApp {
             _ => fail(self, format!("Unknown command /{name}. Use /help.")),
         }
     }
+    /// Stage an image from the clipboard for the next submit.
+    ///
+    /// The three outcomes are deliberately distinct, because "nothing happened"
+    /// was the previous behaviour of the `alt+v` binding: no image on the
+    /// clipboard, a clipboard image that could not be decoded, and success all
+    /// have to look different to the user.
+    fn paste_image(&mut self) {
+        if self.exit.is_some() {
+            return;
+        }
+        match clipboard_image::read_image() {
+            Some(image) => {
+                let (w, h) = (image.width, image.height);
+                self.pending_images.push(image);
+                self.rows.push(ChatRow::new(
+                    RowKind::Notice,
+                    format!("Attached clipboard image {w}x{h}"),
+                ));
+            }
+            None => {
+                let reason = clipboard_image::last_error()
+                    .unwrap_or_else(|| "no image on the clipboard".into());
+                self.rows.push(ChatRow::new(RowKind::Notice, reason));
+            }
+        }
+        self.egui_ctx.request_repaint();
+    }
+
+    /// Move the composer text and any staged images into one message.
+    ///
+    /// Every send path funnels through here so an attachment can never be
+    /// silently dropped by a path that only knew about `String`.
+    fn take_prompt_message(&mut self, text: String) -> feather_core::message::Message {
+        let mut message = feather_core::message::Message::user_text(text);
+        for image in std::mem::take(&mut self.pending_images) {
+            message
+                .content
+                .push(feather_core::message::ContentBlock::Image {
+                    media_type: image.media_type,
+                    data: image.data,
+                });
+        }
+        message
+    }
+
     fn submit(&mut self) {
         if self.exit.is_some() {
             return;
@@ -1000,14 +1090,16 @@ impl FeatherApp {
         } else {
             self.input.trim().to_string()
         };
-        if text.is_empty() {
+        // An image alone is a complete prompt: attaching a screenshot and pressing
+        // enter should send it, without requiring a caption.
+        if text.is_empty() && self.pending_images.is_empty() {
             return;
         }
         self.input.clear();
         if self.running {
             // The thread-safe inbox remains writable while run() owns Agent.
-            self.input_queue
-                .push(feather_core::message::Message::user_text(text), false);
+            let message = self.take_prompt_message(text);
+            self.input_queue.push(message, false);
             self.sync_queued_hint();
             return;
         }
@@ -1026,7 +1118,37 @@ impl FeatherApp {
             self.input = text;
             return;
         }
-        self.rows.push(ChatRow::new(RowKind::User, text.clone()));
+        // The GUI drives the agent in-process and never passes through
+        // `rpc::check_image_support`, so the same modality rule has to be applied
+        // here: sending an image to a text-only model costs a whole run to learn.
+        // An unknown model is still allowed to try, matching the RPC behaviour.
+        if !self.pending_images.is_empty() {
+            if let Some(false) = feather::models::accepts_images(&self.settings.model) {
+                let model = self.settings.model.clone();
+                self.rows.push(ChatRow::new(
+                    RowKind::Error,
+                    format!(
+                        "model `{model}` does not accept image input; remove the attachment \
+                         or switch to a vision-capable model"
+                    ),
+                ));
+                return;
+            }
+        }
+        // The row mirrors the staged attachments so the picture appears in the
+        // transcript the moment it is sent, not only after a reload.
+        let mut user_row = ChatRow::new(RowKind::User, text.clone());
+        user_row.images = self
+            .pending_images
+            .iter()
+            .map(|image| RowImage {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+                texture: None,
+                failed: false,
+            })
+            .collect();
+        self.rows.push(user_row);
         let Some(agent) = self.agent.clone() else {
             self.rows
                 .push(ChatRow::new(RowKind::Error, String::from("no agent")));
@@ -1040,7 +1162,11 @@ impl FeatherApp {
         let now = self.now();
         self.metrics.begin_run(now);
         let ctx = self.egui_ctx.clone();
-        self.rt.spawn(drive_prompt(agent, text, tx, ctx));
+        // Build the message once, at the only point where it is certain to be
+        // sent: earlier failures above return the text to the composer, and the
+        // attachments must survive that rollback rather than being taken and lost.
+        let message = self.take_prompt_message(text);
+        self.rt.spawn(drive_prompt(agent, message, tx, ctx));
     }
 
     fn request_close(&mut self) {
@@ -1493,9 +1619,11 @@ impl FeatherApp {
             "app.message.followUp" => {
                 // queue the current draft while running (pi parity)
                 let text = self.input.trim().to_string();
-                if !text.is_empty() && self.running {
-                    self.input_queue
-                        .push(feather_core::message::Message::user_text(text), false);
+                // An image alone can be a follow-up too, so the same rule as
+                // `submit` applies: text OR a staged attachment makes it sendable.
+                if (!text.is_empty() || !self.pending_images.is_empty()) && self.running {
+                    let message = self.take_prompt_message(text);
+                    self.input_queue.push(message, false);
                     self.input.clear();
                     self.sync_queued_hint();
                 }
@@ -1878,14 +2006,13 @@ fn format_expires(millis: u64) -> String {
 /// may still be queued), not permission to submit a second competing prompt.
 async fn drive_prompt(
     agent: Arc<tokio::sync::Mutex<Agent>>,
-    text: String,
+    message: feather_core::message::Message,
     tx: Sender<UiEvent>,
     ctx: egui::Context,
 ) {
     let mut guard = agent.lock().await;
     let mut events = guard.subscribe();
-    let mut prompt =
-        Box::pin(guard.prompt_message_prepared(feather_core::message::Message::user_text(text)));
+    let mut prompt = Box::pin(guard.prompt_message_prepared(message));
     let result = loop {
         tokio::select! {
             result=&mut prompt=>break result.map_err(|e|e.to_string()),
@@ -2125,8 +2252,25 @@ fn rows_from_messages(messages: &[feather_core::message::Message]) -> Vec<ChatRo
                     rows.push(ChatRow::new(RowKind::Notice, text));
                     continue;
                 }
-                if !text.is_empty() {
-                    rows.push(ChatRow::new(RowKind::User, text));
+                // An image-only turn has no text, so gating on text alone dropped
+                // the attachment entirely on reload. Attachments decide the row.
+                let images: Vec<RowImage> = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        feather_core::ContentBlock::Image { media_type, data } => Some(RowImage {
+                            media_type: media_type.clone(),
+                            data: data.clone(),
+                            texture: None,
+                            failed: false,
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                if !text.is_empty() || !images.is_empty() {
+                    let mut row = ChatRow::new(RowKind::User, text);
+                    row.images = images;
+                    rows.push(row);
                 }
             }
             Role::Assistant => {

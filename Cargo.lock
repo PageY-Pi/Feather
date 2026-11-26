@@ -1242,6 +1242,7 @@ dependencies = [
  "feather-cache",
  "feather-core",
  "feather-hashline",
+ "image",
  "redb",
  "serde_json",
 ]
