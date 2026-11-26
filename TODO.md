@@ -126,6 +126,34 @@ change, not a schedule.
   their errors and carries them across sessions with no expiry, while memory
   that stores *verifiable pointers* (paths, commands, test outcomes) degrades
   safely. Feather already has the safe variant in `AGENTS.md`.
+- [x] **Static prompt audit (the first layer of a prompt ruler).** Done:
+  `feather::prompt_audit` checks the shipped prompt in milliseconds, so an edit
+  gets a verdict without a benchmark run. Four gates, each with a case that
+  reaches it: token budget (260, currently 196 with 64 free), dead tool
+  references, duplicate rules (significant-word equality, so a reordering still
+  counts), and verbatim containment. Tool names are read from the live registry,
+  never listed in the module — the first version of the test carried a hand-
+  written list and immediately produced six false positives.
+- [ ] **Falsifiability is not mechanised, on purpose.** The mechanical versions
+  ("must contain an identifier", "must not use a manner adverb") either fire on
+  sound rules or degrade into a word blacklist, and a prompt bent to satisfy a
+  linter is worse than one a human reads. The check worth adding later is "every
+  rule has a scenario where it fails", which needs the behavioural layer below;
+  a heuristic over wording would be guessing. In the meantime one rule was
+  rewritten by hand: `Keep responses tight.` could never be observed to be
+  broken, so it became "Default to prose: one short paragraph per change, lists
+  only for real lists", which a test could check.
+- [ ] **Behavioural A/B (the second layer) — not started.** The shape: script a
+  `FauxProvider` response, run the same scenario against two prompts, assert on
+  which tool the model reaches for. That tests whether a prompt *parses and
+  steers*, which is the part that is decidable without a live model. It does not
+  test whether the prompt is *good*; that needs real traffic.
+- [ ] **Do not build a Terminal-Bench-shaped ruler for prompts.** Measured
+  budgets for TB 2.1 (89 tasks, all `task.toml` read): 42.2 h of agent timeout,
+  83.6 h with verifiers, and the leaderboard requires 5 trials — ~28 h serial, or
+  4–5 h at 8-way concurrency. At that cost a prompt change gets one data point a
+  day and the model's own variance is the dominant term. TB is acceptance, not
+  iteration.
 
 ## Research note — persistent memory (2026-11-24)
 

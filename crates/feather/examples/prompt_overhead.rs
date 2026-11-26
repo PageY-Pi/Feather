@@ -34,6 +34,23 @@ fn main() -> anyhow::Result<()> {
         feather_core::tokenizer::estimate_tokens(&skills)
     );
     println!("Static total estimate ≈{} tokens before workspace instructions/conversation (provider tokenizer differs)",feather_core::tokenizer::estimate_tokens(&base)+feather_core::tokenizer::estimate_tokens(&tools)+feather_core::tokenizer::estimate_tokens(&skills));
+    // The size numbers above only matter next to the verdict on the prompt: a
+    // prompt can be small and still be wrong (a dead tool name, a repeated rule).
+    let names: Vec<&str> = registry.names();
+    let defects = feather::prompt_audit::audit(&base, &names);
+    if defects.is_empty() {
+        println!(
+            "Prompt audit: clean ({} rules, budget {} tokens, {} free)",
+            feather::prompt_audit::rules(&base).len(),
+            feather::prompt_audit::TOKEN_BUDGET,
+            feather::prompt_audit::TOKEN_BUDGET
+                .saturating_sub(feather_core::tokenizer::estimate_tokens(&base))
+        );
+    } else {
+        for defect in &defects {
+            println!("Prompt audit: {}", defect.explain());
+        }
+    }
     drop(registry);
     drop(tasks);
     std::fs::remove_dir_all(tmp)?;

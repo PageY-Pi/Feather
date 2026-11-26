@@ -14,6 +14,7 @@ pub mod netlimit;
 pub mod oauth;
 pub mod preferences;
 pub mod prereq;
+pub mod prompt_audit;
 pub mod proxy;
 pub mod resources;
 pub mod rpc;
