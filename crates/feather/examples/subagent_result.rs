@@ -24,6 +24,20 @@ fn main() -> anyhow::Result<()> {
             }
         }
         println!("=== {} ===", record.id);
+        // A child that timed out has an empty `output` but its messages are still
+        // on disk, one per `push`. Printing the tail is what recovers work that
+        // would otherwise look lost.
+        if let Ok(messages) = store.messages(&record.id) {
+            if !messages.is_empty() {
+                println!("--- {} recorded messages (tail) ---", messages.len());
+                let start = messages.len().saturating_sub(3);
+                for m in &messages[start..] {
+                    let text = m.text_cow();
+                    let shown: String = text.chars().take(600).collect();
+                    println!("[{:?}] {shown}", m.role);
+                }
+            }
+        }
         if let Some(out) = store.get(&record.id)? {
             println!(
                 "label: {}  model: {}  lines: {}  finished: {}",
