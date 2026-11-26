@@ -19,6 +19,14 @@ use std::sync::{Mutex, OnceLock};
 /// are persisted in `anchors.redb` and re-adopted when every line hash still
 /// matches, so evicting a map costs a rebuild, never correctness.
 const MAP_CACHE_CAPACITY: usize = 64;
+/// Upper bound on the anchor → path index.
+///
+/// Unlike `MAP_CACHE_CAPACITY` this is not a working set that gets evicted and
+/// rebuilt: entries are only added. A long session touching many files would
+/// grow it without limit, so it is cleared wholesale when full. Clearing only
+/// costs a rebuild on the next anchor-addressed miss — the same behaviour as
+/// before the index existed — so correctness never depends on hitting here.
+const ANCHOR_INDEX_CAPACITY: usize = 65_536;
 
 /// Bounded, least-recently-used cache of file maps.
 ///
@@ -124,6 +132,16 @@ pub struct AnchorStore {
     /// prove the file is unchanged, so this is the cheap fast path; a mismatch
     /// falls back to the exact content comparison.
     stamps: Mutex<HashMap<PathBuf, (Option<std::time::SystemTime>, u64)>>,
+    /// Anchor → file, kept outside `maps` so eviction cannot lose it.
+    ///
+    /// The anchor tools carry no `path`: the anchor itself is supposed to name
+    /// the file, and this index is how that lookup answers. Deriving it from the
+    /// resident maps made validity depend on cache residency — a file pushed out
+    /// of the 64-entry cache reported "not a live anchor in any mapped file" for
+    /// an anchor that still matched its line on disk. Retention is bounded by
+    /// clearing on eviction rather than by the map count, so the index can only
+    /// ever resolve to a file whose map can be rebuilt.
+    anchor_index: Mutex<HashMap<Anchor, PathBuf>>,
     /// First failure to persist an anchor table. Persistence is best-effort
     /// (see `persist_record`), so the error is retained here until the host
     /// drains it instead of panicking inside a tool call.
@@ -140,6 +158,7 @@ impl AnchorStore {
 
             last_touched: Mutex::new(HashMap::new()),
             stamps: Mutex::new(HashMap::new()),
+            anchor_index: Mutex::new(HashMap::new()),
             persist_error: Mutex::new(None),
         }
     }
@@ -335,6 +354,7 @@ impl AnchorStore {
             }
         }
         self.persist(&map);
+        self.index_map(&map);
         Ok(map)
     }
 
@@ -502,13 +522,13 @@ impl AnchorStore {
                 .ok_or_else(|| EngineError::Io("map vanished".into()))?;
             let a = m
                 .line_index(source_from)
-                .ok_or_else(|| bad_anchor(source_from))?;
+                .ok_or_else(|| bad_anchor(source_from, "move"))?;
             let b = m
                 .line_index(source_to)
-                .ok_or_else(|| bad_anchor(source_to))?;
+                .ok_or_else(|| bad_anchor(source_to, "move"))?;
             let t = m
                 .line_index(insert_after)
-                .ok_or_else(|| bad_anchor(insert_after))?;
+                .ok_or_else(|| bad_anchor(insert_after, "move"))?;
             if a <= t && t <= b {
                 return Err(EngineError::InvalidRange(
                     "insert_after must sit outside the source range when both anchors share a file"
@@ -559,6 +579,9 @@ impl AnchorStore {
             .get_mut(path)
             .ok_or_else(|| EngineError::Io("map vanished".into()))?;
         let out = f(map)?;
+        // An edit re-draws anchors for the lines it replaced, so the index must
+        // be refreshed here as well as on build.
+        self.index_map(map);
         let rec = map.persist_record();
         drop(maps);
         self.persist_record(&rec);
@@ -587,6 +610,32 @@ impl AnchorStore {
 
     fn persist(&self, map: &AnchorMap) {
         self.persist_record(&map.persist_record());
+    }
+
+    /// Record this map's anchor → path pairs in the eviction-proof index.
+    ///
+    /// Called after every build and every edit, because an edit re-draws anchors
+    /// for the lines it replaced. Stale entries are left in place: they can only
+    /// point at a file that no longer has that anchor, and `resolve_anchor` still
+    /// filters by residency or rebuild before an edit is allowed to proceed.
+    fn index_map(&self, map: &AnchorMap) {
+        // Normalise once, not per line: `norm_key` takes a global lock and clones a
+        // path, so calling it inside the loop cost a lock per line on every build
+        // (~3% of `anchors.read` on a 1500-line file).
+        //
+        // Normalised because `resolve_same_file` compares the two resolved paths
+        // for equality: one anchor served from a resident map and the other from
+        // this index must still compare equal.
+        let path = norm_key(&map.path);
+        let mut index = self.anchor_index.lock().unwrap_or_else(|e| e.into_inner());
+        if index.len() + map.len() > ANCHOR_INDEX_CAPACITY {
+            index.clear();
+        }
+        for i in 0..map.len() {
+            if let Some(anchor) = map.anchor_at(i) {
+                index.insert(anchor, path.clone());
+            }
+        }
     }
 
     /// Persist one file's anchor table, best-effort.
@@ -649,12 +698,27 @@ impl AnchorStore {
     /// All cached files whose map currently contains `anchor`, newest-touched
     /// first.
     pub fn resolve_anchor(&self, anchor: Anchor) -> Vec<PathBuf> {
+        // Resident maps first: they are the freshest view and the common case.
         let maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<PathBuf> = maps
             .iter()
             .filter(|(_, m)| m.line_index(anchor).is_some())
             .map(|(p, _)| p.clone())
             .collect();
+        drop(maps);
+        // Then the index, which outlives eviction. Without this an anchor that
+        // still matches its line on disk stops resolving the moment its file
+        // leaves the cache.
+        if let Some(path) = self
+            .anchor_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&anchor)
+        {
+            if !out.contains(path) {
+                out.push(path.clone());
+            }
+        }
         let touched = self.last_touched.lock().unwrap_or_else(|e| e.into_inner());
         out.sort_by_key(|p| std::cmp::Reverse(touched.get(p).copied().unwrap_or(0)));
         out
@@ -825,13 +889,15 @@ fn norm_key_uncached(path: &Path) -> PathBuf {
 
 fn unknown_anchor_of(a: Anchor, op: &str) -> EngineError {
     EngineError::UnknownAnchor(format!(
-        "{op}: {} is not a live anchor in any mapped file — read the file (or anchor_grep) first to get fresh anchors",
+        "{op}: {} is not a live anchor. Anchors are per-file and are re-drawn when a line is \
+         edited, so an anchor from an earlier read may no longer exist. Re-read the file with \
+         `read` (or locate it with `anchor_grep`) and retry with the anchors from that output.",
         a.to_str()
     ))
 }
 
-fn bad_anchor(a: Anchor) -> EngineError {
-    unknown_anchor_of(a, "op")
+fn bad_anchor(a: Anchor, op: &str) -> EngineError {
+    unknown_anchor_of(a, op)
 }
 
 #[cfg(test)]
@@ -1056,6 +1122,148 @@ mod tests {
             "alpha\nBETA\ngamma\n"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An anchor-addressed edit must work even when the file's map was evicted.
+    ///
+    /// The anchor tools carry no `path` argument — the anchor is supposed to
+    /// identify the file — so `resolve_anchor` is the only way an edit finds its
+    /// target. The cache is capped, and eviction drops the map entirely, so a
+    /// lookup that only consults resident maps reports "not a live anchor in any
+    /// mapped file" for an anchor that is still perfectly valid on disk.
+    ///
+    /// This is the difference from the test above: that one drives every call with
+    /// an explicit `path`, which rebuilds the map and hides the gap.
+    #[test]
+    fn an_anchor_addresses_a_file_even_after_its_map_was_evicted() {
+        let dir = home("anchor-after-evict");
+        let store = AnchorStore::new(&dir);
+
+        // One file we care about, read first so it is the oldest entry.
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "alpha\nbeta\ngamma\n").unwrap();
+        let rows = store.read(&target, None, None).unwrap();
+        let anchor = rows[1]
+            .split('│')
+            .next()
+            .expect("anchor prefix")
+            .trim()
+            .to_string();
+        let anchor = Anchor::parse(&anchor).expect("a parsed anchor");
+
+        // Push it out of the cache with unrelated files.
+        for i in 0..crate::store::MAP_CACHE_CAPACITY + 8 {
+            let p = dir.join(format!("filler{i}.txt"));
+            std::fs::write(&p, "x\ny\n").unwrap();
+            store.read(&p, None, None).unwrap();
+        }
+        assert!(
+            !store
+                .maps
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&norm_key(&target)),
+            "the target must have been evicted for this test to mean anything"
+        );
+
+        // The anchor is still valid; an anchor-addressed edit must find the file.
+        let resolved = store.resolve_anchor(anchor);
+        // Compare through `norm_key`: `map.path` keeps the caller's spelling,
+        // while the cache is keyed by the normalised path.
+        let resolved: Vec<PathBuf> = resolved.iter().map(|p| norm_key(p)).collect();
+        assert_eq!(
+            resolved.first(),
+            Some(&norm_key(&target)),
+            "an evicted file must still be reachable by anchor, got {resolved:?}"
+        );
+        store
+            .replace_anchors(anchor, anchor, "BETA")
+            .expect("anchor-addressed replace after eviction");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An edit re-draws anchors, so the index must follow the edit.
+    ///
+    /// Without reindexing after a write, the old anchor→path entries survive and
+    /// point at lines that no longer carry those anchors, which would make a
+    /// stale anchor resolve to a file and be refused deeper in the engine with a
+    /// less useful message.
+    #[test]
+    fn the_index_follows_an_edit() {
+        let dir = home("reindex-after-edit");
+        let store = AnchorStore::new(&dir);
+        let f = dir.join("t.txt");
+        std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+
+        let rows = store.read(&f, None, None).unwrap();
+        let beta = rows[1]
+            .split('│')
+            .next()
+            .expect("anchor prefix")
+            .trim()
+            .to_string();
+        let beta = Anchor::parse(&beta).expect("a parsed anchor");
+
+        // Replace the beta line wholesale; the anchor it had is retired.
+        store
+            .replace_anchors(beta, beta, "BETA changed")
+            .expect("the first replace");
+
+        // A fresh read of the edited file must resolve its new anchors.
+        let rows = store.read(&f, None, None).unwrap();
+        let new_beta = rows[1]
+            .split('│')
+            .next()
+            .expect("anchor prefix")
+            .trim()
+            .to_string();
+        let new_beta = Anchor::parse(&new_beta).expect("a parsed anchor");
+        assert_ne!(new_beta, beta, "an edit must not reuse the retired anchor");
+        assert!(
+            store
+                .resolve_anchor(new_beta)
+                .iter()
+                .any(|p| norm_key(p) == norm_key(&f)),
+            "a new anchor must resolve to the edited file"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The index must stay bounded: it only grows, so an unbounded session would
+    /// leak memory proportional to the anchors it has ever seen.
+    #[test]
+    fn the_anchor_index_is_bounded() {
+        let dir = home("index-bound");
+        let store = AnchorStore::new(&dir);
+
+        // Reach the cap without writing 65k files: fill the index directly, which
+        // is what `index_map` would have produced.
+        {
+            let mut index = store.anchor_index.lock().unwrap();
+            for i in 0..ANCHOR_INDEX_CAPACITY {
+                index.insert(
+                    Anchor::from_index(i as u64),
+                    PathBuf::from(format!("filler{i}.txt")),
+                );
+            }
+        }
+        let f = dir.join("t.txt");
+        std::fs::write(&f, "alpha\nbeta\n").unwrap();
+        store.read(&f, None, None).expect("read over a full index");
+
+        let held = store.anchor_index.lock().unwrap().len();
+        assert!(
+            held <= ANCHOR_INDEX_CAPACITY,
+            "the index must stay bounded, held {held}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

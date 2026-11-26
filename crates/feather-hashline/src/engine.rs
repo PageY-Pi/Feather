@@ -1053,7 +1053,9 @@ fn draw_fresh_or_err(rng: &mut AnchorRng, used: &HashSet<Anchor>) -> Result<Anch
 
 fn unknown(a: Anchor) -> EngineError {
     EngineError::UnknownAnchor(format!(
-        "{} is not a live anchor in this file — read the file (or anchor_grep) to get fresh anchors",
+        "{} is not a live anchor in this file. Anchors are re-drawn whenever a line is edited, \
+         so the file changed after the read that served this one. Re-read the file and retry with \
+         the anchors from that output.",
         a.to_str()
     ))
 }

@@ -184,6 +184,28 @@ and re-run after any tool change.
   rises or a wrong-mode failure appears in the traffic.
 - [ ] **`subagent` failed 64 of 88 calls (72.7%).** Much worse than any hashline
   tool. Not investigated.
+- [x] **`not a live anchor` had a bug behind it, not just a cost.** The message
+  blamed the model, but the anchor tools carry no `path`: `resolve_anchor` — how an
+  edit finds its file — searched only the *resident* map cache (capped at 64
+  files). Once a file was evicted, an anchor that still matched its line on disk
+  resolved to nothing and the edit was refused. Reproduced in a test: read a file,
+  map 72 other files, and the first one's anchor resolves to `[]`. Fixed with an
+  eviction-proof anchor → path index (`ANCHOR_INDEX_CAPACITY` 65 536, cleared
+  wholesale when full so it can never leak), refreshed on build and after every
+  edit because edits re-draw anchors. Measured: `anchors.read` on 1500 lines stayed
+  at baseline after hoisting the normalisation out of the per-line loop (calling
+  `norm_key` per line cost ~3%).
+- [x] **Two error messages were wrong, one embarrassingly.** `bad_anchor` passed the
+  literal string `"op"` as the operation name, so copy/move failures read
+  `op: XXXX is not a live anchor`. Both messages now name the tool and say what
+  actually happened: anchors are re-drawn when a line is edited, so an anchor from
+  an earlier read may be gone — re-read and retry. The old text ("read the file
+  first") was wrong for the eviction case, where reading was never the problem.
+- [ ] **Stale anchors are only partly explained.** Of 148 real failures, 11%
+  happened on the *first* tool call after a read, which eviction alone cannot
+  account for; 41% came 3-10 calls after a read. Re-run `--example
+  anchor_staleness` once sessions accumulate against the fix to see how much of the
+  rate was the cache bug.
 - [ ] **`bash` failures are mostly policy, not capability.** 638 failures, of which
   the largest single group is `[ILLEGAL_COMMAND]` for redirection and in-place
   edits. That is the shell/anchor split working as designed, but a model that keeps
