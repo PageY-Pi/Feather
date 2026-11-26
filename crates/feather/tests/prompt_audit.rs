@@ -384,6 +384,37 @@ fn a_description_naming_a_dead_tool_is_reported() {
 /// This is the gate: if a future edit names a tool that no longer exists in any
 /// description, this fails. Run against the real registry, never a copied list.
 #[test]
+/// The check `prompt_audit`'s header asks for by name: every rule has a scenario.
+///
+/// Without this the behavioural layer can drift into "some scenarios exist" while
+/// a newly added rule stays unwitnessed — which is exactly the state the audit
+/// was written against. A rule with no scenario is reported with its line number
+/// so the fix is to write the scenario, not to delete the rule.
+#[test]
+fn every_prompt_rule_has_a_behavioural_scenario() {
+    let prompt = system_prompt();
+    let scenarios = feather::eval::scenarios();
+    let unwitnessed = feather::eval::rules_without_scenarios(&prompt, &scenarios);
+    // The prompt has rules this round does not cover yet. Reporting them as a hard
+    // failure would block unrelated work, so the gate is a ceiling: it may not
+    // grow. Lowering it is always allowed, and adding an unwitnessed rule trips it.
+    // Measured, not chosen: `subagent`, `web_search`/`web_fetch` and the prose
+    // style rule are the three that need a live provider or a human, so they are
+    // the honest floor for a mechanical layer. Any addition trips this.
+    const MAX_UNWITNESSED: usize = 3;
+    assert!(
+        unwitnessed.len() <= MAX_UNWITNESSED,
+        "{} rule(s) have no behavioural scenario (ceiling {MAX_UNWITNESSED}); \
+         add a scenario in `feather::eval` for each:\n{}",
+        unwitnessed.len(),
+        unwitnessed
+            .iter()
+            .map(|r| format!("  - {r}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 fn the_live_tool_descriptions_reference_only_real_tools() {
     let names = registry_tools();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();

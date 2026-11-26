@@ -82,6 +82,14 @@ pub const COMMANDS: &[Command] = &[
         args: false,
     },
     Command {
+        name: "cost",
+        // `feather-cache` documented this command for as long as the optimizer has
+        // existed, but it was never added — so the hit rate it computes was shown
+        // nowhere and the prefix strategy was unobservable.
+        description: "Show token usage and prompt-cache hit rate",
+        args: false,
+    },
+    Command {
         name: "rewind",
         description: "Restore context and files: /rewind <turn>",
         args: true,

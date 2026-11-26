@@ -309,7 +309,14 @@ impl AgentTool for TaskUpdateTool {
         _abort: tokio::sync::watch::Receiver<bool>,
     ) -> feather_core::tool::BoxFut<'a> {
         Box::pin(async move {
-            let id = get_str(&args, "id").unwrap_or("").to_string();
+            // `id` is in the schema's `required` list, so an empty one means the
+            // caller sent `{}` or dropped the field. Reporting `no task ` (with a
+            // blank id) reads as "that task does not exist" and sends the model
+            // looking for the wrong fix; name the missing argument instead.
+            let Some(id) = get_str(&args, "id").filter(|s| !s.trim().is_empty()) else {
+                return ToolOutcome::err("task_update: id is required (`task_list` shows the ids)");
+            };
+            let id = id.to_string();
             let status = get_str(&args, "status");
             let title = get_str(&args, "title");
             if status.is_none() && title.is_none() {

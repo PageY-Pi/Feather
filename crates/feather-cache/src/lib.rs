@@ -21,7 +21,10 @@
 //! 4. **One-off demotion** — compaction summaries must not pollute the
 //!    cache: `demote_one_off()` clears breakpoints for the next request.
 //! 5. **Metrics** — provider usage is accumulated into rolling cache
-//!    hit-rate / write numbers surfaced by `/cost` and the status bar.
+//!    hit-rate / write numbers reached through `CachePlanner::cache_metrics` and
+//!    shown by the GUI's `/cost`. That accessor exists because the numbers used
+//!    to be write-only: `record` accumulated them and no caller read them, so the
+//!    breakpoint placement below could not be judged from a real session.
 //!
 //! # pi-cache-optimizer parity boundary
 //!
@@ -321,6 +324,18 @@ impl feather_core::agent::CachePlanner for CacheOptimizer {
             .fetch_add(usage.output, Ordering::Relaxed);
     }
 
+    fn cache_metrics(&self) -> Option<feather_core::agent::CacheMetrics> {
+        let m = self.snapshot_metrics();
+        Some(feather_core::agent::CacheMetrics {
+            requests: m.requests,
+            input: m.input_tokens,
+            cache_read: m.cache_read,
+            cache_write: m.cache_write,
+            output: m.output_tokens,
+            stable_prefix_len: m.last_stable_prefix_len,
+        })
+    }
+
     fn demote_one_off(&self) {
         self.metrics.one_off.store(true, Ordering::Relaxed);
     }
@@ -556,6 +571,46 @@ mod tests {
             CacheSettings::default().sticky_ttl_seconds,
             Some(DEFAULT_STICKY_TTL_SECONDS)
         );
+    }
+
+    /// The planner's numbers have to reach the trait object, or nothing can show
+    /// them. `cache_metrics` is the seam; `hit_rate` here is the cross-check that
+    /// the two paths agree.
+    #[test]
+    fn cache_metrics_reach_the_planner_trait() {
+        use feather_core::agent::CachePlanner;
+        let opt = CacheOptimizer::new();
+        let planner: &dyn CachePlanner = &opt;
+        assert_eq!(
+            planner.cache_metrics(),
+            Some(feather_core::agent::CacheMetrics {
+                requests: 0,
+                input: 0,
+                cache_read: 0,
+                cache_write: 0,
+                output: 0,
+                stable_prefix_len: 0,
+            })
+        );
+        // Nothing billed yet: an unknown rate, not a 0% one. Reporting 0% before
+        // the first request would look like total cache failure.
+        assert_eq!(planner.cache_metrics().unwrap().hit_rate(), None);
+
+        planner.record(&Usage {
+            input: 100,
+            output: 10,
+            cache_read: 900,
+            cache_write: 40,
+        });
+        let m = planner.cache_metrics().unwrap();
+        assert_eq!(m.requests, 1);
+        assert_eq!(m.input, 100);
+        assert_eq!(m.cache_read, 900);
+        assert_eq!(m.cache_write, 40);
+        assert_eq!(m.output, 10);
+        // 900 / (100 + 900) — the same figure `hit_rate()` computes.
+        assert_eq!(m.hit_rate(), Some(0.9));
+        assert!((m.hit_rate().unwrap() - opt.hit_rate()).abs() < 1e-9);
     }
 
     #[test]

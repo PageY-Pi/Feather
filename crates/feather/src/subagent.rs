@@ -20,6 +20,41 @@ pub struct SubagentTool {
     pub inherited_tools: Option<Arc<ToolRegistry>>,
     pub use_policy: bool,
 }
+
+/// What a cut-short child left behind, phrased so the parent can act on it.
+///
+/// Empty when nothing was recorded, so a run that died before writing anything
+/// does not gain a misleading "0 messages" footnote. The count matters because it
+/// is the difference between "retry, there is nothing here" and "the answer is
+/// almost certainly in the last assistant message".
+fn recovery_note(store: &SubagentStore, id: &str) -> String {
+    let Ok(messages) = store.messages(id) else {
+        return String::new();
+    };
+    if messages.is_empty() {
+        return String::new();
+    }
+    // The last assistant text is the most likely answer; a trailing tool result
+    // means the child stopped mid-work, which is worth saying plainly.
+    let last_text = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == feather_core::message::Role::Assistant)
+        .map(|m| m.text())
+        .unwrap_or_default();
+    let mut note = format!(
+        "{} recorded message(s) are on disk in `subagents.redb` (record `{id}`); \
+         the run was cut short, so treat the tail as partial work rather than a result",
+        messages.len()
+    );
+    if !last_text.trim().is_empty() {
+        note.push_str(&format!(
+            "\nlast assistant text:\n{}",
+            bounded(&last_text, 2048, 30)
+        ));
+    }
+    note
+}
 /// Parent receipts are capped, but the full final answer stays in child redb.
 pub fn bounded(text: &str, bytes: usize, lines: usize) -> String {
     let mut end = 0;
@@ -442,9 +477,24 @@ impl SubagentTool {
                         feather_core::StopReason::Aborted | feather_core::StopReason::Error
                     );
                 let text = if timed_out {
-                    "subagent: timed out".into()
+                    // A timed-out child is not an empty child. `Session::child`
+                    // appends every message as it is produced, so the work exists
+                    // even though the run was cut short; saying only "timed out"
+                    // made the parent treat 112 recorded messages as nothing, and
+                    // the partial output had to be found by opening redb by hand.
+                    let note = recovery_note(&store, &id);
+                    if note.is_empty() {
+                        "subagent: timed out".to_string()
+                    } else {
+                        format!("subagent: timed out\n{note}")
+                    }
                 } else if r.stop_reason == feather_core::StopReason::Aborted {
-                    "subagent: aborted".into()
+                    let note = recovery_note(&store, &id);
+                    if note.is_empty() {
+                        "subagent: aborted".to_string()
+                    } else {
+                        format!("subagent: aborted\n{note}")
+                    }
                 } else if r.stop_reason == feather_core::StopReason::Error {
                     format!("subagent: provider stream failed\n{}", r.final_text)
                 } else {
@@ -452,14 +502,22 @@ impl SubagentTool {
                 };
                 (text, failed)
             }
-            Err(e) => (
-                if timed_out {
-                    "subagent: timed out".into()
+            Err(e) => {
+                // The same recovery note applies here: a cancelled or failed run
+                // still has whatever the child managed to record.
+                let base = if timed_out {
+                    "subagent: timed out".to_string()
                 } else {
                     e.to_string()
-                },
-                true,
-            ),
+                };
+                let note = recovery_note(&store, &id);
+                let text = if note.is_empty() {
+                    base
+                } else {
+                    format!("{base}\n{note}")
+                };
+                (text, true)
+            }
         };
         let durable = if error {
             store.fail(&id, &text)

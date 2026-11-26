@@ -185,6 +185,67 @@ async fn child_stream_error_is_failure_in_parent_and_redb() {
     assert_no_jsonl(&temp.0);
 }
 
+/// A child that runs out of time has still done work, and that work is on disk.
+///
+/// This was observed for real: a review child timed out after writing 112
+/// messages, and the tool returned the flat string `subagent: timed out` — no id,
+/// no count, no hint that anything survived. The partial output had to be found
+/// by opening `subagents.redb` by hand. The parent cannot decide whether to retry
+/// or to use what exists without being told that anything exists.
+#[tokio::test]
+async fn a_timed_out_child_reports_its_id_and_recorded_work() {
+    let temp = Temp::new();
+    let session = temp.0.join("session");
+    // A server that accepts and then never answers: the child records its prompt
+    // and blocks on the response, which is the shape of a slow provider.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        // Hold the connection open past the child's deadline, then drop it.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drop(socket);
+    });
+    let tool = tool(
+        &temp.0,
+        &session,
+        ProviderRef::OpenAi(Arc::new(OpenAiProvider::new("synthetic-key", Some(base)))),
+    );
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let out = tool
+        .execute(
+            serde_json::json!({"prompt": "synthetic slow task", "timeoutMs": 300}),
+            rx,
+        )
+        .await;
+    assert!(out.is_error, "a timeout is a failure: {}", out.text);
+    assert!(out.text.contains("timed out"), "{}", out.text);
+    // The id is what makes the record findable; without it the parent cannot even
+    // ask what the child got done.
+    let store = SubagentStore::open(&session).unwrap();
+    let records = store.list().unwrap();
+    assert_eq!(records.len(), 1);
+    let id = records[0].id.clone();
+    assert!(
+        out.text.contains(&id),
+        "the timeout must name the record ({id}) so it can be inspected: {}",
+        out.text
+    );
+    // The count is what tells the parent whether there is anything to recover.
+    let recorded = store.messages(&id).unwrap().len();
+    assert!(
+        recorded > 0,
+        "the child recorded its prompt before timing out"
+    );
+    assert!(
+        out.text.contains(&format!("{recorded} recorded message")),
+        "the timeout must say {recorded} messages were recorded: {}",
+        out.text
+    );
+    drop(store);
+    drop(tool);
+    handle.join().unwrap();
+}
 #[tokio::test]
 async fn child_tool_roundtrip_and_repeated_runs_are_recoverable_without_jsonl() {
     let temp = Temp::new();

@@ -7,6 +7,7 @@ pub mod command_policy;
 pub mod config;
 pub mod config_store;
 pub mod ctxsearch;
+pub mod eval;
 pub mod mentions;
 pub mod model_refresh;
 pub mod models;

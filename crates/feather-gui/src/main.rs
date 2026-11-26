@@ -993,6 +993,52 @@ impl FeatherApp {
                     format!("Current committed turn: {turn}"),
                 ));
             }
+            "cost" => {
+                // The session's own totals come from recorded `Usage`, so they are
+                // exact; the cache figures come from the planner, which only knows
+                // what it was told. Both are shown because the interesting number
+                // is the share of prompt tokens that were *not* re-billed.
+                let (session_usage, cache) = self
+                    .agent
+                    .as_ref()
+                    .and_then(|a| {
+                        a.try_lock().ok().map(|a| {
+                            (
+                                a.session().total_usage(),
+                                // Cloned out of the lock: `CacheMetrics` is `Copy`, but
+                                // the planner is behind the same mutex as the session.
+                                a.cache_metrics(),
+                            )
+                        })
+                    })
+                    .unwrap_or_default();
+                let mut text = format!(
+                    "Session tokens — input {} · output {} · cache read {} · cache write {}",
+                    session_usage.input,
+                    session_usage.output,
+                    session_usage.cache_read,
+                    session_usage.cache_write
+                );
+                match cache {
+                    Some(m) => {
+                        let rate = match m.hit_rate() {
+                            Some(r) => format!("{:.1}% served from cache", r * 100.0),
+                            // Before the first billed request there is no rate. Saying
+                            // "0%" here would read as a cache that is failing.
+                            None => "no billed request yet".to_string(),
+                        };
+                        text.push_str(&format!(
+                            "\nPrompt cache — {rate} over {} request(s); \
+                             longest stable prefix {} messages",
+                            m.requests, m.stable_prefix_len
+                        ));
+                    }
+                    // No planner wired (a faux or test provider): say so rather than
+                    // printing zeros that look like a measured miss.
+                    None => text.push_str("\nPrompt cache — not measured by this provider"),
+                }
+                self.rows.push(ChatRow::new(RowKind::Notice, text));
+            }
             "rewind" if args.is_empty() => {
                 self.input = "/rewind ".into();
                 self.rewind_turns.request(&self.egui_ctx);

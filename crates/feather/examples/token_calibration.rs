@@ -12,6 +12,29 @@
 //! `input + cache_read + cache_write` the provider actually billed.
 //!
 //! Run: `cargo run --release -p feather --example token_calibration -- [session-dir]`
+//!
+//! # What the measurement found (24 sessions)
+//!
+//! The first billed turn of a session is the only unambiguous calibration point,
+//! because compaction cannot have removed anything the audit keeps. Across 24
+//! sessions its ratio ran from **-20.4% to +29.3%**, median about **-9%**: the
+//! heuristic is wrong in *both* directions, and by an amount that depends on the
+//! content (CJK text, code, and JSON schemas tokenize very differently from prose).
+//!
+//! Two conclusions follow, and they are why `agent::EstimateBias` exists:
+//!
+//! - A fixed safety margin has no correct value. Any constant large enough to cover
+//!   the -20% cases pushes the +29% cases 50% past their window, compacting early
+//!   and wasting a summary. That is a two-sided error and a one-sided remedy.
+//! - The ratio is learnable per session from the `Usage` every response carries, so
+//!   the correction can be measured instead of guessed. The agent folds each bill
+//!   into a bounded, smoothed multiplier used only at the compaction threshold.
+//!
+//! Superseded measurements, kept so they are not repeated: comparing the *messages*
+//! alone against the bill appears to be -95% low, which is entirely the static part
+//! (system prompt + schemas) that this probe originally omitted; and consecutive-turn
+//! *growth* ratios (median 1.0-1.7 with p25 down to 0.83) are too noisy to calibrate
+//! against, because one turn's tool result dominates the delta.
 
 use feather_core::session_store::SessionStore;
 
@@ -37,6 +60,20 @@ fn main() -> anyhow::Result<()> {
     let store = SessionStore::open_existing(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no session at {}", dir.display()))?;
     let entries = store.raw_entries()?;
+    // The static half of every request, exactly as the agent computes it. The tool
+    // schemas are the live registry's, not a copy: they are the largest stable part
+    // of the bill and the one most likely to drift after a description edit.
+    let tools = feather::wiring::tool_defs_for_estimate();
+    // The *full* prompt, not the base instructions: skills metadata (~800 tokens)
+    // and project context are part of every request and were missing from an
+    // earlier version of this measurement.
+    let home = feather::config::feather_home();
+    let system = feather::wiring::full_system_prompt(&dir, &home);
+    let static_tokens = feather_core::tokenizer::estimate_request_static_tokens(&system, &tools);
+    println!(
+        "static request part: ~{static_tokens} tokens ({} tools)",
+        tools.len()
+    );
     println!("session {} — {} audit rows", dir.display(), entries.len());
 
     // Walk the audit in order, tracking the running message list so each
@@ -67,7 +104,11 @@ fn main() -> anyhow::Result<()> {
         // Estimate the same slice the provider saw: the context up to but not
         // including this assistant message.
         let upto = &context[..context.len() - 1];
-        let estimate = feather_core::tokenizer::estimate_context_tokens(upto);
+        // The provider bills the *whole* request: system prompt, every tool
+        // schema, then the messages. Measuring only the messages understated it by
+        // ~3 400 tokens — the same as the static part — which looked like the
+        // estimate running 95% low. It was the probe that was wrong.
+        let estimate = static_tokens + feather_core::tokenizer::estimate_context_tokens(upto);
         rows.push((entry.seq, estimate, sent));
     }
     if rows.is_empty() {
@@ -82,6 +123,44 @@ fn main() -> anyhow::Result<()> {
         .map(|(_, est, act)| *est as f64 / *act as f64)
         .collect();
     ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // The first billed turn of a session is the only unambiguous calibration
+    // point: the request was exactly the system prompt, the tool schemas and one
+    // user message, so no compaction can have removed anything the audit keeps.
+    // Later turns are still reported, but they cannot distinguish "the estimate is
+    // low" from "the audit remembers messages the provider never saw".
+    // Between two consecutive settled turns the static part is identical, so the
+    // *growth* of the estimate and the growth of the bill differ only by what the
+    // message estimator got wrong. This isolates the estimator from the system
+    // prompt, which the audit does not record and this probe therefore cannot
+    // reproduce.
+    let mut growth: Vec<f64> = Vec::new();
+    for pair in rows.windows(2) {
+        let (_, est_a, act_a) = pair[0];
+        let (_, est_b, act_b) = pair[1];
+        // Growth must be positive: a turn whose bill shrank means compaction moved
+        // the context, and that pair says nothing about the estimator.
+        if act_b > act_a && est_b > est_a {
+            growth.push((est_b - est_a) as f64 / (act_b - act_a) as f64);
+        }
+    }
+    if !growth.is_empty() {
+        growth.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let gp = |p: f64| growth[((growth.len() - 1) as f64 * p) as usize];
+        println!(
+            "message-estimator growth over {} clean step(s): p25 {:.3}  median {:.3}  p75 {:.3}",
+            growth.len(),
+            gp(0.25),
+            gp(0.5),
+            gp(0.75)
+        );
+    }
+    let first = rows.first().copied();
+    if let Some((seq, est, act)) = first {
+        println!(
+            "first turn (clean measurement): seq {seq} — estimate {est} vs actual {act} ({:+.1}%)",
+            (est as f64 - act as f64) / act as f64 * 100.0
+        );
+    }
     let pct = |p: f64| ratios[((ratios.len() - 1) as f64 * p) as usize];
     println!(
         "assistant turns with usage: {}\n\

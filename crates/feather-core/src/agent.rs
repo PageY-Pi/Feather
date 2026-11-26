@@ -20,6 +20,37 @@ use std::sync::Arc;
 /// Cache planning seam. feather ships exactly one implementation
 /// (`feather-cache::CacheOptimizer`); it is compiled in and wired at
 /// construction — there is no runtime registration.
+/// One reading of the cache planner's running totals.
+///
+/// Kept as plain integers rather than a rate so the consumer decides what to show
+/// and a division by zero cannot be silently baked in. `cache_read` counts prompt
+/// tokens the provider served from its cache; `input` counts the ones it billed
+/// fresh, which is exactly what the prefix strategy is trying to shrink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheMetrics {
+    pub requests: u64,
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+    /// Length of the longest message prefix identical to the previous request.
+    pub stable_prefix_len: u64,
+}
+
+impl CacheMetrics {
+    /// Share of prompt tokens served from cache, in `0.0..=1.0`.
+    ///
+    /// `None` before any tokens have been billed: a request that has not happened
+    /// yet has no hit rate, and reporting 0% would read as a cache miss.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let served = self.input + self.cache_read;
+        if served == 0 {
+            None
+        } else {
+            Some(self.cache_read as f64 / served as f64)
+        }
+    }
+}
 pub trait CachePlanner: Send + Sync {
     /// Fill `cache` hints for the outgoing request and report history
     /// generation.
@@ -37,6 +68,16 @@ pub trait CachePlanner: Send + Sync {
     }
     /// Record provider usage so hit-rate metrics accumulate.
     fn record(&self, usage: &Usage);
+    /// The accumulated cache numbers, for the surface that shows them.
+    ///
+    /// `record` alone made the metrics write-only: `feather-cache` computed a hit
+    /// rate and no caller ever read it, so whether the breakpoint placement
+    /// actually helped was never observable. A planner that keeps no metrics
+    /// returns `None` rather than zeroes, because "0% cached" and "not measured"
+    /// are different claims and only one of them justifies a change.
+    fn cache_metrics(&self) -> Option<CacheMetrics> {
+        None
+    }
     /// Mark the next `plan`/`plan_cached` call as a one-off (summarization) so
     /// it writes no cache entries. Callers must pair it with
     /// [`CachePlanner::end_one_off`]: the flag is per-request state, and a flag
@@ -328,6 +369,85 @@ pub struct Agent {
     /// System-prompt + tool-schema token cost for the current config. Fixed
     /// until `reconfigure`, so it is estimated once instead of every turn.
     static_request_tokens: u64,
+    /// Learned correction between the token estimate and what providers bill.
+    ///
+    /// The estimator is a chars/4 heuristic, and measured against real sessions it
+    /// is wrong in both directions: the first-turn ratio ranged from -20% to +29%
+    /// over 24 sessions, with the median about -9%. A fixed safety margin cannot
+    /// fix a two-sided error — it would push the overshoot cases further over the
+    /// window while the undershoot cases keep their headroom. So the ratio is
+    /// learned per session from the `Usage` every response reports, and kept in a
+    /// narrow band so one pathological turn cannot swing the trigger.
+    ///
+    /// Only used where an error is dangerous: the compaction threshold, which must
+    /// not let an over-window request through. Reporting and UI keep the raw
+    /// estimate so a human sees the same number the heuristic produced.
+    estimate_bias: EstimateBias,
+}
+
+/// The learned estimate/billed ratio, bounded and smoothed.
+///
+/// The bound is the important part. Unbounded feedback would let a session whose
+/// provider bundles extra tokens (a large system prompt injected server-side, say)
+/// ratchet the multiplier without limit, and the compaction threshold would drift
+/// away from the model's real window. `MIN`/`MAX` keep the correction to the range
+/// actually observed on real sessions, so it can only ever make a better guess
+/// inside the regime the heuristic already lives in.
+///
+/// Smoothing is exponential because bills are noisy: one turn that happens to
+/// carry a big tool result must not move the trigger. `ALPHA` weights a new
+/// observation at 25%, so four turns dominate any single one.
+#[derive(Debug, Clone, Copy)]
+struct EstimateBias {
+    /// Ratio of billed input to estimated input, smoothed. `1.0` = trust the estimate.
+    ratio: f64,
+    /// Observations folded in so far; the first one is taken whole.
+    samples: u32,
+}
+
+impl EstimateBias {
+    const MIN: f64 = 0.75;
+    const MAX: f64 = 1.35;
+    const ALPHA: f64 = 0.25;
+
+    fn new() -> Self {
+        Self {
+            ratio: 1.0,
+            samples: 0,
+        }
+    }
+
+    /// Fold in one request's observed ratio.
+    ///
+    /// `estimated` is what the estimator said the request would cost; `billed` is
+    /// what the provider reported. Both must be positive to say anything: a zero
+    /// estimate means the counters were not yet populated, and a zero bill means
+    /// the provider did not report usage.
+    fn observe(&mut self, estimated: u64, billed: u64) {
+        if estimated == 0 || billed == 0 {
+            return;
+        }
+        let observed = (billed as f64 / estimated as f64).clamp(Self::MIN, Self::MAX);
+        self.ratio = if self.samples == 0 {
+            observed
+        } else {
+            self.ratio + (observed - self.ratio) * Self::ALPHA
+        };
+        self.ratio = self.ratio.clamp(Self::MIN, Self::MAX);
+        self.samples = self.samples.saturating_add(1);
+    }
+
+    /// The estimate adjusted to what providers actually bill.
+    ///
+    /// Zero samples returns the estimate unchanged rather than pre-inflating it:
+    /// guessing a margin before any observation is what a fixed constant would do,
+    /// and the measurement showed that constant has no correct value.
+    fn adjust(&self, estimate: u64) -> u64 {
+        if self.samples == 0 {
+            return estimate;
+        }
+        (estimate as f64 * self.ratio).round() as u64
+    }
 }
 
 #[derive(Debug)]
@@ -438,7 +558,14 @@ mod test_support {
                 index,
                 json_fragment,
             } => format!("tooldelta:{}", serde_json::json!([index, json_fragment])),
-            StreamEvent::Usage(u) => format!("usage:{}", u.output),
+            // The full usage, not just output: a scripted test that bills prompt
+            // tokens has to be able to say so, and the prompt side is what the
+            // estimate calibration and compaction threshold depend on. Without it a
+            // test could not tell those features from dead code.
+            StreamEvent::Usage(u) => format!(
+                "usage:{}:{}:{}:{}",
+                u.input, u.output, u.cache_read, u.cache_write
+            ),
             StreamEvent::MessageEnd { stop_reason } => match stop_reason {
                 StopReason::ToolUse => "end:tool".into(),
                 StopReason::Length => "end:length".into(),
@@ -470,9 +597,21 @@ mod test_support {
         } else if let Some(t) = payload.strip_prefix("thinking:") {
             out.push(StreamEvent::ThinkingDelta(t.replace("\\n", "\n")));
         } else if let Some(n) = payload.strip_prefix("usage:") {
-            out.push(StreamEvent::Usage(Usage {
-                output: n.parse().unwrap_or(0),
-                ..Usage::default()
+            // `input:output:cache_read:cache_write`, or a bare output count from the
+            // older single-field form so existing scripts keep working.
+            let parts: Vec<u64> = n.split(':').map(|p| p.parse().unwrap_or(0)).collect();
+            out.push(StreamEvent::Usage(match parts.as_slice() {
+                [output] => Usage {
+                    output: *output,
+                    ..Usage::default()
+                },
+                [input, output, cache_read, cache_write, ..] => Usage {
+                    input: *input,
+                    output: *output,
+                    cache_read: *cache_read,
+                    cache_write: *cache_write,
+                },
+                _ => Usage::default(),
             }));
         } else if let Some(reason) = payload.strip_prefix("end:") {
             let stop_reason = match reason {
@@ -512,6 +651,7 @@ impl Agent {
             abort_rx,
             queue: InputQueue::default(),
             static_request_tokens,
+            estimate_bias: EstimateBias::new(),
         }
     }
 
@@ -529,6 +669,14 @@ impl Agent {
 
     pub fn config(&self) -> &AgentConfig {
         &self.config
+    }
+
+    /// The cache planner's running totals, if the planner keeps any.
+    ///
+    /// `None` when no planner is wired or the planner is not a measuring one;
+    /// callers must treat that as "unknown", not "0%".
+    pub fn cache_metrics(&self) -> Option<CacheMetrics> {
+        self.planner.as_ref()?.cache_metrics()
     }
 
     pub fn abort(&self) {
@@ -718,7 +866,12 @@ impl Agent {
             // cached message rows. Include system instructions and tool schemas,
             // and use only the configured compaction headroom before each normal request.
             // build_request so no later async work can make the prompt stale.
-            let request_tokens = self.request_input_tokens();
+            // The threshold is the one place an estimate error is dangerous: too
+            // low and an over-window request is sent and rejected. `adjust` folds in
+            // what providers actually billed on earlier turns, which is the only
+            // correction that holds across sessions — a fixed margin does not,
+            // because the measured error runs in both directions.
+            let request_tokens = self.estimate_bias.adjust(self.request_input_tokens());
             if compaction::should_compact_request(
                 request_tokens,
                 self.config.context_window,
@@ -1165,9 +1318,28 @@ impl Agent {
         ))
     }
 
+    /// Fold one request's estimate and bill into the learned correction.
+    ///
+    /// `billed` is `input + cache_read + cache_write`: every prompt token the
+    /// provider accounted for, whether it charged full price or a cache rate. That
+    /// is the quantity the context window limits, so it is the one the estimate
+    /// has to track. `output` is excluded — it is not part of the prompt side and
+    /// the threshold never counts it.
+    fn observe_estimate(&mut self, billed: &Usage) {
+        let prompt = billed.input + billed.cache_read + billed.cache_write;
+        // The estimate of the request that produced this bill: the same function
+        // the threshold uses, before any adjustment.
+        let estimated = self.request_input_tokens();
+        self.estimate_bias.observe(estimated, prompt);
+    }
+
     fn record_provider_usage(&mut self, total_usage: &mut Usage, usage: Usage) {
         *total_usage = crate::session::add_usage(*total_usage, usage);
         self.session.add_usage(usage);
+        // Only a request that billed prompt tokens says anything about the
+        // estimate. A provider that reports zero (some gateways omit usage on
+        // errors) is ignored by `observe` itself.
+        self.observe_estimate(&usage);
         if let Some(p) = &self.planner {
             p.record(&usage);
         }
@@ -1482,6 +1654,91 @@ mod retry_tests {
         assert!(Arc::ptr_eq(&request.messages, &second.messages));
         assert!(Arc::ptr_eq(&request.tools, &second.tools));
     }
+
+    /// The learned correction has to change the compaction decision, or it is dead
+    /// code that only looks like a safeguard.
+    ///
+    /// The provider here bills far more than the estimator predicts — the real
+    /// pattern for a session whose system prompt carries a large project context the
+    /// estimator under-counts. After one billed turn, the same context must be
+    /// judged closer to its real size.
+    #[tokio::test(start_paused = true)]
+    async fn a_billed_turn_moves_the_compaction_threshold() {
+        let root = std::env::temp_dir().join(crate::provider::gen_id("bias-agent"));
+        std::fs::create_dir_all(&root).unwrap();
+        // Every estimate is scaled by the same factor to make the comparison exact:
+        // the assertion is on the *estimate*, not on whether compaction fired at a
+        // particular context window (which would depend on the prompt's size).
+        let billed = 40_000u64;
+        let provider = test_support::ScriptedProvider::new(vec![
+            test_support::ScriptItem::Stream {
+                events: vec![
+                    StreamEvent::Usage(Usage {
+                        input: billed,
+                        output: 1,
+                        ..Usage::default()
+                    }),
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::MessageEnd {
+                        stop_reason: StopReason::Stop,
+                    },
+                ],
+                terminal: None,
+            },
+            test_support::ScriptItem::Stream {
+                events: vec![
+                    StreamEvent::Usage(Usage {
+                        input: billed,
+                        output: 1,
+                        ..Usage::default()
+                    }),
+                    StreamEvent::TextDelta("again".into()),
+                    StreamEvent::MessageEnd {
+                        stop_reason: StopReason::Stop,
+                    },
+                ],
+                terminal: None,
+            },
+        ]);
+        let mut agent = Agent::new(
+            config(),
+            Session::memory(&root, "bias"),
+            Arc::new(ToolRegistry::new()),
+            ProviderRef::Scripted(provider.clone()),
+            None,
+        );
+        agent
+            .session_mut()
+            .push(Message::user_text("x".repeat(40_000)))
+            .unwrap();
+        let raw = agent.request_input_tokens();
+        assert_eq!(
+            agent.estimate_bias.adjust(raw),
+            raw,
+            "before any bill there is nothing learned to apply"
+        );
+
+        agent
+            .prompt_message(Message::user_text("go".to_string()))
+            .await
+            .unwrap();
+
+        let adjusted = agent.estimate_bias.adjust(raw);
+        assert!(
+            adjusted > raw,
+            "a provider billing {billed} against a {raw} estimate must raise the \
+             correction; got {adjusted} (raw {raw}, ratio {:.3})",
+            agent.estimate_bias.ratio
+        );
+        // And it must not over-shoot: the bound is what keeps the threshold near the
+        // model's real window instead of chasing a single observation.
+        assert!(
+            adjusted <= (raw as f64 * 1.35).round() as u64,
+            "the correction must stay inside the measured band, got {adjusted}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn illegal_tool_error_is_visible_in_next_request_and_run_continues() {
         struct Blocked;
@@ -1778,5 +2035,99 @@ mod retry_tests {
         ));
         assert_eq!(provider.calls(), 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// The learned correction has to be conservative in exactly the direction that
+/// matters: it may raise the estimate (compacting early) but must never let an
+/// over-window request through on the strength of one noisy turn.
+#[cfg(test)]
+mod estimate_bias_tests {
+    use super::EstimateBias;
+
+    #[test]
+    fn an_unobserved_bias_leaves_the_estimate_alone() {
+        // Pre-inflating before any measurement is the fixed-margin mistake: the
+        // measurement showed the error runs in both directions, so there is no
+        // constant that is right. Until a bill arrives, trust the estimate.
+        let bias = EstimateBias::new();
+        assert_eq!(bias.adjust(1000), 1000);
+    }
+
+    #[test]
+    fn the_first_observation_is_taken_whole() {
+        // A session whose first bill is 20% over the estimate should be corrected
+        // immediately, not after a long warm-up: the very next request could be the
+        // one that crosses the window.
+        let mut bias = EstimateBias::new();
+        bias.observe(1000, 1200);
+        assert_eq!(bias.adjust(1000), 1200);
+    }
+
+    #[test]
+    fn a_single_outlier_cannot_swing_the_correction() {
+        // Smoothing: one turn carrying a huge tool result must not move the
+        // trigger by the full amount. After a 1.0 baseline, a 2.0 observation
+        // lands at 1.25 rather than 2.0.
+        let mut bias = EstimateBias::new();
+        bias.observe(1000, 1000);
+        bias.observe(1000, 2000);
+        let adjusted = bias.adjust(1000);
+        assert!(
+            adjusted > 1000 && adjusted < 1400,
+            "one outlier must not move the estimate to the outlier: got {adjusted}"
+        );
+    }
+
+    #[test]
+    fn the_correction_stays_inside_the_measured_band() {
+        // Unbounded feedback would let a provider that bundles server-side tokens
+        // ratchet the multiplier without limit, drifting the compaction threshold
+        // away from the model's real window.
+        let mut bias = EstimateBias::new();
+        for _ in 0..100 {
+            bias.observe(1000, 100_000);
+        }
+        assert!(
+            bias.adjust(1000) <= 1350,
+            "the correction must stay bounded, got {}",
+            bias.adjust(1000)
+        );
+        let mut low = EstimateBias::new();
+        for _ in 0..100 {
+            low.observe(1000, 1);
+        }
+        assert!(
+            low.adjust(1000) >= 750,
+            "an under-billing provider must not collapse the estimate, got {}",
+            low.adjust(1000)
+        );
+    }
+
+    #[test]
+    fn zero_usage_teaches_nothing() {
+        // Some gateways omit usage on error responses. Folding a zero in would read
+        // as "this request cost nothing" and drag the correction down.
+        let mut bias = EstimateBias::new();
+        bias.observe(1000, 0);
+        assert_eq!(bias.adjust(1000), 1000);
+        bias.observe(0, 1000);
+        assert_eq!(bias.adjust(1000), 1000);
+    }
+
+    #[test]
+    fn the_correction_converges_toward_a_steady_undercount() {
+        // The real-world case: the estimator is consistently ~15% low because the
+        // provider tokenizer splits differently. After a few turns the correction
+        // must be close, which is the whole point of learning it per session.
+        let mut bias = EstimateBias::new();
+        for _ in 0..12 {
+            bias.observe(10_000, 11_500);
+        }
+        let adjusted = bias.adjust(10_000);
+        assert!(
+            (11_000..=11_600).contains(&adjusted),
+            "expected to converge near the billed 11 500, got {adjusted}"
+        );
     }
 }

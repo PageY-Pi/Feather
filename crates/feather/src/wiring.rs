@@ -19,6 +19,26 @@ use feather_hashline::tools::{
     AnchorGrepTool, CopyTool, InsertTool, ReadTool, ReplaceTool, UndoTool, WriteTool,
 };
 use std::sync::Arc;
+/// The complete system prompt for a workspace, as the agent receives it.
+///
+/// `system_prompt()` alone is only the base instructions. The prompt actually sent
+/// also carries the skills metadata and the project context, and those are the
+/// larger half: skills alone are ~800 tokens. A measurement that used the base
+/// text reported a static part ~1 000 tokens low, which then looked like the
+/// estimator under-counting when it was the measurement that was wrong.
+pub fn full_system_prompt(root: &std::path::Path, home: &std::path::Path) -> String {
+    let base = crate::preferences::apply_system_prompt_override(&system_prompt(), root, &home)
+        .unwrap_or_else(|_| system_prompt());
+    let resources = crate::config::resources_for(root, home);
+    let mut sys =
+        base + &crate::resources::format_skills_for_system_prompt(&resources.skills, "read");
+    let ctx = crate::config::project_context(root, home);
+    if !ctx.is_empty() {
+        sys.push_str("\n\nProject-specific instructions and guidelines:\n\n");
+        sys.push_str(&ctx);
+    }
+    sys
+}
 
 pub fn system_prompt() -> String {
     format!(
@@ -210,6 +230,26 @@ pub fn select_provider(settings: &Settings) -> ProviderRef {
                 .with_credentials(resolver),
         ))
     }
+}
+/// The tool schemas the agent bills on every request.
+///
+/// Exists so a measurement can use the live definitions instead of a hand-kept
+/// copy — the schemas are the largest static part of a request, and the part most
+/// likely to drift after a description edit.
+pub fn tool_defs_for_estimate() -> Vec<feather_core::provider::ToolDef> {
+    use std::sync::Arc;
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let tmp = std::env::temp_dir().join(feather_core::provider::gen_id("tool-defs"));
+    let _ = std::fs::create_dir_all(&tmp);
+    let settings = crate::config::Settings::default();
+    let tasks = Arc::new(crate::tasks::TaskStore::open(&tmp));
+    let provider = Arc::new(feather_core::agent::ProviderRef::Faux(faux_provider()));
+    let registry = build_registry(&root, &tmp, &settings, &tasks, &tmp, &provider);
+    let defs = registry.defs();
+    drop(registry);
+    drop(tasks);
+    let _ = std::fs::remove_dir_all(&tmp);
+    defs
 }
 
 pub fn build_registry(

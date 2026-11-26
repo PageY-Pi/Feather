@@ -2053,6 +2053,32 @@ fn an_image_without_any_text_still_sends() {
     );
 }
 #[test]
+fn cost_reports_the_cache_as_unmeasured_rather_than_zero() {
+    // `feather-cache` has computed a hit rate since it was written and nothing ever
+    // read it. The value of surfacing it is being able to tell "the prefix strategy
+    // is working" from "we never measured" — so the no-planner case must not print
+    // 0%, which reads as total cache failure.
+    let mut app = fixture();
+    app.execute_command("/cost");
+    let notice = app
+        .rows
+        .iter()
+        .rev()
+        .find(|r| r.kind == RowKind::Notice)
+        .expect("/cost must add a notice row");
+    assert!(
+        notice.text.contains("not measured"),
+        "with no agent there is nothing to measure; got: {}",
+        notice.text
+    );
+    assert!(
+        !notice.text.contains("0.0%"),
+        "an unmeasured cache must not render as a 0% hit rate: {}",
+        notice.text
+    );
+}
+
+#[test]
 fn a_png_mention_is_not_expanded_in_the_gui() {
     // The reported bug: the model is asked to look at an image, calls `read`,
     // and gets `[E_BINARY] ... looks binary (NUL byte)`. `read` cannot return a

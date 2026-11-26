@@ -15,15 +15,18 @@
 //!   rules that say the same thing spend attention twice and can be obeyed
 //!   inconsistently.
 //!
-//! **What is deliberately not checked.** Falsifiability — whether a rule could
-//! ever be observed to be broken — is not mechanised here. The versions of it
-//! that are mechanical ("must contain an identifier", "must not use a manner
-//! adverb") either fire on sound rules or degrade into a word blacklist, and a
-//! prompt bent to satisfy a linter is worse than one a human reviews. The witness
-//! that makes a rule falsifiable is a scenario where it fails, which is what the
-//! behavioural layer will supply; when it exists, the check to add is "every rule
-//! has at least one scenario", not a heuristic over the wording. Until then this
-//! module stays silent rather than guessing.
+//! **What is deliberately not checked here.** Falsifiability — whether a rule
+//! could ever be observed to be broken — cannot be decided over the wording. The
+//! versions of it that are mechanical ("must contain an identifier", "must not
+//! use a manner adverb") either fire on sound rules or degrade into a word
+//! blacklist, and a prompt bent to satisfy a linter is worse than one a human
+//! reviews. The witness that makes a rule falsifiable is a scenario where it
+//! fails, and those now live in [`crate::eval`]: real tool calls replayed through
+//! the live registry, each declaring the rule it can falsify. The check this
+//! module promised — "every rule has at least one scenario" — is
+//! `prompt_audit::tests::every_prompt_rule_has_a_behavioural_scenario`, which
+//! caps the number of unwitnessed rules so a new one cannot slip in unnoticed.
+//! That is where the wording is falsified; this file stays silent about it.
 //!
 //! Tool names are never listed here. They are read from the live registry, so this
 //! file cannot drift from the thing it audits.
