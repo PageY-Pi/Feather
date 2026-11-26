@@ -826,6 +826,48 @@ mod tests {
         );
     }
 
+    /// A PDF is a binary a model is routinely asked about, and it must not be reported
+    /// as an anonymous NUL byte — that reads as corruption and says nothing about what
+    /// would work instead.
+    #[tokio::test]
+    async fn a_pdf_is_named_rather_than_reported_as_a_nul_byte() {
+        let dir = tmp("read-pdf");
+        let f = dir.join("paper.pdf");
+        // A real PDF header followed by a NUL, which is what made the old path report a
+        // byte-level symptom instead of the document type.
+        std::fs::write(&f, b"%PDF-1.7\n\x00\x01\x02 compressed stream").unwrap();
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        let tool = ReadTool {
+            store,
+            images: true,
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = tool
+            .execute(serde_json::json!({ "path": f.to_str().unwrap() }), rx)
+            .await;
+
+        assert!(outcome.is_error, "a PDF has no text rows to read");
+        assert!(
+            outcome.images.is_empty(),
+            "a PDF must not be attached as if it were a picture"
+        );
+        assert!(
+            outcome.text.contains("is a PDF"),
+            "the error must name the format: {}",
+            outcome.text
+        );
+        assert!(
+            !outcome.text.contains("NUL byte"),
+            "a byte-level symptom hides what the file actually is: {}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("pdftotext"),
+            "it must suggest something that works: {}",
+            outcome.text
+        );
+    }
+
     /// Decode for the round-trip assertion above. Asserting on a re-encode would pass
     /// with a broken encoder that happens to be self-consistent.
     fn base64_decode(text: &str) -> Vec<u8> {

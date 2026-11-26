@@ -244,3 +244,72 @@ fn a_tool_result_keeps_its_text_and_image_together() {
         "text must come first so an encoder that ignores images still sends something"
     );
 }
+
+/// A picture inside the *kept* span must survive the in-place shrink pass.
+///
+/// `shrink_kept_span` rewrites an older tool result to its head+tail form by replacing
+/// the whole block list with one text block. That drops any image in the same message,
+/// silently: the text still looks shrunk, so nothing in the output says a picture went
+/// away. A turn keeps its images only while it is within `keep_last_turns_unshrunk`
+/// (2 by default), which is a much smaller guarantee than "inside the keep budget" —
+/// a 20k-token keep span usually contains more than two turns.
+#[test]
+fn an_image_in_the_kept_span_survives_the_shrink_pass() {
+    use feather_core::compaction::{shrink_kept_span, CompactionSettings};
+
+    let settings = CompactionSettings {
+        // Force the rewrite: a tiny budget makes every eligible result "too long".
+        kept_tool_result_budget: 64,
+        keep_last_turns_unshrunk: 1,
+        ..CompactionSettings::default()
+    };
+
+    // Three turns. The oldest must be eligible for in-place shrinking; it carries both
+    // a long text result and a picture.
+    let mut messages = vec![Message::user_text("turn one")];
+    messages.push(Message::tool_result("c1", "read", "a".repeat(5000), false));
+    messages[1].content.push(ContentBlock::Image {
+        media_type: "image/png".into(),
+        data: "PICTURE".into(),
+    });
+    messages.push(Message::user_text("turn two"));
+    messages.push(tool_result_with_image("c2", "b", 16));
+    messages.push(Message::user_text("turn three"));
+    messages.push(tool_result_with_image("c3", "c", 16));
+
+    shrink_kept_span(&mut messages, &settings);
+
+    let surviving: Vec<String> = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Image { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !surviving.is_empty(),
+        "the shrink pass removed every image. Text is still there, so nothing in the \
+         output reports the loss: {:#?}",
+        messages
+    );
+    assert!(
+        surviving.iter().any(|d| d == "PICTURE"),
+        "the oldest turn's image is the one eligible for shrinking; it must be kept \
+         while its text is shortened, got {surviving:?}"
+    );
+    // The text half still has to be shortened, or the pass did nothing.
+    let first_text = messages[1]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.len()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        first_text < 5000,
+        "the 5000-char text must still be shrunk, got {first_text}"
+    );
+}

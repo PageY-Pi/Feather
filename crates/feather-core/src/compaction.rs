@@ -674,7 +674,18 @@ pub fn shrink_kept_span(messages: &mut [Message], settings: &CompactionSettings)
             saved += delta;
             (shrunk.into_owned(), original_len)
         };
-        messages[i].content = vec![ContentBlock::Text { text: replacement }];
+        // Keep every non-text block. Only the text is replaceable: an image is already
+        // as small as it can get, and dropping it here is silent — the text still looks
+        // shrunk, so nothing downstream reports that a picture went away.
+        let kept_blocks: Vec<ContentBlock> = messages[i]
+            .content
+            .iter()
+            .filter(|b| !matches!(b, ContentBlock::Text { .. }))
+            .cloned()
+            .collect();
+        messages[i].content = std::iter::once(ContentBlock::Text { text: replacement })
+            .chain(kept_blocks)
+            .collect();
         messages[i].shrink = Some(crate::message::ShrinkInfo {
             original_len,
             head: settings.kept_tool_result_budget * 3 / 5,

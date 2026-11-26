@@ -301,12 +301,25 @@ impl AnchorStore {
         // anchor store is used directly.
         if crate::image::is_image(path, &bytes) {
             return Err(EngineError::Binary(format!(
-                "{} is an image; images are attached by the user, not read as rows \
-                 (ask the user to attach it, e.g. `@{}`)",
+                "{} is an image, so it has no rows to page through. Read it without \
+                 `offset`/`limit` to get the picture itself; attach it with `@{}` to add \
+                 it to a prompt.",
                 path.display(),
                 path.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
+            )));
+        }
+        // A PDF is the other binary a model is routinely asked about, and it has no
+        // text rows either: it is a compressed object graph, not a document with lines.
+        // Naming it stops the `NUL byte` message below from reading as corruption, and
+        // says what would work instead of only what failed.
+        if bytes.starts_with(b"%PDF-") {
+            return Err(EngineError::Binary(format!(
+                "{} is a PDF; it has no text rows to read. Extract its text with a tool \
+                 (`pdftotext`, or a PDF library) or ask the user to attach the pages as \
+                 images",
+                path.display()
             )));
         }
         if bytes.contains(&0) {
