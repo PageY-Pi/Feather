@@ -326,6 +326,14 @@ Never include the anchor line. Compare both edges of the inserted block in the p
 // ---------------------------------------------------------------------------
 // copy
 // ---------------------------------------------------------------------------
+/// Copy — or, with `remove_source`, move — a range of lines to another position.
+///
+/// One tool, not two. `copy` and `move` had identical schemas and descriptions
+/// differing in a single word, so the choice carried no information for the model
+/// but cost ~250 tokens of schema on every request. The measurement that justified
+/// merging: `move` was called 19 times to `copy`'s 4, and one of those was the
+/// observed `[E_RANGE_ORDER]` failure. Duplicated near-identical tools are a place
+/// models pick wrong; a boolean with a safe default is a place they pick once.
 pub struct CopyTool {
     pub store: Arc<AnchorStore>,
 }
@@ -337,8 +345,9 @@ impl AgentTool for CopyTool {
 
     fn description(&self) -> &'static str {
         "Copy a range of lines to another position, targeted by 5-character anchors. \
-`source_from`/`source_to` mark the first and last line to copy and `insert_after` the destination line after which the copy goes; anchors may belong to different files. \
-The source lines stay in place, and the copied lines are written exactly as the source file holds them."
+`source_from`/`source_to` mark the first and last line and `insert_after` the destination line after which the copy goes; anchors may belong to different files. \
+The source lines stay in place unless `remove_source` is true, which makes this a move. \
+Copied lines are written exactly as the source file holds them."
     }
 
     fn parameters(&self) -> Value {
@@ -347,96 +356,58 @@ The source lines stay in place, and the copied lines are written exactly as the 
             "properties": {
                 "source_from": { "type": "string" },
                 "source_to": { "type": "string" },
-                "insert_after": { "type": "string" }
-            },
-            "required": ["source_from", "source_to", "insert_after"]
-        })
-    }
-
-    fn execute<'a>(
-        &'a self,
-        args: Value,
-        _abort: tokio::sync::watch::Receiver<bool>,
-    ) -> feather_core::tool::BoxFut<'a> {
-        Box::pin(async move {
-            let sf = match parse_anchor(&args, "source_from") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            let st = match parse_anchor(&args, "source_to") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            let ia = match parse_anchor(&args, "insert_after") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            match self.store.copy_anchors(sf, st, ia) {
-                Ok((_src, dst, diff)) => edited(&dst, &diff),
-                Err(e) => engine_out(Err(e)),
-            }
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// move
-// ---------------------------------------------------------------------------
-pub struct MoveTool {
-    pub store: Arc<AnchorStore>,
-}
-
-impl AgentTool for MoveTool {
-    fn name(&self) -> &'static str {
-        "move"
-    }
-
-    fn description(&self) -> &'static str {
-        "Move a range of lines to another position, targeted by 5-character anchors. \
-`source_from`/`source_to` mark the range and `insert_after` the destination line after which the range goes; anchors may belong to different files. \
-`insert_after` must sit outside the source range when both anchors share a file; moving a range to where it already sits reports no change."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "source_from": { "type": "string" },
-                "source_to": { "type": "string" },
-                "insert_after": { "type": "string" }
-            },
-            "required": ["source_from", "source_to", "insert_after"]
-        })
-    }
-
-    fn execute<'a>(
-        &'a self,
-        args: Value,
-        _abort: tokio::sync::watch::Receiver<bool>,
-    ) -> feather_core::tool::BoxFut<'a> {
-        Box::pin(async move {
-            let sf = match parse_anchor(&args, "source_from") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            let st = match parse_anchor(&args, "source_to") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            let ia = match parse_anchor(&args, "insert_after") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            match self.store.move_anchors(sf, st, ia) {
-                Ok((_src, dst, removed, added)) => {
-                    let mut out = ToolOutcome::ok(with_file_header(
-                        &dst,
-                        format!("{}{}", render_diff(&removed), render_diff(&added)),
-                    ));
-                    out.details = Some(serde_json::json!({ "path": dst.display().to_string() }));
-                    out
+                "insert_after": { "type": "string" },
+                "remove_source": {
+                    "type": "boolean",
+                    "description": "Remove the source range after copying, turning the copy into a move. Defaults to false. insert_after must sit outside the source range when both anchors are in the same file."
                 }
-                Err(e) => engine_out(Err(e)),
+            },
+            "required": ["source_from", "source_to", "insert_after"]
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: Value,
+        _abort: tokio::sync::watch::Receiver<bool>,
+    ) -> feather_core::tool::BoxFut<'a> {
+        Box::pin(async move {
+            let sf = match parse_anchor(&args, "source_from") {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let st = match parse_anchor(&args, "source_to") {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            let ia = match parse_anchor(&args, "insert_after") {
+                Ok(a) => a,
+                Err(e) => return e,
+            };
+            // Absent means "do not delete": the destructive reading must be opt-in,
+            // because a model that forgets the flag should leave files intact.
+            let remove_source = args
+                .get("remove_source")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if remove_source {
+                match self.store.move_anchors(sf, st, ia) {
+                    Ok((_src, dst, removed, added)) => {
+                        let mut out = ToolOutcome::ok(with_file_header(
+                            &dst,
+                            format!("{}{}", render_diff(&removed), render_diff(&added)),
+                        ));
+                        out.details =
+                            Some(serde_json::json!({ "path": dst.display().to_string() }));
+                        out
+                    }
+                    Err(e) => engine_out(Err(e)),
+                }
+            } else {
+                match self.store.copy_anchors(sf, st, ia) {
+                    Ok((_src, dst, diff)) => edited(&dst, &diff),
+                    Err(e) => engine_out(Err(e)),
+                }
             }
         })
     }
@@ -456,7 +427,7 @@ impl AgentTool for AnchorGrepTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search text files; hits come back as `lineNumber │ anchor│content` rows, editable with replace/insert/copy/move without a new read; the `=== path ===` header and line numbers locate the match. \
+        "Search text files; hits come back as `lineNumber │ anchor│content` rows, editable with replace/insert/copy without a new read; the `=== path ===` header and line numbers locate the match. \
 Searches respect common ignore dirs and skip binary files silently. A match over 500 bytes is shown as a `...` fragment around the hit, but its anchor still covers the whole line. \
 When cut by match limit, raise `limit`; when cut by rows/bytes, refine `pattern` or narrow `path`."
     }
@@ -643,9 +614,6 @@ pub fn hashline_tools(
             store: store.clone(),
         }),
         Arc::new(CopyTool {
-            store: store.clone(),
-        }),
-        Arc::new(MoveTool {
             store: store.clone(),
         }),
         Arc::new(AnchorGrepTool {
@@ -999,6 +967,91 @@ mod tests {
         let names = reg.names();
         assert!(names.contains(&"replace"), "{names:?}");
         assert!(!names.contains(&"replace_within"), "{names:?}");
+        // The same argument one tool along: `move` is now `copy` with a flag, so the
+        // old name must be gone rather than silently aliased.
+        assert!(!names.contains(&"move"), "{names:?}");
+        assert!(names.contains(&"copy"), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The merged tool's default must be the safe one. A model that omits
+    /// `remove_source` should get a copy — never a deletion — because the old
+    /// `move` tool was destructive and this one is not by default.
+    #[tokio::test]
+    async fn copy_without_remove_source_leaves_the_source_in_place() {
+        let (dir, f, store) = two_line_file("copykeep").await;
+        let first = anchor_for(&store, &f, "alpha").await;
+        let last = anchor_for(&store, &f, "beta").await;
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store.clone(), dir.clone()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "c".into(),
+                    name: "copy".into(),
+                    arguments: serde_json::json!({
+                        "source_from": first,
+                        "source_to": last,
+                        "insert_after": last,
+                    }),
+                },
+                abort.clone(),
+            )
+            .await;
+        assert!(!out.is_error, "{out:?}");
+        let body = std::fs::read_to_string(&f).unwrap();
+        // Doubled, not halved: the source survived and the copy landed.
+        assert_eq!(
+            body.matches("alpha line").count(),
+            2,
+            "source lines must remain: {body:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the flag set the same call removes the source, which is the old `move`.
+    #[tokio::test]
+    async fn copy_with_remove_source_removes_the_source_range() {
+        // Three lines, because a move needs a destination *outside* the source
+        // range — `insert_after` inside it is refused as E_INVALID_RANGE, which is
+        // the constraint this test would otherwise trip over.
+        let dir = tmp("copymove");
+        let f = dir.join("t.txt");
+        std::fs::write(&f, "alpha line\nbeta line\nomega line\n").unwrap();
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        let first = anchor_for(&store, &f, "alpha").await;
+        let last = anchor_for(&store, &f, "beta").await;
+        let omega = anchor_for(&store, &f, "omega").await;
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store.clone(), dir.clone()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "m".into(),
+                    name: "copy".into(),
+                    arguments: serde_json::json!({
+                        "source_from": first,
+                        "source_to": last,
+                        "insert_after": omega,
+                        "remove_source": true,
+                    }),
+                },
+                abort.clone(),
+            )
+            .await;
+        assert!(!out.is_error, "{out:?}");
+        let body = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(
+            body.matches("alpha line").count(),
+            1,
+            "the move must not duplicate the source: {body:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

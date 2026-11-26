@@ -531,7 +531,12 @@ impl AnchorStore {
                 .ok_or_else(|| bad_anchor(insert_after, "move"))?;
             if a <= t && t <= b {
                 return Err(EngineError::InvalidRange(
-                    "insert_after must sit outside the source range when both anchors share a file"
+                    // Names the flag, because this constraint only exists in move
+                    // mode: the same anchors are legal for a plain copy. A model that
+                    // hit this has an out besides retrying the same call.
+                    "remove_source needs insert_after outside the source range when \
+                     both anchors share a file — pick a line before source_from or \
+                     after source_to, or drop remove_source to copy instead"
                         .into(),
                 ));
             }

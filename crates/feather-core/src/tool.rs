@@ -158,6 +158,81 @@ impl ToolRegistry {
         self
     }
 
+    /// The error for a tool name this registry does not know.
+    ///
+    /// A model can put prose where the tool name belongs. Observed in the wild:
+    /// a deepseek model emitted its native `<|DSML|> invoke name=` syntax inside
+    /// the *content* stream, and the name field ended up holding an entire
+    /// multi-line note followed by the marker — so `name` was ~350 characters of
+    /// Chinese prose plus `…<｜｜DSML｜｜ invoke name=`. Echoing that back verbatim
+    /// teaches the model nothing and burns context on every retry.
+    ///
+    /// So the reply is bounded and actionable: what arrived (short), whether it
+    /// looks like a leaked tool-call marker rather than a real name, and the
+    /// nearest real tool name when the input resembles one. `execute_progress`
+    /// and `ToolRegistry::run` both go through here so the two paths cannot drift.
+    pub fn unknown_tool_error(&self, name: &str) -> String {
+        // Control characters and newlines are the tell: a real tool name is a
+        // short bare identifier. Clamp the echo so a note-sized name costs a
+        // line, not a screen.
+        let looks_leaked = name.chars().any(|c| c.is_control() || c == '\n')
+            || name.contains("DSML")
+            || name.contains("<|")
+            || name.chars().count() > 40;
+        let echo: String = if looks_leaked {
+            // Only echo the part that can plausibly be a tool name: a leading run of
+            // identifier characters. Anything else is prose, and prose is exactly
+            // what must not come back — a 40-char clamp still reproduced
+            // `constraints> - 不做 defensive writing` whole.
+            let ident: String = name
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                .collect();
+            let prefix: String = ident.chars().take(40).collect();
+            if prefix.is_empty() {
+                format!("(no name; {} chars of text)", name.chars().count())
+            } else {
+                format!("{prefix}… ({} chars)", name.chars().count())
+            }
+        } else {
+            name.to_string()
+        };
+        let mut msg = format!("unknown tool: {echo}");
+        if looks_leaked {
+            msg.push_str(
+                ". This is not a tool name — it looks like prose or a leaked tool-call \
+                 marker in the name field. Call a tool by its bare name.",
+            );
+        }
+        if let Some(near) = self.nearest_name(name) {
+            msg.push_str(&format!(" Did you mean `{near}`?"));
+        }
+        msg.push_str(&format!(" Available: {}.", self.names().join(", ")));
+        msg
+    }
+    /// Closest registered name to `haystack`, by shared-token overlap.
+    ///
+    /// Deliberately crude: the goal is to rescue `grep` from a leaked marker or a
+    /// typo, not to build an edit-distance index over sixteen strings. Returns
+    /// `None` when nothing resembles the input, because a confident wrong guess
+    /// is worse than no guess.
+    fn nearest_name(&self, haystack: &str) -> Option<&'static str> {
+        let lower = haystack.to_ascii_lowercase();
+        let mut best: Option<(usize, &'static str)> = None;
+        for candidate in self.tools.keys() {
+            // Whole-name substring (the names are short and distinctive) or a
+            // token-level match, which catches `usage of grep tool`.
+            let hit = lower.contains(&candidate.to_ascii_lowercase());
+            let score = if hit { candidate.len() + 10 } else { 0 };
+            if score == 0 {
+                continue;
+            }
+            if best.is_none_or(|(s, _)| score > s) {
+                best = Some((score, candidate));
+            }
+        }
+        best.map(|(_, n)| n)
+    }
     pub fn get(&self, name: &str) -> Option<std::sync::Arc<dyn AgentTool>> {
         self.tools.get(name).cloned()
     }
@@ -194,7 +269,7 @@ impl ToolRegistry {
                 };
                 t.execute(args, abort).await
             }
-            None => ToolOutcome::err(format!("unknown tool: {}", call.name)),
+            None => ToolOutcome::err(self.unknown_tool_error(&call.name)),
         }
     }
 }
@@ -250,6 +325,59 @@ mod tests {
         };
         let (_, rx2) = tokio::sync::watch::channel(false);
         assert!(reg.execute_call(&bad, rx2).await.is_error);
+    }
+
+    /// The verbatim shape that reached the traffic report. A deepseek model put its
+    /// whole note — plus a native `<｜｜DSML｜｜ invoke name=` marker — in the tool
+    /// *name* field, so `name` was hundreds of characters of prose. Echoing that
+    /// back teaches nothing and costs context on every retry.
+    #[tokio::test]
+    async fn a_leaked_marker_in_the_name_field_is_reported_without_dumping_the_note() {
+        let mut reg = ToolRegistry::new();
+        reg.add(std::sync::Arc::new(Echo));
+        let leaked = "constraints>\n- 不做 defensive writing\n- 无分号、无 em dash\n- 不改数字\n\
+                      </constraints>\n\n现在在 `submit_flat/paper5.tex` 上恢复身份信息，\
+                      这是生成提交包的源文件。\n\n<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=";
+        let call = ToolCall {
+            id: "1".into(),
+            name: leaked.into(),
+            arguments: serde_json::json!({}),
+        };
+        let (_, rx) = tokio::sync::watch::channel(false);
+        let out = reg.execute_call(&call, rx).await;
+        assert!(out.is_error);
+        let text = out.text;
+        // Bounded: the note must not be reproduced in full.
+        assert!(
+            text.chars().count() < 400,
+            "the error must stay short, got {} chars",
+            text.chars().count()
+        );
+        assert!(
+            !text.contains("不做 defensive writing"),
+            "the prose must not be echoed back: {text}"
+        );
+        // Actionable: it names the failure and lists real tools.
+        assert!(text.contains("not a tool name"), "{text}");
+        assert!(text.contains("echo"), "must list available tools: {text}");
+    }
+
+    /// A plain typo keeps its full echo (no truncation noise) and gets a pointer to
+    /// the tool the model probably meant, rather than a bare "unknown tool".
+    #[tokio::test]
+    async fn a_typo_gets_the_nearest_real_name() {
+        let mut reg = ToolRegistry::new();
+        reg.add(std::sync::Arc::new(Echo));
+        let call = ToolCall {
+            id: "1".into(),
+            name: "run echo".into(),
+            arguments: serde_json::json!({}),
+        };
+        let (_, rx) = tokio::sync::watch::channel(false);
+        let text = reg.execute_call(&call, rx).await.text;
+        assert!(text.contains("unknown tool: run echo"), "{text}");
+        // The name contains a registered tool, so the hint fires.
+        assert!(text.contains("Did you mean `echo`?"), "{text}");
     }
 
     #[test]

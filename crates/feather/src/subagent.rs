@@ -311,9 +311,6 @@ impl SubagentTool {
         .add(Arc::new(CopyTool {
             store: anchors.clone(),
         }))
-        .add(Arc::new(MoveTool {
-            store: anchors.clone(),
-        }))
         .add(Arc::new(UndoTool {
             store: anchors.clone(),
         }))

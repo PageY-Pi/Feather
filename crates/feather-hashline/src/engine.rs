@@ -166,7 +166,12 @@ pub enum EngineError {
     UnknownAnchor(String),
     #[error("[E_ANCHOR_STALE] {0}")]
     AnchorStale(String),
-    #[error("[E_RANGE_ORDER] remove_from must come before remove_to: {0}")]
+    // Deliberately names no parameter: `replace`, `copy` and `move` all raise this,
+    // and only `replace` calls its ends `remove_from`/`remove_to`. The old wording sent
+    // models looking for `remove_from` on tools whose schema never had it — a real
+    // observed failure (`[E_RANGE_ORDER] remove_from must come before remove_to:
+    // 232..=230` on a `move` call). The caller knows which arguments it passed.
+    #[error("[E_RANGE_ORDER] the first anchor must come before the second: {0}")]
     RangeOrder(String),
     #[error(
         "[E_MATCH_COUNT] replace_old must occur exactly once in the range, found {count}: {detail}"

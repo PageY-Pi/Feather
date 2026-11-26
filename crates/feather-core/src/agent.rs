@@ -1421,7 +1421,7 @@ async fn execute_progress(
     events: tokio::sync::broadcast::Sender<AgentEvent>,
 ) -> crate::tool::ToolOutcome {
     let Some(tool) = tools.get(&call.name) else {
-        return crate::tool::ToolOutcome::err(format!("unknown tool: {}", call.name));
+        return crate::tool::ToolOutcome::err(tools.unknown_tool_error(&call.name));
     };
     let _ = events.send(AgentEvent::ToolStart { call: call.clone() });
     // A streaming tool can emit hundreds of updates, and every `ToolProgress`

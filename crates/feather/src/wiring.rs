@@ -16,7 +16,7 @@ use feather_core::session::Session;
 use feather_core::tool::ToolRegistry;
 use feather_hashline::store::AnchorStore;
 use feather_hashline::tools::{
-    AnchorGrepTool, CopyTool, InsertTool, MoveTool, ReadTool, ReplaceTool, UndoTool, WriteTool,
+    AnchorGrepTool, CopyTool, InsertTool, ReadTool, ReplaceTool, UndoTool, WriteTool,
 };
 use std::sync::Arc;
 
@@ -25,7 +25,8 @@ pub fn system_prompt() -> String {
         "You are Feather, a standalone coding agent in the user's workspace.\n\
          Working principles:\n\
          - File edits ALWAYS go through the anchor tools: `read` returns \
-         `anchor│content` rows; edit with `replace`/`insert`/`copy`/`move`/`write`. \
+         `anchor│content` rows; edit with `replace`/`insert`/`copy` (its remove_source \
+         flag makes that a move)/`write`. \
          Never modify file contents via the shell (python/sed/awk/heredocs/redirection) — \
          bash runs code, the anchor tools edit files with verified diffs and undo.\n\
          - Anchor tools resolve paths ONLY from anchors, never from line numbers. \
@@ -234,9 +235,6 @@ pub fn build_registry(
         store: store.clone(),
     }))
     .add(Arc::new(CopyTool {
-        store: store.clone(),
-    }))
-    .add(Arc::new(MoveTool {
         store: store.clone(),
     }))
     .add(Arc::new(UndoTool {

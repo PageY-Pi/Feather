@@ -197,13 +197,33 @@ and re-run after any tool change.
   **deleted the range**. Omitting both content fields is now an error; only an
   explicit `""` deletes. A test was written first and confirmed to fail against
   the old code before the fix went in.
-- [ ] **`copy` and `move` are one tool wearing two names.** Identical schemas
-  (`source_from`/`source_to`/`insert_after`), and in 30 sessions they were called
-  23 times combined against 4500 reads. Cost: 247 tokens on every request, forever,
-  for a capability used once every few sessions. Not merged yet because the merge
-  needs a destination-mode field and 23 calls is too little data to prove the shape
-  is right; the risk of guessing outweighs 247 tokens for now. Revisit when usage
-  rises or a wrong-mode failure appears in the traffic.
+- [x] **`copy` and `move` were one tool wearing two names — now merged.** The old
+  item deferred this on "only 23 calls, too little data to prove the shape is
+  right". Both revisit triggers fired: usage rose, and a wrong-mode failure showed
+  up — `[E_RANGE_ORDER] remove_from must come before remove_to: 232..=230` on a
+  `move` call whose schema never had a `remove_from`. That message was the real
+  defect: one error string served `replace`, `copy` and `move`, but only `replace`
+  names its ends `remove_from`/`remove_to`, so it told models to fix an argument
+  that did not exist. It now says "the first anchor must come before the second",
+  which is true of all three.
+
+  Merged into `copy` with a `remove_source` boolean, absent means false so a model
+  that forgets the flag copies rather than deletes. Measured: 18 tools / 2486
+  tokens → 17 tools / 2419, and `copy`+`move` at 122+125 became 180. The cost is
+  smaller than the old item's 247 because the flag's description is prose the
+  combined entry would carry anyway; the real win is one choice instead of two.
+
+  Tests: `copy_without_remove_source_leaves_the_source_in_place` (fails if the
+  default flips to true), `copy_with_remove_source_removes_the_source_range`, and
+  the name-list assertion extended to `move` being absent. The prompt audit caught
+  both stale references — the system prompt's tool list and `anchor_grep`'s
+  description — which is exactly what it exists for.
+
+  Follow-up, not done: the `E_INVALID_RANGE` constraint applies only in move mode
+  (the same anchors are legal for a copy), so the message now names `remove_source`
+  and offers the copy fallback. Whether the flag should instead have been a
+  separate `direction` enum is unknowable from 23 calls; the boolean is the smaller
+  thing to reverse.
 - [x] **`subagent` failed 64 of 88 calls (72.7%), investigated with
   `--example subagent_failures`.** The causes split cleanly, and only 24 are the
   tool surface's fault:
@@ -225,6 +245,33 @@ and re-run after any tool change.
   gained descriptions. Cost: `subagent` went 111 → 202 tokens, +91 on every
   request. Judged worth it because each failed call burns a whole turn, but it is
   the most expensive tool definition after `bash` now.
+- [x] **A tool call arrived as prose, and the "tool name" was an entire note.**
+  Traced with `--example marker_leak`, which walks stored messages and separates the
+  two cases that look identical in a traffic report. The `unknown tool: grep` entry
+  was not a tool at all: a deepseek model emitted its native `<｜｜DSML｜｜ invoke
+  name=` syntax inside the *content* stream, so parsing produced a call whose `name`
+  field held ~350 characters of the model's own note plus the marker, and whose
+  `arguments` held a real `bash` command. The call failed as an unknown tool, which
+  means **the command never ran** — the failure was the safety net, not a breach.
+
+  Root cause is not parseable away: `openai.rs` reads `function.name` correctly, and
+  the model simply wrote a tool-call-shaped string into content. What was fixable is
+  the reply. `ToolRegistry::unknown_tool_error` now bounds the echo to a leading run
+  of identifier characters (so prose cannot come back), says when the name looks like
+  prose rather than a name, lists the real tools, and suggests the nearest registered
+  name when one is a substring — `unknown tool: grep` would have said `Did you mean
+  `anchor_grep`?`. Both call sites (`execute_progress` and `ToolRegistry::run`) go
+  through it so they cannot drift.
+
+  A test caught a bug in the first attempt: clamping to 40 chars still reproduced
+  `constraints> - 不做 defensive writing` verbatim, because the note's first sentence
+  fits in 40 characters. Verified both new tests fail against the old message.
+
+  Not fixed, deliberately: detection. Feather could watch text deltas for
+  tool-call markers and either strip them or surface a notice. Left alone because a
+  false positive would corrupt legitimate output that discusses this syntax, and the
+  current behaviour is already safe — the call fails closed.
+
 - [ ] **28 timeouts were self-inflicted, not the default.** Only 5 of 28 used the
   300000 ms default; the rest set 45–180 s themselves (9 at 120 s, 4 at 180 s, 2 at
   60 s). The schema now says real work needs minutes, but if timeouts persist the
