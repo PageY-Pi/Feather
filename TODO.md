@@ -93,3 +93,93 @@ than claiming full behavioral parity.
   Start-menu/desktop shortcuts recreated) and in the product: a temp copy now
   refuses to register the menu, a real start repoints a stale entry at itself,
   and the installer prepends `{app}` to PATH instead of appending it.
+
+## Open — context and memory
+
+Ideas under evaluation, not commitments. Sizes are the author's estimate of the
+change, not a schedule.
+
+- [ ] **Make compaction lossy-but-traceable.** `summary_message` currently
+  writes a summary with no reference to what it replaced, so once
+  `shrink_messages_to_tokens` drops a turn or elides a `ToolCall`'s arguments,
+  a detail the summary missed is unrecoverable even though the raw messages are
+  still in `session.redb`. Record the turn/sequence range each summary covers
+  (e.g. `[compressed turns 12-34, seq 210-640]`) so a later `search_context`
+  can find it, and so a reader of the transcript can see what was folded.
+  No behaviour change on its own. _Small._
+- [ ] **`search_context` tool over the raw audit.** `SessionStore` already has
+  `raw_messages()` and `raw_page_before()`, and compaction never touches the raw
+  audit — the storage needed for retrieval is present and idle. A search tool
+  would let the model recover a path, command or identifier that the summarizer
+  dropped. This is the capability that reversible-compression proxies provide
+  and that Feather currently lacks entirely. _Medium._
+- [ ] **Escape role labels before flattening for the summarizer.**
+  `serialize_messages` marks each message with a literal `[User]:` /
+  `[Assistant]:` prefix and does not escape those prefixes inside message text,
+  so content the agent read (a file, a tool result) can forge a user turn that
+  survives compaction as a genuine instruction. Role-typed harnesses are immune;
+  flattening ones are not. Escaping the labels at the serializer is the stated
+  fix. _Small._
+- [ ] **Evaluate persistent memory — leaning negative.** See the research note
+  below. The short version: memory that stores *inferred judgments* inherits
+  their errors and carries them across sessions with no expiry, while memory
+  that stores *verifiable pointers* (paths, commands, test outcomes) degrades
+  safely. Feather already has the safe variant in `AGENTS.md`.
+
+## Research note — persistent memory (2026-11-24)
+
+Question: does persistent memory help, or does it record wrong judgments and
+end up worse than not remembering?
+
+**What the evidence says.** The failure mode is real and is the one you
+described, but it is a property of *what* is stored, not of persistence itself.
+
+- `LEDGER` (arXiv 2611.20927) is the most directly relevant result. It splits
+  memory into a fact layer with **explicit rules for which value is current,
+  which source is trusted, and what to delete**, plus raw-turn search as a
+  fallback. On a coding-agent workload it answers **94.3% / 91.1%** (dev /
+  held-out seeds) against **82.1% / 83.3% for full-history replay** — the
+  strongest baseline. On LongMemEval it matches full replay (74.8%) using **1%
+  of the context**. Three things follow: memory can beat full context; the gain
+  comes from staleness rules, not from storage; and deletion has to be a
+  first-class operation.
+- The same paper shows what happens without those rules: facts round-tripped
+  through a model are only as good as the model's extraction, and a memory store
+  that never expires a value keeps serving it after it stops being true. Your
+  concern is the failure mode of *inferred* memory, and it is documented.
+- `MemoSync` (arXiv 2611.24165, N=132) tested the opposite of autonomy: the
+  agent *proposes* memory candidates and the developer reviews, edits and scopes
+  them, with the agent reporting which items it actually used. It beat two
+  baselines, and a mediation analysis attributed the win to **monitoring
+  accuracy** rather than to more memory. A memory the user cannot see or correct
+  is the case that degrades.
+- `Coding Agent Memory Post-Training II` (arXiv 2611.14009) finds the strongest
+  memory behaviour is **file-based, using ordinary `bash` and a persistent
+  workspace** — no special memory subsystem. The policy learns to write down,
+  search and re-read files. Feather's `write`/`read`/`anchor_grep` already give
+  that surface.
+- `Security Impact of Coding Agent's Memory Files` (arXiv 2610.38521) is a
+  caution on the same axis: malicious content in a loaded memory file changed
+  secure-completion rates by **-8 to +6 points**, with no consistent pattern, and
+  flagging the file as an attack did not reliably prevent vulnerable output. Any
+  auto-loaded memory is an attack surface, which argues for memory the user
+  authors or approves.
+- `napkin` (a widely-copied Claude Code skill) is the popular form of the risky
+  pattern: the agent continuously appends "mistakes, corrections, preferences"
+  to a repo markdown file it reads at session start. It reports a behaviour shift
+  by session 3-5, but nothing expires, nothing is verified, and the file only
+  grows — exactly the accumulating-error failure mode.
+
+**Assessment for Feather.** Do not build inferred-judgment memory. The evidence
+supports memory that is (a) verifiable, (b) user-visible and editable, and
+(c) expirable. Feather's existing `AGENTS.md` load (`config::project_context`,
+global + per-directory, user-authored) is already the *safe* variant: the user
+writes it, it is version-controlled, it can be deleted, and it holds durable
+preferences rather than model guesses. Adding a model-maintained memory file
+next to it would import the entire risk for a benefit that the four citations
+above attribute to *rules and review*, which `AGENTS.md` already has in the
+form the user controls.
+
+If something more is wanted later, extend the safe direction first: search the
+raw audit (`search_context`, above) beats storing a model's paraphrase of it,
+because the raw audit cannot be wrong — it is what actually happened.
