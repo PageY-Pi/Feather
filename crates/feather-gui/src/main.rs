@@ -1689,6 +1689,7 @@ impl FeatherApp {
                     self.sync_queued_hint();
                 }
             }
+            "app.clipboard.pasteImage" => self.paste_image(),
             "app.exit" => {
                 if self.input.is_empty() && !self.running {
                     self.request_close();

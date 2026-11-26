@@ -171,6 +171,28 @@ fn finalized_message_precedes_queued_user_delivery() {
 }
 
 #[test]
+fn the_paste_image_binding_reaches_a_handler() {
+    // The binding table promised `alt+v` and `handle_action` had no arm for it, so the
+    // match fell through to `_ => {}` and the key did nothing — the exact bug
+    // `clipboard_image`'s module doc says it was written to fix. A keybinding is only
+    // real if the action string reaches a branch, and nothing tied the two together:
+    // the table and the match are separate string literals.
+    //
+    // This asserts the wiring, not the clipboard. `read_image` talks to the Win32
+    // clipboard and the test machine has no image on it, so the observable effect of a
+    // working arm is the *failure* notice — "no image on the clipboard" or a decode
+    // reason. A dead binding pushes no row at all.
+    let mut app = fixture();
+    let ctx = app.egui_ctx.clone();
+    app.handle_action("app.clipboard.pasteImage", &ctx);
+    assert!(
+        !app.rows.is_empty(),
+        "the action must reach `paste_image`, which always reports an outcome"
+    );
+    assert_eq!(app.rows[0].kind, RowKind::Notice);
+}
+
+#[test]
 fn modal_enter_does_not_submit_composer() {
     let mut app = fixture();
     app.input = "keep draft".into();

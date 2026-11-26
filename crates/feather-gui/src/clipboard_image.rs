@@ -3,7 +3,11 @@
 //! Why this exists: `rpc::user_message` accepts an `images` array and the
 //! providers all encode images natively, but nothing in the GUI ever produced
 //! one. The `app.clipboard.pasteImage` binding promised `alt+v` and had no
-//! handler, so the key did nothing. This module is the missing producer.
+//! handler, so the key did nothing. This module is the missing producer, and
+//! `handle_action` carries the arm that calls it. Note that the module alone does not
+//! make the key work: for a while this doc claimed the fix while the match still had
+//! no arm, and every image test passed because they call the producer directly. The
+//! binding is only real when a test drives `handle_action`.
 //!
 //! egui 0.29 has no image clipboard API (`Clipboard` is text-only and
 //! `Event::Paste` carries a `String`), so the Win32 clipboard is read directly.

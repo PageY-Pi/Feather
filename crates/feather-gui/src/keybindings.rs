@@ -211,8 +211,11 @@ pub const ACTIONS: &[(&str, &[&str])] = &[
     ("app.suspend", &[]),
     ("app.editor.external", &["ctrl+g"]),
     // pi: ctrl+v, alt+v on Windows — the GUI keeps ctrl+v for text and uses
-    // alt+v for an image, matching pi. `handle_action` has the arm, and
-    // `clipboard_image` is the intake that makes it real.
+    // alt+v for an image, matching pi. The arm in `handle_action` is separate from
+    // this table and there is nothing forcing them to agree — it read
+    // `_ => {}` here for a while, so the key did nothing at all.
+    // `the_paste_image_binding_reaches_a_handler` is what holds the two together.
+    // `clipboard_image` is the intake; the arm in `handle_action` calls it.
     ("app.clipboard.pasteImage", &["alt+v"]),
     // -- sessions --
     ("app.session.new", &["ctrl+shift+n"]),
