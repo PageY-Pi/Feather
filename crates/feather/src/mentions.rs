@@ -7,6 +7,17 @@
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 const MAX_TEXT_ATTACHMENT_CHARS: usize = 8_000;
+/// The most bytes an `@image.png` mention will read into an attachment.
+///
+/// This is a *byte* cap, and PNG is a compressor: a mostly flat 12000x12000 image
+/// is 2.69 MiB, so it passes at 144 megapixels. Pixel count is what a provider
+/// bills for, so this cap does not bound the cost it looks like it bounds.
+/// Downscaling would (a 1568 long edge saves 97.5% of the bytes on an 8000x8000
+/// mention), but it needs a decode, and measured that decode is ~560 ms on the
+/// synchronous send path (`examples/mention_downscale_cost.rs`) — worse than the
+/// bytes. The paste path avoids this by capping before it ever encodes; a mention
+/// arrives already encoded, so the cap cannot be applied without paying the decode.
+/// Left as a byte cap deliberately, not by oversight.
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// One attached image (base64, provider-native image block).

@@ -218,19 +218,53 @@ mod windows_clipboard {
                 rgba.extend_from_slice(&[r, g, b, a]);
             }
         }
-        encode_png(width, height, &rgba)
+        encode_png(width, height, rgba)
     }
+    /// The largest long edge a pasted image is kept at before encoding.
+    ///
+    /// Vision models do not want the full 4K stream: a provider bill for an image is
+    /// driven by its pixel grid, and Anthropic documents 1568 as the long edge above
+    /// which it downscales server-side anyway. Sending more therefore costs upload
+    /// time and, because the block lives in the message history, bytes on *every*
+    /// later request in the session — for no extra detail. Measured on a synthetic
+    /// screenshot (`examples/paste_cost.rs`):
+    ///
+    /// | paste | uncapped (time / bytes per request) | capped |
+    /// |-------|------------------------------------|--------|
+    /// | 1080p | 21 ms / 5.4 MiB | 42 ms / 2.8 MiB |
+    /// | 1440p | 37 ms / 9.6 MiB | 51 ms / 2.7 MiB |
+    /// | 4K    | 81 ms / 21.7 MiB | 65 ms / 2.5 MiB |
+    /// | 8K    | 330 ms / 86.7 MiB | 130 ms / 2.2 MiB |
+    ///
+    /// Above 4K the cap is also *faster*, because PNG compressing 126 MiB of RGBA
+    /// costs more than resampling to 1568 does. Below it the resize is a real cost
+    /// (~20 ms) and the bytes are what it buys.
+    pub(super) const MAX_LONG_EDGE: u32 = 1568;
+
     /// Re-encode RGBA pixels as a PNG and base64 it.
     ///
     /// PNG is produced rather than passing the DIB through because every provider
     /// takes a media type from the documented set and `CF_DIB` is not one of them.
-    unsafe fn encode_png(
+    pub(super) unsafe fn encode_png(
         width: u32,
         height: u32,
-        rgba: &[u8],
+        rgba: Vec<u8>,
     ) -> Result<super::ClipboardImage, String> {
-        let buffer: image::RgbaImage = image::ImageBuffer::from_raw(width, height, rgba.to_vec())
+        // `rgba` is already a freshly allocated buffer, so it is moved into the
+        // image rather than copied — at 4K the copy was another 33 MB on the GUI
+        // thread right when the frame is already late.
+        let mut buffer: image::RgbaImage = image::ImageBuffer::from_raw(width, height, rgba)
             .ok_or("clipboard image buffer size mismatch")?;
+        let (mut width, mut height) = (buffer.width(), buffer.height());
+        if width.max(height) > MAX_LONG_EDGE {
+            let scale = MAX_LONG_EDGE as f64 / width.max(height) as f64;
+            let (w, h) = (
+                ((width as f64 * scale).round() as u32).max(1),
+                ((height as f64 * scale).round() as u32).max(1),
+            );
+            buffer = image::imageops::resize(&buffer, w, h, image::imageops::FilterType::Triangle);
+        }
+        (width, height) = (buffer.width(), buffer.height());
         let mut png = Vec::new();
         {
             use image::ImageEncoder;
@@ -257,6 +291,57 @@ mod windows_clipboard {
 mod tests {
     use super::*;
 
+    /// A paste must be downscaled before it is encoded: the block is re-sent with
+    /// every later request, so an un-capped screenshot is paid for over and over.
+    ///
+    /// The size is measured from the *encoded PNG*, not from the reported width and
+    /// height, because a wrong `width`/`height` label would let this pass while the
+    /// payload stayed huge.
+    #[test]
+    fn a_pasted_image_is_capped_to_the_max_long_edge() {
+        // 4000x500 is well past the cap on one edge and under it on the other: the
+        // scale must follow the *long* edge, not simply clamp both.
+        let (w, h) = (4000u32, 500u32);
+        let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 64, 255]);
+            }
+        }
+        let image = unsafe { windows_clipboard::encode_png(w, h, rgba) }.expect("encode");
+        assert_eq!(
+            image.width,
+            windows_clipboard::MAX_LONG_EDGE,
+            "the long edge must be capped, got {}x{}",
+            image.width,
+            image.height
+        );
+        // Aspect ratio preserved: 4000x500 -> 1568x196.
+        assert_eq!(image.height, 196, "aspect ratio must be preserved");
+        // And the reported size must match the bytes actually encoded: decode the
+        // base64 back and read the PNG header, which is the only claim a provider sees.
+        let png = tests_support::decode_base64(&image.data);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "must be a real PNG");
+        let png_w = u32::from_be_bytes(png[16..20].try_into().unwrap());
+        let png_h = u32::from_be_bytes(png[20..24].try_into().unwrap());
+        assert_eq!(
+            (png_w, png_h),
+            (image.width, image.height),
+            "the label must match the encoded pixels"
+        );
+    }
+
+    /// An image already inside the cap must not be resampled: the resize costs ~20 ms
+    /// and would only blur the picture.
+    #[test]
+    fn an_image_within_the_cap_is_not_resampled() {
+        let (w, h) = (640u32, 480u32);
+        let rgba: Vec<u8> = (0..w as usize * h as usize)
+            .flat_map(|i| [(i % 256) as u8, 0, 0, 255])
+            .collect();
+        let image = unsafe { windows_clipboard::encode_png(w, h, rgba) }.expect("encode");
+        assert_eq!((image.width, image.height), (w, h));
+    }
     #[test]
     fn base64_matches_the_rfc_vectors() {
         assert_eq!(base64(b""), "");
