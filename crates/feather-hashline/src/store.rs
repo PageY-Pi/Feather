@@ -555,14 +555,63 @@ impl AnchorStore {
                 .ok_or_else(|| EngineError::Io("map vanished".into()))?;
             m.take_range(source_from, source_to)?
         };
-        let removed = self.with_map_mut(src_path, |m| m.remove_range(source_from, source_to))?;
         let same_file = src_path == dst_path;
+        // A same-file move is two edits on one file: remove, then paste. Each would
+        // take its own undo snapshot and the paste would overwrite the remove's, so
+        // one `undo` would restore the file *without* the moved lines — silent data
+        // loss on an operation the description calls safe. Marking both halves
+        // composite keeps the first snapshot, so a single undo restores the whole
+        // pre-move file. A cross-file move cannot be undone atomically at all:
+        // `undo` takes one path, so each file keeps its own snapshot and the caller
+        // must undo each side. That is a documented limit, not an oversight.
+        let removed = self.with_map_mut_composite(src_path, same_file, |m| {
+            m.remove_range(source_from, source_to)
+        })?;
         // after removal the destination map must be re-read for same-file
         // moves: the insert_after anchor survives (it is outside the range)
-        let added = self.with_map_mut(dst_path, |m| {
+        let added = self.with_map_mut_composite(dst_path, same_file, |m| {
             m.paste_range(insert_after, &payload, same_file)
         })?;
         Ok((removed, added))
+    }
+
+    /// Apply `f` to the map for `path` and persist the result.
+    ///
+    /// `composite` marks one half of a multi-step edit. Between the halves the
+    /// undo snapshot must survive, so that a single `undo` restores the state
+    /// before the first half rather than only the second. Leaving it false gives
+    /// each call its own snapshot, which is right for a single edit.
+    fn with_map_mut_composite<T>(
+        &self,
+        path: &Path,
+        composite: bool,
+        f: impl FnOnce(&mut AnchorMap) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        self.before_edit(path)?;
+        let mut maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        if !maps.contains_key(path) {
+            drop(maps);
+            self.ensure(path)?;
+            maps = self.maps.lock().unwrap_or_else(|e| e.into_inner());
+        }
+        let map = maps
+            .get_mut(path)
+            .ok_or_else(|| EngineError::Io("map vanished".into()))?;
+        if composite {
+            map.begin_composite();
+        }
+        let out = f(map);
+        if composite {
+            map.end_composite();
+        }
+        let out = out?;
+        self.index_map(map);
+        let rec = map.persist_record();
+        drop(maps);
+        self.persist_record(&rec);
+        self.after_edit(path)?;
+        self.restamp(path);
+        Ok(out)
     }
 
     fn with_map_mut<T>(
@@ -909,6 +958,45 @@ fn bad_anchor(a: Anchor, op: &str) -> EngineError {
 mod tests {
     use super::*;
 
+    /// Undoing a same-file move through the store must restore the whole file.
+    ///
+    /// This is the path `copy` with `remove_source` takes. It failed before the fix:
+    /// `move_range` ran `remove_range` and then `paste_range`, each taking its own
+    /// undo snapshot, so the paste's snapshot replaced the remove's and one `undo`
+    /// left the file with the moved lines gone.
+    #[test]
+    fn undo_restores_a_same_file_move_through_the_store() {
+        let dir = home("move-undo");
+        let path = dir.join("move.txt");
+        let original = "alpha\nbeta\ngamma\ndelta\n";
+        std::fs::write(&path, original).unwrap();
+        let store = AnchorStore::new(&dir);
+        let rows = store.read(&path, None, None).unwrap();
+        // Anchors are the first field of each `anchor│content` row.
+        let anchor_at = |i: usize| {
+            let row = &rows[i];
+            let (a, _) = row.split_once('│').unwrap();
+            Anchor::parse(a).unwrap()
+        };
+        store
+            .move_anchors(anchor_at(1), anchor_at(1), anchor_at(3))
+            .expect("same-file move runs");
+        let moved = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(moved, original, "the move must have changed the file");
+        assert_eq!(
+            moved.lines().count(),
+            original.lines().count(),
+            "a move must not add or drop lines"
+        );
+
+        store.undo(&path).expect("one undo");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "one undo must restore the pre-move file, not a file missing the moved line"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
     fn home(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "feather-store-{tag}-{}-{}",

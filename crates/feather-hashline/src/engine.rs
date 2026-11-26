@@ -1259,6 +1259,32 @@ mod tests {
         assert_eq!(src.lines, vec!["s3"]);
     }
 
+    /// A same-file move is two engine calls (remove, then paste). One undo must
+    /// restore the pre-move file, not just the paste half.
+    ///
+    /// `begin_composite` exists for exactly this and was never called from outside
+    /// this file, so `composite_undo` stayed false: `remove_range` took a snapshot,
+    /// `paste_range` overwrote it, and undoing a move restored the file *with the
+    /// moved lines deleted* — silent data loss on a documented-safe operation.
+    #[test]
+    fn one_undo_restores_a_same_file_move() {
+        let mut m = map_with("a\nb\nc\nd\n");
+        let before = m.lines.clone();
+        let (sf, st) = (anchor(&m, 1), anchor(&m, 1)); // move "b"
+        let target = anchor(&m, 3); // to after "d"
+        m.begin_composite();
+        m.remove_range(sf, st).unwrap();
+        let payload = vec![(sf, "b".to_string(), 0)];
+        m.paste_range(target, &payload, true).unwrap();
+        m.end_composite();
+        assert_eq!(m.lines, vec!["a", "c", "d", "b"], "move should reorder");
+        m.undo().unwrap();
+        assert_eq!(
+            m.lines, before,
+            "one undo must restore the whole pre-move file, not just the paste"
+        );
+    }
+
     #[test]
     fn undo_restores_last_mutation() {
         let mut m = map_with("a\nb\n");

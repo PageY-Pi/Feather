@@ -197,7 +197,7 @@ Whole lines: `remove_from`/`remove_to` are the 5-char anchors of the first and l
 Part of a line: pass `replace_old` (copied exactly from the served row, must occur once in the range) and `replace_new`; every character you do not name is preserved, so nothing needs retyping. \
 Target lines by anchor, never by content or line number. \
 A trailing line break sets the last line's ending instead of adding a blank line. \
-Path resolution is anchor-only. Same-file calls in one message batch share one undo."
+Path resolution is anchor-only. One undo per edit; a batch undoes only the last."
     }
 
     fn parameters(&self) -> Value {
@@ -428,7 +428,7 @@ impl AgentTool for AnchorGrepTool {
 
     fn description(&self) -> &'static str {
         "Search text files; hits come back as `lineNumber │ anchor│content` rows, editable with replace/insert/copy without a new read; the `=== path ===` header and line numbers locate the match. \
-Searches respect common ignore dirs and skip binary files silently. A match over 500 bytes is shown as a `...` fragment around the hit, but its anchor still covers the whole line. \
+Searches respect common ignore dirs and skip binary files silently. A match over 500 bytes is shown as a `...` fragment around the hit, but its anchor still covers the whole line; replace it whole, not in part. \
 When cut by match limit, raise `limit`; when cut by rows/bytes, refine `pattern` or narrow `path`."
     }
 
@@ -509,7 +509,7 @@ impl AgentTool for UndoTool {
     }
 
     fn description(&self) -> &'static str {
-        "Undo the last replace, insert, copy, or move on a file, restoring the previous content. \
+        "Undo the last replace, insert, or copy on a file (a move is a copy with remove_source), restoring the previous content. \
 Use it when an edit removed or changed the wrong lines. If the file changed since that edit, the undo is refused with [E_UNDO_STALE] and nothing is modified: verify the current state with read and stop instead of forcing the undo."
     }
 

@@ -5,7 +5,9 @@
 //! and a prompt with legitimate near-misses must come back empty, or the audit
 //! becomes something to appease rather than something to trust.
 
-use feather::prompt_audit::{audit, rules, tool_references, Defect, TOKEN_BUDGET};
+use feather::prompt_audit::{
+    audit, audit_tool_descriptions, rules, tool_references, Defect, TOKEN_BUDGET,
+};
 use feather::wiring::{build_registry, faux_provider, system_prompt};
 use std::sync::Arc;
 
@@ -349,5 +351,73 @@ fn one_edit_that_breaks_two_things_reports_both() {
             .any(|d| matches!(d, Defect::DuplicateRule { .. })),
         "{:?}",
         defects
+    );
+}
+
+/// A tool description naming a retired tool must be caught.
+///
+/// The prompt audit could not see this: it reads only the system prompt, so
+/// `undo_last_change`'s "replace, insert, copy, or move" survived the retirement of
+/// `move` with nothing reporting it. This proves the check fires before the clean
+/// case below proves it is silent on the live registry.
+#[test]
+fn a_description_naming_a_dead_tool_is_reported() {
+    let tools = registry_tools();
+    let refs: Vec<&str> = tools.iter().map(String::as_str).collect();
+    let descriptions = [(
+        "undo_last_change",
+        "Undo the last replace, insert, copy, or `move` on a file.",
+    )];
+    // Parameter names are legitimate backticks in a description and are not tools;
+    // pass a couple so the negative is exercised here too.
+    let defects = audit_tool_descriptions(&descriptions, &refs, &["remove_from", "lines"]);
+    assert!(
+        defects.iter().any(
+            |d| matches!(d, Defect::DeadToolReference { name, .. } if name.starts_with("move"))
+        ),
+        "a backticked dead tool in a description must be reported: {defects:?}"
+    );
+}
+
+/// The live registry's own descriptions must be clean.
+///
+/// This is the gate: if a future edit names a tool that no longer exists in any
+/// description, this fails. Run against the real registry, never a copied list.
+#[test]
+fn the_live_tool_descriptions_reference_only_real_tools() {
+    let names = registry_tools();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let root = std::env::current_dir().expect("cwd");
+    let tmp = std::env::temp_dir().join(feather_core::provider::gen_id("desc-audit"));
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let settings = feather::config::Settings::default();
+    let tasks = Arc::new(feather::tasks::TaskStore::open(&tmp));
+    let provider = Arc::new(feather_core::agent::ProviderRef::Faux(faux_provider()));
+    let registry = build_registry(&root, &tmp, &settings, &tasks, &tmp, &provider);
+    // Every property name in every schema is legitimate backticked vocabulary in a
+    // description, so the audit is told the full set. Without it, `remove_from` and
+    // `timeout` read as dead tools — 18 false positives on the live registry.
+    let defs = registry.defs();
+    let mut parameters: Vec<String> = Vec::new();
+    for def in &defs {
+        if let Some(props) = def.parameters.get("properties").and_then(|p| p.as_object()) {
+            parameters.extend(props.keys().cloned());
+        }
+    }
+    parameters.sort();
+    parameters.dedup();
+    let param_refs: Vec<&str> = parameters.iter().map(String::as_str).collect();
+    let owned: Vec<(String, String)> = defs.into_iter().map(|d| (d.name, d.description)).collect();
+    let descriptions: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    let defects = audit_tool_descriptions(&descriptions, &refs, &param_refs);
+    drop(registry);
+    drop(tasks);
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+        defects.is_empty(),
+        "tool descriptions name tools that do not exist: {defects:?}"
     );
 }

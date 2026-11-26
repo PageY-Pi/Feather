@@ -235,6 +235,50 @@ pub fn audit(prompt: &str, tools: &[&str]) -> Vec<Defect> {
     defects
 }
 
+/// Audit the **tool descriptions** for references to tools that do not exist.
+///
+/// `audit` only sees the system prompt, so a tool description could name a
+/// capability the registry does not have and nothing noticed. That is not
+/// hypothetical: `undo_last_change` said "the last replace, insert, copy, or
+/// move" for as long as `move` had been merged into `copy`, and a model reading
+/// it would either call `move` (one wasted call) or assume `copy` has two modes.
+///
+/// The hard part is that a description legitimately backticks **parameter names**
+/// (`remove_from`, `timeout`, `lines`) as often as tool names, and those are not
+/// tools. So a name is only reported when it looks like a tool *and* is not a
+/// parameter of any registered tool: parameters are shared vocabulary across the
+/// registry, and a real tool name never collides with one. Guessing from the name
+/// alone reported 18 false positives on the live registry.
+///
+/// This is a weaker check than it looks. A description mentioning a retired tool
+/// *without* backticks still escapes it, and so does a retired name whose spelling
+/// matches a surviving parameter. It catches enough to be worth having — the
+/// `move` case would have been caught had it been backticked — and the sentence in
+/// `undo_last_change` was also reworded by hand rather than left to the audit.
+pub fn audit_tool_descriptions(
+    descriptions: &[(&str, &str)],
+    tools: &[&str],
+    parameters: &[&str],
+) -> Vec<Defect> {
+    let known: BTreeSet<&str> = tools.iter().copied().collect();
+    let params: BTreeSet<&str> = parameters.iter().copied().collect();
+    let mut defects = Vec::new();
+    for (tool, description) in descriptions {
+        for name in tool_references(description) {
+            if known.contains(name.as_str()) || params.contains(name.as_str()) {
+                continue;
+            }
+            // Report the owning tool in the line slot: there is no line number,
+            // and "which description said it" is the actionable part.
+            defects.push(Defect::DeadToolReference {
+                line: 0,
+                name: format!("{name} (in `{tool}` description)"),
+            });
+        }
+    }
+    defects
+}
+
 /// Report rules wholly contained in another rule.
 ///
 /// Verbatim containment is the only redundancy signal here that cannot misfire:
