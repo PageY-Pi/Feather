@@ -99,27 +99,28 @@ than claiming full behavioral parity.
 Ideas under evaluation, not commitments. Sizes are the author's estimate of the
 change, not a schedule.
 
-- [ ] **Make compaction lossy-but-traceable.** `summary_message` currently
-  writes a summary with no reference to what it replaced, so once
-  `shrink_messages_to_tokens` drops a turn or elides a `ToolCall`'s arguments,
-  a detail the summary missed is unrecoverable even though the raw messages are
-  still in `session.redb`. Record the turn/sequence range each summary covers
-  (e.g. `[compressed turns 12-34, seq 210-640]`) so a later `search_context`
-  can find it, and so a reader of the transcript can see what was folded.
-  No behaviour change on its own. _Small._
-- [ ] **`search_context` tool over the raw audit.** `SessionStore` already has
-  `raw_messages()` and `raw_page_before()`, and compaction never touches the raw
-  audit — the storage needed for retrieval is present and idle. A search tool
-  would let the model recover a path, command or identifier that the summarizer
-  dropped. This is the capability that reversible-compression proxies provide
-  and that Feather currently lacks entirely. _Medium._
-- [ ] **Escape role labels before flattening for the summarizer.**
-  `serialize_messages` marks each message with a literal `[User]:` /
-  `[Assistant]:` prefix and does not escape those prefixes inside message text,
-  so content the agent read (a file, a tool result) can forge a user turn that
-  survives compaction as a genuine instruction. Role-typed harnesses are immune;
-  flattening ones are not. Escaping the labels at the serializer is the stated
-  fix. _Small._
+- [x] **Make compaction lossy-but-traceable.** Done: `FoldedRange` records the
+  message count and the millisecond span each summary replaced, and
+  `summary_message` writes a `<folded-range>` marker naming it and pointing at
+  `search_context`. `compaction.mark` measures 2.2 µs — once per compaction, so
+  it never registers against a turn.
+- [x] **`search_context` tool over the raw audit.** Done: `feather_core::ctxsearch`
+  reads the audit through the existing `raw_page_before` paging, scanning
+  newest-first and stopping as soon as `limit` is met. Registered unconditionally
+  in `wiring::build_registry`. Two things the implementation had to get right:
+  a cheap pre-filter rejects non-matching messages without building a string
+  (A/B: ~460 µs → ~340 µs on a 500-row scan), and a `limit` stop mid-page still
+  reports that more may exist. Measured at 335 µs, of which ~309 µs is storage
+  deserialisation — the `context.page` control (164 µs for 256 rows) is what makes
+  that attribution possible rather than guessed.
+- [x] **Escape role labels before flattening for the summarizer.** Done:
+  `escape_role_labels` prefixes a backslash on any content line that would read
+  as `[User]:`, `[Assistant]:`, `[Tool result]:` or `[Assistant tool calls]:`,
+  applied to user text, assistant text and tool results. It borrows and does no
+  work when nothing is forgeable. `compaction.escape` measures 24 µs over 400
+  messages with 20% adversarial content. Tool-call arguments are serialised as
+  JSON, so a newline there is already escaped — a test pins that, because it is
+  JSON encoding rather than the escaper that keeps that path safe.
 - [ ] **Evaluate persistent memory — leaning negative.** See the research note
   below. The short version: memory that stores *inferred judgments* inherits
   their errors and carries them across sessions with no expiry, while memory

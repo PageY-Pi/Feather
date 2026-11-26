@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod checkpoint_worker;
 pub mod compaction;
+pub mod ctxsearch;
 pub mod database;
 pub mod file_snapshots;
 pub mod gitckpt;

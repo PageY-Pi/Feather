@@ -6,6 +6,7 @@ pub mod bash;
 pub mod command_policy;
 pub mod config;
 pub mod config_store;
+pub mod ctxsearch;
 pub mod mentions;
 pub mod model_refresh;
 pub mod models;

@@ -1328,9 +1328,16 @@ impl Agent {
 
         // rewrite the linear context: summary + shrunk kept span
         let (reads, writes) = file_ops(to_summarize);
+        // What this summary replaces, so the fold stays traceable after the
+        // original messages leave the live context.
+        let folded = compaction::FoldedRange {
+            messages: to_summarize.len(),
+            from_ms: to_summarize.first().map(|m| m.timestamp).unwrap_or(0),
+            to_ms: to_summarize.last().map(|m| m.timestamp).unwrap_or(0),
+        };
         drop(context); // release old immutable history before installing new context
         shrink_kept_span(&mut kept, &settings);
-        let mut new_msgs = vec![summary_message(&summary, &reads, &writes)];
+        let mut new_msgs = vec![summary_message(&summary, &reads, &writes, folded)];
 
         new_msgs.extend(kept);
         // Safety net only: the cut above already targets the keep budget, so

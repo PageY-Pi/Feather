@@ -255,6 +255,13 @@ pub fn build_registry(
             cwd: root.to_path_buf(),
         }));
     }
+    // History search must survive compaction: it reads the raw audit that
+    // compaction never writes, so a detail the summarizer dropped stays
+    // recoverable. Registered unconditionally — a tool the model cannot see is
+    // not a capability.
+    reg.add(Arc::new(crate::ctxsearch::SearchContextTool {
+        session_dir: session_dir.to_path_buf(),
+    }));
     reg.add(Arc::new(crate::web::WebFetchTool))
         .add(Arc::new(crate::web::WebSearchTool {
             model: settings.model.clone(),

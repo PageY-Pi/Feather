@@ -503,7 +503,12 @@ mod tests {
                 .push(Message::user_text(format!("original prompt {n}")))
                 .unwrap();
         }
-        let summary = feather_core::compaction::summary_message("PRIVATE SUMMARY", &[], &[]);
+        let summary = feather_core::compaction::summary_message(
+            "PRIVATE SUMMARY",
+            &[],
+            &[],
+            feather_core::compaction::FoldedRange::default(),
+        );
         session.set_messages_for_compaction(vec![summary]);
         session.commit_turn().unwrap();
         let dir = session.dir().to_path_buf();

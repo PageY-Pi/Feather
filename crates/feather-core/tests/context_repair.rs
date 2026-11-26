@@ -59,7 +59,12 @@ fn resume_repairs_a_snapshot_that_opens_on_an_orphan_tool_result() {
     let turn = s.commit_turn().unwrap();
 
     let broken = vec![
-        feather_core::compaction::summary_message("earlier work", &[], &[]),
+        feather_core::compaction::summary_message(
+            "earlier work",
+            &[],
+            &[],
+            feather_core::compaction::FoldedRange::default(),
+        ),
         Message::tool_result("call_00_gone", "bash", "395: chosen_preset = ...", false),
         assistant_text("carrying on"),
     ];
@@ -119,7 +124,12 @@ fn rewind_restores_verbatim_and_repair_is_idempotent() {
 #[test]
 fn repaired_context_converts_to_a_body_providers_accept() {
     let broken = vec![
-        feather_core::compaction::summary_message("earlier work", &[], &[]),
+        feather_core::compaction::summary_message(
+            "earlier work",
+            &[],
+            &[],
+            feather_core::compaction::FoldedRange::default(),
+        ),
         Message::tool_result("call_00_gone", "bash", "395: chosen_preset = ...", false),
         assistant_text("carrying on"),
     ];
