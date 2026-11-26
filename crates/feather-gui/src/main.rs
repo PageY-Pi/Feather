@@ -2437,6 +2437,18 @@ fn main() -> anyhow::Result<()> {
     // A renderer child never waits on itself; the parent is only a prior GUI
     // instance handed off by this process.
     lifecycle::wait_for_parent()?;
+    // Heal an Explorer menu entry that an update left pointing at a file that no
+    // longer exists. `repair_if_stale` existed and had no caller, so the recovery it
+    // performs could only happen by hand: an automatic update that moved the
+    // executables left every right-click entry dead until the user re-ran
+    // `--install-context-menu`. It is a no-op when nothing is registered, when the
+    // registration is live (a menu deliberately pointed at another build must stay
+    // put) and when this binary is transient (running from a temp or build dir).
+    if let Ok(exe) = std::env::current_exe() {
+        if context_menu::repair_if_stale(&exe).is_some() {
+            eprintln!("registered Explorer menu repaired to {}", exe.display());
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--install-context-menu") {
         let exe = std::env::current_exe()?;

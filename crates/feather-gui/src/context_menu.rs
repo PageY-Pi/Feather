@@ -282,7 +282,20 @@ mod tests {
         )));
     }
 
+    /// The recovery has to fire on a stale entry and stay out of the way otherwise.
+    ///
+    /// Only the two guards are asserted, not the registry rewrite: `repair_if_stale`
+    /// calls `install`, which writes HKCU, and a test must not touch the developer's
+    /// real Explorer menu. The guards are what decide whether a write happens at all,
+    /// and both were reachable-by-nobody before the GUI called this on startup.
     #[test]
+    fn repair_only_acts_from_a_stable_location() {
+        // A transient copy never repairs: a `cargo run` build must not rewrite the
+        // user's menu to point at `target/debug`.
+        let temp = std::env::temp_dir().join("feather-repair-guard.exe");
+        assert_eq!(repair_if_stale(&temp), None);
+    }
+
     fn transient_install_is_refused_without_the_opt_in() {
         let temp = std::env::temp_dir().join("feather-transient-refusal-test.exe");
         // Only exercise the guard: no registry write happens on the Err path.
