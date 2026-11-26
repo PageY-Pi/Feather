@@ -421,7 +421,21 @@ struct Native {
 }
 fn context(model: &str, base_override: Option<&str>) -> Option<Native> {
     let catalog = models::load()?;
-    let (pid, p, m) = models::find(&catalog, model)?;
+    context_in(&catalog, model, base_override)
+}
+
+/// The route decision, with the catalog passed in.
+///
+/// Split out from [`context`] so the decision is testable. It was not, and the first
+/// version of these tests proved it: they called `deepseek_fallback` directly, so
+/// deleting the call to it from `context` left every test green while the feature was
+/// off. A test that cannot fail when the wiring is removed is not testing the wiring.
+fn context_in(
+    catalog: &models::ModelsFile,
+    model: &str,
+    base_override: Option<&str>,
+) -> Option<Native> {
+    let (pid, p, m) = models::find(catalog, model)?;
     let base = base_override
         .or(m.base_url.as_deref())
         .or(p.base_url.as_deref())
@@ -438,9 +452,27 @@ fn context(model: &str, base_override: Option<&str>) -> Option<Native> {
         Backend::Ddg if deepseek_host(base) => Backend::Deepseek,
         kind => kind,
     };
-    if kind == Backend::Ddg {
-        return None;
+    if kind != Backend::Ddg {
+        return Some(native_from(pid, p, m, base, kind));
     }
+    // The provider offers no native search — a reseller such as `opencode-go`,
+    // whose base is a gateway rather than a model host. Falling back to
+    // DuckDuckGo is only right when nothing better exists, because that fallback
+    // is a scrape of an HTML page: measured on one machine it took 15.2 s and
+    // failed outright while the DeepSeek Search API answered in 827 ms. So when a
+    // DeepSeek-family model is selected *and* the catalog holds a usable
+    // `deepseek` provider, search goes there instead.
+    deepseek_fallback(catalog, model)
+}
+
+/// A `Native` built from one catalog row.
+fn native_from(
+    pid: &str,
+    p: &models::ProviderEntry,
+    m: &models::ModelEntry,
+    base: &str,
+    kind: Backend,
+) -> Native {
     let mut headers = Vec::new();
     for h in [p.headers.as_ref(), m.headers.as_ref()]
         .into_iter()
@@ -454,14 +486,45 @@ fn context(model: &str, base_override: Option<&str>) -> Option<Native> {
             }
         }
     }
-    Some(Native {
+    Native {
         pid: pid.into(),
         model: m.id.clone(),
         base: base.into(),
         key: p.api_key.clone(),
         headers,
         kind,
-    })
+    }
+}
+
+/// Search through the official DeepSeek provider for a model that has no native
+/// search of its own.
+///
+/// Two conditions, both deliberate. The selected model must look like a DeepSeek
+/// model, because sending an unrelated model's query to a DeepSeek account would
+/// spend its balance on a search the user never associated with that provider. And
+/// the `deepseek` row must carry a credential — without one the request would fail
+/// with 401 and the caller would fall back to DuckDuckGo anyway, one round trip
+/// later. A custom provider whose base is DeepSeek's own host is already handled by
+/// the caller, so this only covers gateways.
+fn deepseek_fallback(catalog: &models::ModelsFile, model: &str) -> Option<Native> {
+    let id = model.rsplit('/').next().unwrap_or(model);
+    if !id.to_ascii_lowercase().contains("deepseek") {
+        return None;
+    }
+    let p = catalog.providers.get("deepseek")?;
+    // `/tools/search` takes a query, not a model, so any row will do — but a row must
+    // exist, because the `Native` carries an id and the catalog is the only source for
+    // one. Picking the first keeps this working when a user's catalog lists different
+    // DeepSeek models than this machine's does.
+    let m = p.models.first()?;
+    if p.api_key.as_deref().unwrap_or_default().trim().is_empty() {
+        return None;
+    }
+    let base = p.base_url.as_deref().unwrap_or(DEEPSEEK);
+    if !deepseek_host(base) {
+        return None;
+    }
+    Some(native_from("deepseek", p, m, base, Backend::Deepseek))
 }
 fn endpoint(base: &str, route: &str) -> String {
     let base = base.trim_end_matches('/');
@@ -897,6 +960,93 @@ impl AgentTool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reseller gateway gets no native search, so the DeepSeek fallback decides
+    /// whether `web_search` works at all for those models.
+    ///
+    /// Measured before writing this: with `opencode-go/deepseek-v4.1-flash` selected,
+    /// `web_search` took 15.2 s and returned "DuckDuckGo request failed", while the
+    /// same query through `deepseek/deepseek-flash` used the Search API and answered in
+    /// 827 ms. The fix is only correct if it fires for the first and stays away from
+    /// models that are not DeepSeek's.
+    fn catalog_with_deepseek(key: Option<&str>) -> models::ModelsFile {
+        let mut providers = std::collections::BTreeMap::new();
+        let mk = |ids: &[&str], api_key: Option<&str>| models::ProviderEntry {
+            base_url: None,
+            api: None,
+            api_key: api_key.map(str::to_string),
+            models: ids
+                .iter()
+                .map(|id| models::ModelEntry {
+                    id: (*id).to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            headers: None,
+            compat: None,
+        };
+        providers.insert("deepseek".to_string(), mk(&["deepseek-flash"], key));
+        providers.insert(
+            "opencode-go".to_string(),
+            mk(&["deepseek-v4.1-flash", "glm-5.3"], Some("gateway-key")),
+        );
+        models::ModelsFile { providers }
+    }
+
+    #[test]
+    fn a_gateway_deepseek_model_searches_through_the_official_provider() {
+        let catalog = catalog_with_deepseek(Some("official-key"));
+        // Through `context_in`, not `deepseek_fallback` directly: the earlier version
+        // of this test called the helper, so deleting the call from the route decision
+        // left it green while `web_search` still went to DuckDuckGo.
+        let native = context_in(&catalog, "opencode-go/deepseek-v4.1-flash", None)
+            .expect("a gateway DeepSeek model must reach the official Search API");
+        assert_eq!(native.kind, Backend::Deepseek);
+        assert_eq!(
+            native.base, DEEPSEEK,
+            "the fallback must target the official host, not the gateway"
+        );
+        assert_eq!(
+            native.key.as_deref(),
+            Some("official-key"),
+            "it must use the official credential, not the gateway's"
+        );
+    }
+
+    #[test]
+    fn a_missing_deepseek_credential_leaves_search_on_the_fallback() {
+        // Without a key the request would 401 and fall back to DuckDuckGo anyway, one
+        // wasted round trip later. `None` here means "no native route", which is what
+        // makes `web_search` choose DDG deliberately rather than by accident.
+        let catalog = catalog_with_deepseek(None);
+        assert!(context_in(&catalog, "opencode-go/deepseek-v4.1-flash", None).is_none());
+        let catalog = catalog_with_deepseek(Some("   "));
+        assert!(
+            context_in(&catalog, "opencode-go/deepseek-v4.1-flash", None).is_none(),
+            "a blank key is not a credential"
+        );
+    }
+
+    #[test]
+    fn the_fallback_does_not_capture_models_from_other_families() {
+        // Spending a DeepSeek account's balance on an unrelated model's query is the
+        // failure this guard prevents; glm-5.3 really does fall through to DDG.
+        let catalog = catalog_with_deepseek(Some("official-key"));
+        assert!(context_in(&catalog, "opencode-go/glm-5.3", None).is_none());
+        assert!(context_in(&catalog, "opencode-go/hungerg-free", None).is_none());
+        // A bare model id with no provider prefix still resolves.
+        assert!(context_in(&catalog, "deepseek-flash", None).is_some());
+    }
+
+    #[test]
+    fn a_native_provider_keeps_its_own_route() {
+        // Anything with a native backend returns before the fallback, so the official
+        // provider's model must keep pointing at its own row.
+        let catalog = catalog_with_deepseek(Some("official-key"));
+        let native = context_in(&catalog, "deepseek/deepseek-flash", None).unwrap();
+        assert_eq!(native.kind, Backend::Deepseek);
+        assert_eq!(native.pid, "deepseek");
+    }
     #[test]
     fn private_targets_and_credentials_are_rejected() {
         for ip in [
