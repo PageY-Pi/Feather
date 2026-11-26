@@ -563,3 +563,52 @@ snapshot. They live in different databases and each costs redb's ~2 ms floor, so
 commit, and both remaining ones are what makes a turn recoverable — the audit
 trail is the record of what happened and the snapshot is what makes resuming a
 96.9 MiB session cheap.
+
+### The redb floor bounds the rest
+
+Rounds 3 and 4 found no win, and the reason is now measurable rather than a
+feeling. Every case that sits near 2 ms is the *same* 2 ms:
+
+| case | ns/op | what it actually is |
+|---|---|---|
+| `redb.commit` (one small row) | 1,970,100 | a bare commit |
+| `snapshot.reuse` (409 messages) | 1,981,300 | the same, content irrelevant |
+| `snapshot.full` (400 serialised) | 2,007,300 | the same |
+| `checkpoints.grow` | 1,977,500 | the same |
+| `anchors.read` (1500 lines) | 1,973,400 | `build_map`'s trailing `persist` |
+| `session.commit` | 6,050,900 | ~3 of these + real work |
+
+Commit cost does not scale with content — a one-row commit and a 409-message
+snapshot are within 0.6% of each other. So the only lever is *how many commits
+happen*, which is why round 1's two removed writes were worth 22 ms and why every
+micro-optimisation inside a commit measures flat.
+
+Confirmed negative results, each reverted rather than kept:
+
+- **`Arc` in the anchor index.** `index_map` inserts one entry per line, each
+  cloning a `PathBuf` under the mutex — 1500 allocations for a 1500-line file.
+  Sharing one `Arc` changed `anchors.read` from 1,973,400 to 1,969,800 ns: the
+  1500 clones are noise beside the one commit at the end.
+- **`text_cow` in `push`.** The instruction-prefix test called `Message::text()`
+  twice, and `text()` concatenates every text block into a fresh `String`. At a
+  realistic 64 KiB tool result the replacement measured 224.9 µs against 221.4 —
+  slower, within noise. Reverted.
+
+### The known cost this work did not remove
+
+`Session::push` clones the whole message into `pending_audit`, and
+`crates/feather/examples/push_cost.rs` puts that at a flat **3.5 µs/KiB** — 225 µs
+for a 64 KiB tool result, once per message. It is one full copy of the body.
+
+The obvious fix is for `pending_audit` to hold an index into `messages` instead.
+That is **not safe today**: `set_messages_for_compaction` and `repair_context`
+replace the whole list, and the existing test
+`resume_compacted_context_pages_originals_without_a_summary_bubble` does exactly
+the dangerous sequence — 250 pushes fill the buffer, the list is replaced with a
+single summary, then `commit_turn` writes it. An index would silently record the
+summary 250 times in the audit trail.
+
+Making it safe means proving `pending_audit` is empty whenever the list is
+replaced, or remapping the indices there. Until that invariant is established the
+copy stays: 225 µs per message is cheaper than an audit trail that lies about what
+happened.
