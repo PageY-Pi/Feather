@@ -155,6 +155,41 @@ change, not a schedule.
   day and the model's own variance is the dominant term. TB is acceptance, not
   iteration.
 
+## Tool surface (2026-11-24)
+
+Measured, not reasoned. `--example tool_failures` and `--example tool_misuse`
+read all 30 real session stores and classify every tool result by cause; keep them
+and re-run after any tool change.
+
+- [x] **Merged `replace_within` into `replace`.** The evidence: of 5047
+  `replace_within` calls, **1695 failed on a missing anchor field** — and 1685 of
+  those passed `remove_from`/`remove_to`/`replacement_lines`, i.e. the model
+  reached for `replace` and got a schema error from the sibling it picked by
+  mistake. The two tools had disjoint anchor names (`remove_*` vs `replace_*`) for
+  the same concept. `replace` now takes either spelling, and which mode runs
+  depends on whether `replace_old` is present. Tool count 19 → 18; the merged
+  definition costs 316 tokens against 245 for the two it replaced, i.e. +71 tokens
+  once, in exchange for removing a 33%-of-calls failure mode.
+- [x] **Fixed a silent data-loss default while merging.** `replacement_lines` was
+  read with `unwrap_or_default()`, so a call that simply omitted the field
+  **deleted the range**. Omitting both content fields is now an error; only an
+  explicit `""` deletes. A test was written first and confirmed to fail against
+  the old code before the fix went in.
+- [ ] **`copy` and `move` are one tool wearing two names.** Identical schemas
+  (`source_from`/`source_to`/`insert_after`), and in 30 sessions they were called
+  23 times combined against 4500 reads. Cost: 247 tokens on every request, forever,
+  for a capability used once every few sessions. Not merged yet because the merge
+  needs a destination-mode field and 23 calls is too little data to prove the shape
+  is right; the risk of guessing outweighs 247 tokens for now. Revisit when usage
+  rises or a wrong-mode failure appears in the traffic.
+- [ ] **`subagent` failed 64 of 88 calls (72.7%).** Much worse than any hashline
+  tool. Not investigated.
+- [ ] **`bash` failures are mostly policy, not capability.** 638 failures, of which
+  the largest single group is `[ILLEGAL_COMMAND]` for redirection and in-place
+  edits. That is the shell/anchor split working as designed, but a model that keeps
+  trying is losing turns to it; worth checking whether the refusal text teaches the
+  alternative strongly enough.
+
 ## Research note — persistent memory (2026-11-24)
 
 Question: does persistent memory help, or does it record wrong judgments and

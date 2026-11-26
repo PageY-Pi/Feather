@@ -23,6 +23,24 @@ fn get_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(|v| v.as_bool())
 }
 
+/// Parse an anchor from the first of two spellings that is present.
+///
+/// `replace` historically used `remove_from`/`remove_to` while its partial-edit
+/// sibling used `replace_from`/`replace_to`. Models mixed them up constantly —
+/// 1685 real calls sent the other tool's keys — so the merged tool accepts both
+/// rather than rejecting a call whose intent is unambiguous.
+fn parse_anchor_alias(v: &Value, primary: &str, alias: &str) -> Result<Anchor, ToolOutcome> {
+    if v.get(primary).and_then(|x| x.as_str()).is_some() {
+        return parse_anchor(v, primary);
+    }
+    if v.get(alias).and_then(|x| x.as_str()).is_none() {
+        return Err(ToolOutcome::err(format!(
+            "missing argument: {primary} (or {alias})\n\
+             `replace` is the only edit tool; give the first and last anchor of the range."
+        )));
+    }
+    parse_anchor(v, alias)
+}
 fn parse_anchor(v: &Value, key: &str) -> Result<Anchor, ToolOutcome> {
     let s = v
         .get(key)
@@ -174,8 +192,9 @@ impl AgentTool for ReplaceTool {
     }
 
     fn description(&self) -> &'static str {
-        "Replace a range of lines (or a single line) in a text file by anchor. \
-`remove_from` and `remove_to` are the 5-character anchors of the first and last line to remove, and `replacement_lines` is one string with the exact replacement text: \"\" deletes the range. \
+        "Replace lines in a text file by anchor, either wholesale or in part. \
+Whole lines: `remove_from`/`remove_to` are the 5-char anchors of the first and last line to replace, and `replacement_lines` is the exact new text — \"\" deletes the range. \
+Part of a line: pass `replace_old` (copied exactly from the served row, must occur once in the range) and `replace_new`; every character you do not name is preserved, so nothing needs retyping. \
 Target lines by anchor, never by content or line number. \
 A trailing line break sets the last line's ending instead of adding a blank line. \
 Path resolution is anchor-only. Same-file calls in one message batch share one undo."
@@ -185,67 +204,16 @@ Path resolution is anchor-only. Same-file calls in one message batch share one u
         serde_json::json!({
             "type": "object",
             "properties": {
-                "remove_from": { "type": "string", "description": "5-char anchor of the FIRST line to remove" },
-                "remove_to": { "type": "string", "description": "5-char anchor of the LAST line to remove" },
-                "replacement_lines": { "type": "string", "description": "Exact replacement text; \"\" deletes" }
-            },
-            "required": ["remove_from", "remove_to", "replacement_lines"]
-        })
-    }
-
-    fn execute<'a>(
-        &'a self,
-        args: Value,
-        _abort: tokio::sync::watch::Receiver<bool>,
-    ) -> feather_core::tool::BoxFut<'a> {
-        Box::pin(async move {
-            let from = match parse_anchor(&args, "remove_from") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            let to = match parse_anchor(&args, "remove_to") {
-                Ok(a) => a,
-                Err(e) => return e,
-            };
-            let replacement = get_str(&args, "replacement_lines").unwrap_or_default();
-            match self.store.replace_anchors(from, to, &replacement) {
-                Ok((path, diff)) => edited(&path, &diff),
-                Err(e) => engine_out(Err(e)),
+                "remove_from": { "type": "string", "description": "5-char anchor of the FIRST line to replace (alias: replace_from)" },
+                "remove_to": { "type": "string", "description": "5-char anchor of the LAST line to replace (alias: replace_to)" },
+                "replacement_lines": { "type": "string", "description": "Whole-line mode: exact new text for the range; \"\" deletes it" },
+                "replace_old": { "type": "string", "description": "Partial mode: text to replace, copied exactly from the served row; must occur once in the range" },
+                "replace_new": { "type": "string", "description": "Partial mode: text to put in its place; \"\" deletes it" },
+                "replace_from": { "type": "string", "description": "Alias for remove_from" },
+                "replace_to": { "type": "string", "description": "Alias for remove_to" }
             }
         })
     }
-}
-
-// ---------------------------------------------------------------------------
-// replace_within
-// ---------------------------------------------------------------------------
-pub struct ReplaceWithinTool {
-    pub store: Arc<AnchorStore>,
-}
-
-impl AgentTool for ReplaceWithinTool {
-    fn name(&self) -> &'static str {
-        "replace_within"
-    }
-
-    fn description(&self) -> &'static str {
-        "Replace part of a line (or a range of lines) without retyping the rest. \
-`replace_old` is matched exactly once inside `replace_from`/`replace_to` and replaced by `replace_new`; every character the request does not name is preserved. \
-`replace_old` must be copied exactly from the served row and occur once in the range; a missing or repeated match is refused and returns the current rows."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "replace_from": { "type": "string", "description": "5-char anchor of the FIRST line searched" },
-                "replace_to": { "type": "string", "description": "5-char anchor of the LAST line searched" },
-                "replace_old": { "type": "string" },
-                "replace_new": { "type": "string" }
-            },
-            "required": ["replace_from", "replace_to", "replace_old", "replace_new"]
-        })
-    }
 
     fn execute<'a>(
         &'a self,
@@ -253,22 +221,48 @@ impl AgentTool for ReplaceWithinTool {
         _abort: tokio::sync::watch::Receiver<bool>,
     ) -> feather_core::tool::BoxFut<'a> {
         Box::pin(async move {
-            let from = match parse_anchor(&args, "replace_from") {
+            // Anchors arrive as either `remove_*` or `replace_*`. Requiring one
+            // exact spelling is what made models reach for `replace` and get a
+            // missing-argument error, so both are accepted.
+            let from = match parse_anchor_alias(&args, "remove_from", "replace_from") {
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let to = match parse_anchor(&args, "replace_to") {
+            let to = match parse_anchor_alias(&args, "remove_to", "replace_to") {
                 Ok(a) => a,
                 Err(e) => return e,
             };
-            let old = match get_str(&args, "replace_old") {
-                Some(s) => s,
-                None => return ToolOutcome::err("missing argument: replace_old"),
-            };
-            let new = get_str(&args, "replace_new").unwrap_or_default();
-            match self.store.replace_within_anchors(from, to, &old, &new) {
-                Ok((path, diff)) => edited(&path, &diff),
-                Err(e) => engine_out(Err(e)),
+            // Which mode this is depends on which content field is present. The
+            // old code defaulted `replacement_lines` to "" and so deleted the
+            // range when the field was simply omitted — a silent destructive
+            // default. Omitting both is now an error rather than a deletion.
+            let old = get_str(&args, "replace_old");
+            let new = get_str(&args, "replace_new");
+            match (old, new) {
+                (Some(old), new) => {
+                    let new = new.unwrap_or_default();
+                    match self.store.replace_within_anchors(from, to, &old, &new) {
+                        Ok((path, diff)) => edited(&path, &diff),
+                        Err(e) => engine_out(Err(e)),
+                    }
+                }
+                (None, Some(_)) => ToolOutcome::err(
+                    "replace_new needs replace_old: partial replacement requires the text to \
+                     replace. To rewrite whole lines instead, pass replacement_lines.",
+                ),
+                (None, None) => {
+                    let Some(replacement) = get_str(&args, "replacement_lines") else {
+                        return ToolOutcome::err(
+                            "missing argument: replacement_lines or replace_old\n\
+                             Whole lines: remove_from, remove_to, replacement_lines (\"\" deletes).\n\
+                             Part of a line: remove_from, remove_to, replace_old, replace_new.",
+                        );
+                    };
+                    match self.store.replace_anchors(from, to, &replacement) {
+                        Ok((path, diff)) => edited(&path, &diff),
+                        Err(e) => engine_out(Err(e)),
+                    }
+                }
             }
         })
     }
@@ -544,7 +538,7 @@ impl AgentTool for UndoTool {
     }
 
     fn description(&self) -> &'static str {
-        "Undo the last replace, replace_within, insert, copy, or move on a file, restoring the previous content. \
+        "Undo the last replace, insert, copy, or move on a file, restoring the previous content. \
 Use it when an edit removed or changed the wrong lines. If the file changed since that edit, the undo is refused with [E_UNDO_STALE] and nothing is modified: verify the current state with read and stop instead of forcing the undo."
     }
 
@@ -643,9 +637,6 @@ pub fn hashline_tools(
             store: store.clone(),
         }),
         Arc::new(ReplaceTool {
-            store: store.clone(),
-        }),
-        Arc::new(ReplaceWithinTool {
             store: store.clone(),
         }),
         Arc::new(InsertTool {
@@ -826,6 +817,188 @@ mod tests {
         );
         // the file is untouched
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the merged replace: both shapes, and the destructive default ---
+
+    async fn two_line_file(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, Arc<AnchorStore>) {
+        let dir = tmp(tag);
+        let f = dir.join("t.txt");
+        std::fs::write(&f, "alpha line\nbeta line\n").unwrap();
+        let store = Arc::new(AnchorStore::new(&dir.join(".feather")));
+        (dir, f, store)
+    }
+
+    /// Read the file and return (anchor of the line containing `needle`, text).
+    async fn anchor_for(store: &Arc<AnchorStore>, f: &std::path::Path, needle: &str) -> String {
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store.clone(), f.parent().unwrap().to_path_buf()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "r".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": f.to_string_lossy()}),
+                },
+                abort,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.text);
+        for line in out.text.lines() {
+            let Some((anchor, rest)) = line.split_once('│') else {
+                continue;
+            };
+            if rest.contains(needle) {
+                return anchor.trim().to_string();
+            }
+        }
+        panic!("no line containing {needle:?} in: {}", out.text);
+    }
+
+    #[tokio::test]
+    async fn replace_accepts_the_replace_style_anchor_names() {
+        // The bug this covers: 1685 real calls passed `replace_from`/`replace_to`
+        // to a tool that only accepted `remove_from`/`remove_to`.
+        let (dir, f, store) = two_line_file("alias").await;
+        let a = anchor_for(&store, &f, "beta line").await;
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store, dir.clone()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "1".into(),
+                    name: "replace".into(),
+                    arguments: serde_json::json!({
+                        "remove_from": a, "remove_to": a, "replacement_lines": "beta changed"
+                    }),
+                },
+                abort,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "alpha line\nbeta changed\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn replace_partial_mode_preserves_the_rest_of_the_line() {
+        let (dir, f, store) = two_line_file("partial").await;
+        let a = anchor_for(&store, &f, "beta line").await;
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store, dir.clone()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "1".into(),
+                    name: "replace".into(),
+                    arguments: serde_json::json!({
+                        "replace_from": a, "replace_to": a,
+                        "replace_old": "beta", "replace_new": "BETA"
+                    }),
+                },
+                abort,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.text);
+        // Only the named text changed; " line" survived.
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "alpha line\nBETA line\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn omitting_the_content_field_does_not_delete_the_range() {
+        // The old code did `get_str(...).unwrap_or_default()`, so a call that
+        // simply forgot `replacement_lines` silently deleted the lines. Losing
+        // content must require an explicit "".
+        let (dir, f, store) = two_line_file("nodelete").await;
+        let a = anchor_for(&store, &f, "beta line").await;
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store, dir.clone()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "1".into(),
+                    name: "replace".into(),
+                    arguments: serde_json::json!({"remove_from": a, "remove_to": a}),
+                },
+                abort,
+            )
+            .await;
+        assert!(
+            out.is_error,
+            "omitting content must be refused: {}",
+            out.text
+        );
+        assert!(out.text.contains("missing argument"), "{}", out.text);
+        // And the file is intact.
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "alpha line\nbeta line\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_empty_replacement_still_deletes() {
+        // The guard above must not remove the ability to delete on purpose.
+        let (dir, f, store) = two_line_file("empty").await;
+        let a = anchor_for(&store, &f, "beta line").await;
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store, dir.clone()) {
+            reg.add(t);
+        }
+        let (_, abort) = tokio::sync::watch::channel(false);
+        let out = reg
+            .execute_call(
+                &feather_core::message::ToolCall {
+                    id: "1".into(),
+                    name: "replace".into(),
+                    arguments: serde_json::json!({
+                        "remove_from": a, "remove_to": a, "replacement_lines": ""
+                    }),
+                },
+                abort,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha line\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn both_anchor_spellings_point_at_one_tool() {
+        // The whole point of the merge: there is no `replace_within` to pick by
+        // mistake, and asking for it must fail as an unknown tool rather than
+        // silently landing somewhere unexpected.
+        let (dir, _f, store) = two_line_file("onetool").await;
+        let mut reg = ToolRegistry::new();
+        for t in hashline_tools(store, dir.clone()) {
+            reg.add(t);
+        }
+        let names = reg.names();
+        assert!(names.contains(&"replace"), "{names:?}");
+        assert!(!names.contains(&"replace_within"), "{names:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

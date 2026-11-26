@@ -178,9 +178,6 @@ impl SubagentTool {
         .add(Arc::new(ReplaceTool {
             store: anchors.clone(),
         }))
-        .add(Arc::new(ReplaceWithinTool {
-            store: anchors.clone(),
-        }))
         .add(Arc::new(InsertTool {
             store: anchors.clone(),
         }))

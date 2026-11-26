@@ -19,7 +19,7 @@ use feather_core::tool::ToolRegistry;
 use feather_hashline::engine::ANCHOR_LEN;
 use feather_hashline::store::AnchorStore;
 use feather_hashline::tools::{
-    AnchorGrepTool, InsertTool, ReadTool, ReplaceTool, ReplaceWithinTool, UndoTool, WriteTool,
+    AnchorGrepTool, InsertTool, ReadTool, ReplaceTool, UndoTool, WriteTool,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,9 +45,6 @@ fn registry(root: &Path, anchor_home: &Path) -> ToolRegistry {
         store: store.clone(),
     }))
     .add(Arc::new(ReplaceTool {
-        store: store.clone(),
-    }))
-    .add(Arc::new(ReplaceWithinTool {
         store: store.clone(),
     }))
     .add(Arc::new(InsertTool {
@@ -320,10 +317,10 @@ async fn anchor_flow_chains_like_pi() {
         "anchors survive edits"
     );
 
-    // replace_within: partial-line substitution by anchors
+    // replace, partial mode: substitute inside a line without retyping it
     let out = call(
         &reg,
-        "replace_within",
+        "replace",
         serde_json::json!({"path": p, "replace_from": a_beta2, "replace_to": a_beta2,
                            "replace_old": "edited", "replace_new": "v2"}),
     )
@@ -354,11 +351,11 @@ async fn anchor_flow_chains_like_pi() {
     )
     .await;
     // `replace` swaps the whole line range: this SUCCEEDS by design (it
-    // replaces the alpha line). The mismatch case is `replace_within`:
+    // replaces the alpha line). The mismatch case is a wrong `replace_old`:
     assert!(!out.is_error);
     let out = call(
         &reg,
-        "replace_within",
+        "replace",
         serde_json::json!({"path": p, "replace_from": a_alpha, "replace_to": a_alpha,
                            "replace_old": "no such text on this line", "replace_new": "x"}),
     )

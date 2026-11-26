@@ -214,15 +214,27 @@ fn two_different_rules_are_not_flagged_as_duplicates() {
 
 #[test]
 fn renaming_a_tool_in_the_real_prompt_is_caught() {
-    let prompt = system_prompt().replace("`replace_within`", "`replace_inner`");
-    assert!(prompt.contains("`replace_inner`"), "mutation did not apply");
+    // Pick the name from the prompt rather than hard-coding one: a hard-coded
+    // tool that later gets removed (as `replace_within` was) leaves the mutation
+    // silently unapplied and the test passing for the wrong reason.
+    let original = system_prompt();
+    let target = rules(&original)
+        .iter()
+        .flat_map(|r| tool_references(&r.text))
+        .next()
+        .expect("the prompt names at least one tool");
+    let prompt = original.replace(&format!("`{target}`"), "`no_such_tool`");
+    assert!(
+        prompt.contains("`no_such_tool`"),
+        "mutation did not apply; target was {target}"
+    );
     let defects = audit_with(&prompt);
     assert!(
         defects.iter().any(|d| matches!(
             d,
-            Defect::DeadToolReference { name, .. } if name == "replace_inner"
+            Defect::DeadToolReference { name, .. } if name == "no_such_tool"
         )),
-        "a renamed tool went unnoticed: {:#?}",
+        "renaming `{target}` went unnoticed: {:#?}",
         defects.iter().map(Defect::explain).collect::<Vec<_>>()
     );
 }
