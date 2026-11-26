@@ -445,6 +445,44 @@ pub fn egui_event_to_action(
 #[cfg(test)]
 mod gui_modifier_tests {
     use super::*;
+    /// A combo claimed by two actions resolves to whichever is declared first, and
+    /// the loser is silently unreachable — no error, no warning, no test.
+    ///
+    /// `ctrl+c` is claimed three times: `tui.input.copy` (declared first, handler is
+    /// an empty arm because egui copies selections natively), `tui.select.cancel` and
+    /// `app.clear`. So `ctrl+c` resolves to the no-op copy action and cancelling a
+    /// selection with it does nothing. This pins the resolution order so the
+    /// collision is visible instead of being rediscovered by a user.
+    #[test]
+    fn a_combo_claimed_twice_resolves_to_the_first_declaration() {
+        let kb = Keybindings::load_from(&std::path::PathBuf::from("missing-keybindings-test.json"));
+        let ctrl_c = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            egui_event_to_action(&kb, ctrl_c, egui::Key::C),
+            Some("tui.input.copy"),
+            "`tui.input.copy` is declared before `tui.select.cancel` and wins"
+        );
+        // Every action that claims the combo, so a future edit to the table has to
+        // look at the conflict rather than quietly reversing which one works.
+        let claimants: Vec<&str> = ACTIONS
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| {
+                kb.active(id)
+                    .iter()
+                    .any(|c| c.ctrl && !c.shift && !c.alt && c.key == "c")
+            })
+            .collect();
+        assert_eq!(
+            claimants,
+            vec!["tui.input.copy", "tui.select.cancel", "app.clear"],
+            "ctrl+c claimants changed; re-check which one wins"
+        );
+    }
+
     #[test]
     fn windows_command_alias_does_not_require_super() {
         let kb = Keybindings::load_from(&std::path::PathBuf::from("missing-keybindings-test.json"));

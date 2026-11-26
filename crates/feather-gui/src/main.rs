@@ -1706,7 +1706,18 @@ impl FeatherApp {
             {
                 self.submit()
             }
-            "tui.input.copy" => {} // egui handles selection copy natively
+            // Copying a selection is egui's own job, but this arm still has to exist
+            // because `ctrl+c` resolves here before `app.interrupt` (see
+            // `a_combo_claimed_twice_resolves_to_the_first_declaration`). Doing
+            // nothing is only correct when there is nothing to interrupt: while a
+            // turn runs, `ctrl+c` must abort it, which is what the binding table's
+            // own doc comments promise. Leaving the arm empty made `ctrl+c` a silent
+            // no-op during a run.
+            "tui.input.copy" => {
+                if self.running || self.modal_open() {
+                    self.handle_action("app.interrupt", ctx);
+                }
+            }
             // editor/list actions are handled natively by egui widgets; the
             // registry still carries them for the settings panel & overrides
             _ => {}

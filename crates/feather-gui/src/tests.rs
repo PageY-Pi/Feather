@@ -2049,6 +2049,38 @@ fn a_staged_image_becomes_a_content_block_and_survives_reload() {
 }
 
 #[test]
+fn ctrl_c_aborts_a_running_turn_instead_of_doing_nothing() {
+    // `ctrl+c` resolves to `tui.input.copy`, because that action is declared before
+    // `app.interrupt` and `match_combo` returns the first match. The copy handler was
+    // an empty arm — "egui handles selection copy natively" — so during a run the key
+    // did nothing at all, and the interrupt it is documented to perform was
+    // unreachable from the keyboard.
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let mut app = fixture();
+    app.abort_tx = abort_tx;
+    app.running = true;
+    let ctx = app.egui_ctx.clone();
+    app.handle_action("tui.input.copy", &ctx);
+    assert!(
+        *abort_rx.borrow(),
+        "ctrl+c during a run must signal abort, not fall through"
+    );
+
+    // With no turn running and no modal open there is nothing to interrupt, and a
+    // stray abort signal must not be raised: the composer's copy still belongs to
+    // egui.
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let mut app = fixture();
+    app.abort_tx = abort_tx;
+    app.running = false;
+    app.handle_action("tui.input.copy", &ctx);
+    assert!(
+        !*abort_rx.borrow(),
+        "ctrl+c with nothing running must not abort a turn that does not exist"
+    );
+}
+
+#[test]
 fn an_image_without_any_text_still_sends() {
     // A pasted screenshot with no caption is a complete prompt. Before this,
     // `submit` returned early on empty text and the attachment was dropped.
