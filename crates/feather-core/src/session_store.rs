@@ -314,33 +314,17 @@ impl SessionStore {
     }
 
     /// Append one raw audit row, returning its sequence number.
+    ///
+    /// Deliberately does not touch discovery metadata: `Session::flush_audit` writes
+    /// a whole turn's rows plus (modified_ms, first_prompt) in one transaction via
+    /// [`Self::append_raw_batch`], so a single-row variant that also touched metadata
+    /// would be a strict subset of it — that form existed and had no caller, so it is
+    /// gone rather than left as a second place to keep the batching invariant right.
     pub fn append_raw(
         &self,
         id: &str,
         timestamp: u64,
         message: &Message,
-    ) -> Result<u64, SessionStoreError> {
-        self.append_raw_inner(id, timestamp, message, None)
-    }
-
-    /// Append audit and update discovery metadata with ONE durable commit.
-    pub fn append_raw_with_meta(
-        &self,
-        id: &str,
-        timestamp: u64,
-        message: &Message,
-        modified_ms: u64,
-        first_prompt: &str,
-    ) -> Result<u64, SessionStoreError> {
-        self.append_raw_inner(id, timestamp, message, Some((modified_ms, first_prompt)))
-    }
-
-    fn append_raw_inner(
-        &self,
-        id: &str,
-        timestamp: u64,
-        message: &Message,
-        touch: Option<(u64, &str)>,
     ) -> Result<u64, SessionStoreError> {
         let txn = self.db.begin_write()?;
         let seq;
@@ -358,10 +342,6 @@ impl SessionStore {
             };
             raw.insert(seq, serde_json::to_vec(&rec)?.as_slice())?;
             meta.insert(K_RAW_COUNT, (seq + 1).to_le_bytes().as_slice())?;
-            if let Some((modified_ms, first_prompt)) = touch {
-                meta.insert(K_MODIFIED_MS, modified_ms.to_le_bytes().as_slice())?;
-                meta.insert(K_FIRST_PROMPT, first_prompt.as_bytes())?;
-            }
         }
         txn.commit()?;
         Ok(seq)
@@ -757,6 +737,91 @@ pub fn first_prompt_from<'a>(messages: impl Iterator<Item = &'a Message>) -> Str
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod append_raw_tests {
+    //! `append_raw` writes rows only; discovery metadata is `append_raw_batch`'s job.
+    //!
+    //! A single-row `append_raw_with_meta` used to exist here and had no caller — the
+    //! batch form already takes the same `touch`, and it is the only shape a turn
+    //! actually needs. These tests pin the distinction so the single-row form is not
+    //! reintroduced for "convenience" and then silently left to drift from the batch
+    //! path it is supposed to agree with.
+
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "feather-session-store-{tag}-{}-{}",
+            std::process::id(),
+            crate::message::now_millis()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn append_raw_leaves_discovery_metadata_alone() {
+        let dir = temp("append-raw-meta");
+        let store = SessionStore::open(&dir).unwrap();
+        store
+            .bulk_import(
+                &SessionMeta {
+                    id: "s".into(),
+                    cwd: dir.clone(),
+                    created_ms: 1,
+                    modified_ms: 111,
+                    first_prompt: "first".into(),
+                },
+                &[("e0".into(), 1, Message::user_text("hello"))],
+            )
+            .unwrap();
+
+        store
+            .append_raw("s", 2, &Message::user_text("second"))
+            .unwrap();
+
+        let meta = store.read_meta().unwrap().expect("meta");
+        assert_eq!(
+            meta.modified_ms, 111,
+            "append_raw must not advance discovery metadata; that is the batch path's job"
+        );
+        assert_eq!(meta.first_prompt, "first");
+        assert_eq!(store.raw_len().unwrap(), 2, "the row itself must land");
+    }
+
+    #[test]
+    fn append_raw_batch_is_the_only_way_to_touch_metadata_with_rows() {
+        let dir = temp("append-batch-meta");
+        let store = SessionStore::open(&dir).unwrap();
+        store
+            .bulk_import(
+                &SessionMeta {
+                    id: "s".into(),
+                    cwd: dir.clone(),
+                    created_ms: 1,
+                    modified_ms: 111,
+                    first_prompt: "first".into(),
+                },
+                &[],
+            )
+            .unwrap();
+
+        store
+            .append_raw_batch(
+                vec![("s".to_string(), 2, Message::user_text("a"))],
+                Some((222, "first")),
+            )
+            .unwrap();
+
+        let meta = store.read_meta().unwrap().expect("meta");
+        assert_eq!(
+            meta.modified_ms, 222,
+            "the batch form carries (modified_ms, first_prompt) in the same commit"
+        );
+        assert_eq!(store.raw_len().unwrap(), 1);
+    }
 }
 
 #[cfg(test)]

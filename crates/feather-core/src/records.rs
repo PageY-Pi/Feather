@@ -67,10 +67,12 @@ impl Records {
         //
         // Creating the table used to need one, and an unconditional durable
         // commit on *every* open is what made `Records::open` cost ~20 ms on a
-        // real disk. `FileSnapshots` opens this database twice per
-        // `Session::commit_turn` (once to read the tracked list, once to write),
-        // so that single line put two avoidable fsyncs on the turn boundary —
-        // measured at 41 ms of a 71 ms commit by `feather-bench`.
+        // real disk — measured at 41 ms of a 71 ms commit by `feather-bench`. It was
+        // paid twice per `Session::commit_turn`, because `FileSnapshots` reached the
+        // database once to read the tracked list and again to write. That second
+        // open is gone too: `FileSnapshots::store` now keeps the handle in a
+        // `OnceLock`, so this database is opened at most once per instance and the
+        // cost below is paid once, not twice.
         //
         // The table is created by `put` instead, which already runs its own write
         // transaction and creates the table as part of it. `get` on a database
