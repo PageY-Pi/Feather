@@ -22,7 +22,14 @@ static DBS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Database>>>> = OnceLock::new()
 #[derive(Clone)]
 pub struct Records(Arc<Database>);
 impl Records {
-    pub(crate) fn database(&self) -> &Database {
+    /// The underlying database handle.
+    ///
+    /// Public because "is this the same handle?" is the only way to assert that the
+    /// process-wide cache did its job: two live handles to one redb file cannot
+    /// coexist, so a caller that holds one and opens the path again is either reusing
+    /// it or failing. `feather-bench`'s `records.warm` uses this to pin that reuse, so
+    /// the warm-open measurement cannot silently drift back to cold.
+    pub fn database(&self) -> &Database {
         &self.0
     }
     pub fn open(path: &Path) -> Result<Self, String> {

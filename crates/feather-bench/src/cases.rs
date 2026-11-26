@@ -57,6 +57,10 @@ pub fn registry() -> Vec<Case> {
             run: anchors_read,
         },
         Case {
+            name: "records.warm",
+            run: records_warm,
+        },
+        Case {
             name: "grep.anchor",
             run: grep_anchor,
         },
@@ -566,11 +570,49 @@ fn session_commit(root: &std::path::Path, iterations: usize) -> Measurement {
     })
 }
 
-/// Opening a `Records` database — the step `FileSnapshots` performs twice per
-/// `commit_turn` (once to read the tracked list, once to write).
+/// Opening a `Records` database, then reading through it.
 ///
-/// Isolated here because the whole-path case cannot tell you whether the cost is
-/// the open itself or the work done through it, and those have different fixes.
+/// This used to be the shape of the turn boundary: `FileSnapshots` built a fresh
+/// handle per turn and opened the file twice. It does not any more — the handle
+/// lives on `Session` — so the case is kept as a *known fixed cost* rather than a
+/// per-turn one, and it is deliberately measured cold by dropping the handle
+/// between iterations. A cold redb startup is ~10 ms and cannot be made cheaper by
+/// this codebase; the round-1 win was avoiding it, which is what the case documents.
+/// Read `session.commit` for whether the avoidance still holds.
+/// Opening a `Records` database that is already open in this process — what a turn
+/// actually pays for `tracked_paths` and `commit` now that `Session` keeps the handle.
+///
+/// This is the companion to `records.open` and the number that matters: the cold
+/// startup there is paid once per session, and every later turn takes this path. If
+/// this ever tracks `records.open`, the handle reuse has regressed.
+fn records_warm(root: &std::path::Path, iterations: usize) -> Measurement {
+    let dir = scratch_db(root, "records-warm");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("records.redb");
+    // Held for the whole measurement, so the Weak cache always upgrades. This is the
+    // session-lifetime handle `Session.file_snapshots` now keeps alive.
+    let held = feather_core::records::Records::open(&path).expect("seed open");
+    held.put("warm", &1u32).expect("seed put");
+    let mut reads = 0u32;
+    measure("records.warm", 1, iterations, || {
+        let store = feather_core::records::Records::open(&path).expect("open");
+        let value: Option<u32> = store.get("warm").expect("get");
+        reads += value.unwrap_or(0);
+        // The invariant is identity, not timing: a warm open must *reuse* the handle.
+        // Two live handles to one redb file cannot coexist, so if this ever stops being
+        // the same pointer the open above would have failed instead — and the measured
+        // number below would have silently drifted back to the cold startup cost.
+        let same = std::ptr::eq(store.database(), held.database());
+        (
+            same && value == Some(1),
+            format!(
+                "same_handle={same} key_present={} reads={reads}",
+                value.is_some()
+            ),
+        )
+    })
+}
+
 fn records_open(root: &std::path::Path, iterations: usize) -> Measurement {
     let dir = scratch_db(root, "records-open");
     std::fs::create_dir_all(&dir).expect("scratch dir");
@@ -582,10 +624,10 @@ fn records_open(root: &std::path::Path, iterations: usize) -> Measurement {
     }
     let mut reads = 0u32;
     measure("records.open", 1, iterations, || {
-        // Open and read, which is exactly what `tracked_paths` does. The handle
-        // is dropped before the next iteration, so the process-wide Weak cache
-        // cannot make the *second* open free — which is the situation the real
-        // call path is in.
+        // Open and read, exactly as a first-turn `tracked_paths` would. The handle
+        // is dropped each iteration so the process-wide Weak cache cannot make the
+        // second open free: this measures the cold startup those two calls pay *once
+        // per session* now, which is why the number is a floor and not a per-turn cost.
         let store = feather_core::records::Records::open(&path).expect("open");
         let value: Option<u32> = store.get("warm").expect("get");
         reads += value.unwrap_or(0);
