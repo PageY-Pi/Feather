@@ -85,6 +85,25 @@ if ($BinariesOnly) {
             throw "$name ($builtAt) is newer than the installer ($packagedAt) - rebuild it with: ISCC installer/Feather.iss"
         }
     }
+    # The .iss sets CloseApplications=yes, which lets the installer terminate a
+    # running Feather to free its files. That is right for a user double-clicking
+    # Setup, and wrong for an automated run: it would close a window somebody is
+    # using, mid-conversation. Refuse instead, and name the safe path.
+    $running = @(Get-Process -Name 'feather-gui', 'feather' -ErrorAction SilentlyContinue |
+        Where-Object {$_.Path -and $_.Path.StartsWith($app, 'OrdinalIgnoreCase')})
+    if ($running.Count -gt 0) {
+        $ids = ($running | ForEach-Object {$_.Id}) -join ', '
+        throw @"
+Refusing to run the installer: Feather is running (PID $ids).
+The installer is configured with CloseApplications=yes and would close it.
+
+To update without touching the running window, use:
+    powershell -ExecutionPolicy Bypass -File scripts/install-local.ps1 -BinariesOnly
+
+That renames the in-use image aside and writes the new one in its place, so the
+current window keeps running the old build and the new one applies on next start.
+"@
+    }
     $p = Start-Process $Installer -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOCLOSEAPPLICATIONS' -PassThru -Wait
     if ($p.ExitCode -ne 0) {throw "Installer exit $($p.ExitCode)"}
     Write-Output "Installer exit: $($p.ExitCode)"
