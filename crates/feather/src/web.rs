@@ -77,7 +77,15 @@ async fn body(mut response: Response) -> Result<Vec<u8>, String> {
         .content_length()
         .is_some_and(|n| n > BODY_LIMIT as u64)
     {
-        return Err("Response exceeds 2 MiB input limit".into());
+        // The size is known here and was previously discarded, leaving the caller
+        // unable to tell "just over the limit" from "a 500 MB archive". A page
+        // slightly over the cap is worth retrying against a sub-resource; a
+        // monstrous one is not.
+        return Err(format!(
+            "Response is {n} bytes, over the {BODY_LIMIT} byte (2 MiB) input limit. \
+             Fetch a specific sub-page or raw file instead; the HTML is not truncated to fit.",
+            n = response.content_length().unwrap_or_default()
+        ));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -86,7 +94,15 @@ async fn body(mut response: Response) -> Result<Vec<u8>, String> {
         .map_err(|_| "Cannot read HTTP response".to_string())?
     {
         if bytes.len() + chunk.len() > BODY_LIMIT {
-            return Err("Response exceeds 2 MiB input limit".into());
+            // Same wording as the Content-Length path: this one fires when the
+            // length was absent (chunked or gzip-decoded), so the caller cannot
+            // otherwise tell which check rejected it.
+            return Err(format!(
+                "Response exceeded the {BODY_LIMIT} byte (2 MiB) input limit after reading \
+                 {} bytes. Fetch a specific sub-page or raw file instead; the HTML is not \
+                 truncated to fit.",
+                bytes.len() + chunk.len()
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -294,12 +310,33 @@ fn parse_ddg(html: &str) -> Result<String, String> {
         .take(8)
         .map(|s| s.text().collect::<Vec<_>>().join(" "))
         .collect();
-    if titles.is_empty()
-        && (html.contains("anomaly-modal")
+    // Distinguish "the query genuinely had no results" from "this page is not a
+    // results page". Both leave `titles` empty, but they need opposite reports:
+    // the first is a successful search, and calling it a failure would be wrong;
+    // the second is a silent lie that tells the caller a real query returned
+    // nothing. A results page always carries the `.result__a` container even when
+    // it has no rows, so the container is the signal, not the row count.
+    if titles.is_empty() {
+        let has_result_container = document.select(&a).next().is_some();
+        let challenge = html.contains("anomaly-modal")
             || html.contains("captcha")
-            || html.contains("challenge-form"))
-    {
-        return Err("DuckDuckGo returned an anti-bot challenge; try again later".into());
+            || html.contains("challenge-form");
+        if challenge || !has_result_container {
+            // A challenge page and an unrecognised layout are the same thing to
+            // the caller: no results were extracted, and retrying the identical
+            // query is unlikely to change it. Say so instead of returning an
+            // empty result set as success.
+            return Err(if challenge {
+                "DuckDuckGo returned an anti-bot challenge; retrying immediately will likely \
+                 return the same page. Use `web_fetch` on a known URL instead, or try again later."
+                    .into()
+            } else {
+                "DuckDuckGo returned a page with no recognisable results (the layout may have \
+                 changed, or the query matched nothing). Try different terms, or use `web_fetch` \
+                 on a known URL."
+                    .into()
+            });
+        }
     }
     Ok(if titles.is_empty() {
         "No results found.".into()
@@ -889,6 +926,22 @@ mod tests {
         assert!(results.contains("Title & More"));
         assert!(results.contains("A snippet"));
         assert!(parse_ddg("<form class='challenge-form'>captcha</form>").is_err());
+        // A page that parsed into no rows and has no results container is not a
+        // successful empty search. Reporting it as "No results found." told the
+        // caller a real query had matched nothing, which is indistinguishable
+        // from a layout change or a challenge page the substring check missed.
+        let unrecognised = parse_ddg("<html><body><p>something else entirely</p></body></html>");
+        assert!(
+            unrecognised.is_err(),
+            "an unrecognised page must not report success: {unrecognised:?}"
+        );
+        // A genuine empty result set still has the container, and must stay a
+        // success: the query really did match nothing.
+        let empty_but_real = parse_ddg(r#"<div class="results"><ol class="result__a"></ol></div>"#);
+        assert!(
+            empty_but_real.is_ok(),
+            "an empty result page is still a successful search: {empty_but_real:?}"
+        );
         let response = cited_response(
             &json!({"content":[{"type":"text","text":"answer","citations":[{"url":"https://example.com","title":"site"}]}]}),
             Backend::Anthropic,

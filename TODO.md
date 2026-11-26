@@ -238,6 +238,38 @@ and re-run after any tool change.
   edits. That is the shell/anchor split working as designed, but a model that keeps
   trying is losing turns to it; worth checking whether the refusal text teaches the
   alternative strongly enough.
+- [x] **The refusal text was teaching the wrong thing, and one guard was simply
+  wrong.** Two separate defects, both from reading the code after the traffic
+  numbers:
+
+  The `>`-redirect check ran on a lexer that had already stripped quotes, so a
+  quoted `>` became a bare `>` token and was refused as "shell redirection would
+  write a file". `grep '>' notes.txt`, `awk 'BEGIN{print "a>b"}'`, and any patch
+  body containing `->` were all blocked for writing files they never touch. The
+  lexer now carries a per-token "came from quotes" flag (`lex_quoted`) and the
+  redirect scan only fires on unquoted operators. The unquoted forms are still
+  refused, and `/dev/null`, `NUL`, `2>&1` still pass — all three locked by tests.
+
+  Every refusal also said "use the anchor file tools", which is internal jargon:
+  the tools are named `write`/`replace`/`insert`. `illegal_with` now requires a
+  concrete next step per case ("write it with `write` (path + content), or edit it
+  with `replace`") and states what bash *does* allow.
+- [ ] **The guard still lets real writers through.** `tee`, `cp`, `mv`, `dd`,
+  `truncate`, `rm`, `sed -n 'w out'`, `awk -i inplace`, and `echo hi >&out.txt` are
+  all unblocked, so the file-write protection is a speed bump, not a boundary.
+  Also `python -c"..."` (attached, no space) escapes the inline-script check, and
+  backtick/`$()` wrapping escapes the self-kill guard. Not fixed here: it is a
+  sandbox problem, not a message problem, and closing it properly means deciding
+  whether the bash tool is trusted at all.
+- [x] **`web_fetch` and `web_search` each failed ~18%.** `web_fetch` discarded the
+  size it had in hand and returned the same opaque "exceeds 2 MiB" from both the
+  Content-Length and streaming paths; the messages now carry the measured size and
+  say the HTML is not truncated to fit. `web_search` had a silent-success path:
+  `parse_ddg` returned `Ok("No results found.")` for any page it could not parse,
+  including challenge pages the three-substring check missed. It now requires a
+  results container, so "not a results page" is an error while a genuine empty
+  result set stays a success. Test proves the old behaviour returned
+  `Ok("No results found.")` for an unrecognised page.
 
 ## Research note — persistent memory (2026-11-24)
 

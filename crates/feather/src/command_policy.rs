@@ -11,7 +11,25 @@ pub fn check(command: &str) -> Result<(), String> {
     check_depth(command, 0)
 }
 fn illegal(reason: &str) -> Result<(), String> {
-    Err(format!("[ILLEGAL_COMMAND] Blocked before execution: {reason}. Use the anchor file tools or an allowed inspection command. This is a recoverable tool error; continue with a safe alternative."))
+    illegal_with(
+        reason,
+        "use the `write`, `replace`, or `insert` tool instead",
+    )
+}
+
+/// Refuse a command, naming the tool that does the equivalent safely.
+///
+/// The old text said "use the anchor file tools", which is internal jargon: the
+/// tools are named `write`/`replace`/`insert`/`read`, and a model told to use
+/// "anchor tools" has to guess. Every refusal now names a concrete next step,
+/// because the point of the preflight is to redirect the call, not just stop it.
+fn illegal_with(reason: &str, instead: &str) -> Result<(), String> {
+    Err(format!(
+        "[ILLEGAL_COMMAND] Blocked before execution: {reason}. \
+         This is a recoverable tool error: {instead} and continue. \
+         Allowed in bash: reading, searching, building, testing, and redirecting to \
+         /dev/null or NUL."
+    ))
 }
 
 /// Process names that ARE Feather's own runtime. Killing any of these from a
@@ -102,16 +120,25 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
     if depth > 4 {
         return illegal("nested shell command exceeds policy inspection depth");
     }
-    let segments = lex(command);
+    let segments = lex_quoted(command);
     for words in segments {
-        for (n, word) in words.iter().enumerate() {
-            if matches!(word.as_str(), ">" | ">>" | "&>" | "&>>" | ">|") {
-                let target = words.get(n + 1).map(String::as_str).unwrap_or("");
+        for (n, (word, from_quotes)) in words.iter().enumerate() {
+            // A redirect operator only counts when it was not quoted. Otherwise
+            // `grep '>' f`, `awk 'BEGIN { print "a>b" }'` and any patch body
+            // containing `->` were refused for writing a file they never touch.
+            if !*from_quotes && matches!(word.as_str(), ">" | ">>" | "&>" | "&>>" | ">|") {
+                let target = words.get(n + 1).map(|(w, _)| w.as_str()).unwrap_or("");
                 if target != "/dev/null" && target != "NUL" && !target.starts_with('&') {
-                    return illegal("shell redirection would write a file");
+                    return illegal_with(
+                        "shell redirection would write a file",
+                        "write the file with the `write` tool (path + content), or edit it with `replace`",
+                    );
                 }
             }
         }
+        // Everything below reasons about token text only; the quote flag is
+        // needed just for the redirect scan above.
+        let words: Vec<String> = words.into_iter().map(|(w, _)| w).collect();
         let Some(index) = words.iter().position(|w| {
             !w.contains('=')
                 && !matches!(
@@ -131,7 +158,12 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
         // Never let a tool call terminate the runtime that issued it.
         check_self_kill(&program, args)?;
         match program.as_str() {
-            "eval" => return illegal("eval cannot be safely preflighted"),
+            "eval" => {
+                return illegal_with(
+                    "eval cannot be safely preflighted",
+                    "run the command directly instead",
+                )
+            }
             "bash" | "sh" | "zsh" => {
                 if let Some(n) = args
                     .iter()
@@ -150,7 +182,10 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
                             || (!a.starts_with("--") && a.contains('i')))
                 }) =>
             {
-                return illegal("in-place text edits belong to anchor tools")
+                return illegal_with(
+                    "in-place text edits are not allowed in bash",
+                    "use `replace` with the anchors from `read`, or `anchor_grep` to locate the text first",
+                )
             }
             "python" | "python3" | "py" | "node" | "ruby" => {
                 if let Some(n) = args
@@ -172,7 +207,10 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
                         .iter()
                         .any(|s| script.contains(s))
                         {
-                            return illegal("inline script would edit files outside anchor tools");
+                            return illegal_with(
+                                "an inline script would write files from bash",
+                                "make the edit with `write` or `replace`",
+                            );
                         }
                     }
                 }
@@ -183,7 +221,10 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
                     .position(|a| matches!(a.as_str(), "reset" | "clean"))
                 {
                     if args[n] == "reset" && args[n + 1..].iter().any(|a| a == "--hard") {
-                        return illegal("git reset --hard can destroy user work");
+                        return illegal_with(
+                            "git reset --hard can destroy user work",
+                            "`git stash`, or undo a single edit with `undo_last_change`",
+                        );
                     }
                     if args[n] == "clean"
                         && args[n + 1..].iter().any(|a| {
@@ -191,7 +232,10 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
                                 || a.starts_with('-') && !a.starts_with("--") && a.contains('f')
                         })
                     {
-                        return illegal("git clean --force can destroy untracked user work");
+                        return illegal_with(
+                            "git clean --force can destroy untracked user work",
+                            "delete the specific paths you created instead of everything untracked",
+                        );
                     }
                 }
             }
@@ -200,17 +244,59 @@ fn check_depth(command: &str, depth: usize) -> Result<(), String> {
     }
     Ok(())
 }
-// Quote-aware tokens preserve literal script arguments for nested preflight.
-fn lex(text: &str) -> Vec<Vec<String>> {
+
+/// Lex into `(token, came_from_quotes)` pairs.
+///
+/// The quote flag exists because stripping quotes before the operator scan made a
+/// quoted `>` indistinguishable from a redirect: `grep '>' notes.txt` writes
+/// nothing, yet was refused as `shell redirection would write a file`. Operators
+/// are only ever produced by the unquoted branches below, so the flag is exactly
+/// what the redirect check needs.
+fn lex_quoted(text: &str) -> Vec<Vec<(String, bool)>> {
     let mut segments = Vec::new();
-    let mut words = Vec::new();
+    let mut words: Vec<(String, bool)> = Vec::new();
     let mut word = String::new();
+    let mut word_quoted = false;
     let mut quote = None;
     let mut escaped = false;
     let mut chars = text.chars().peekable();
+
+    // Flush the pending word, remembering whether any of it came from quotes.
+    macro_rules! flush_word {
+        () => {
+            if !word.is_empty() {
+                words.push((std::mem::take(&mut word), word_quoted));
+                // Required, not redundant: this macro also runs between a
+                // word and a following operator (`grep 'x' > f` flushes `x`
+                // then pushes `>`), and the next word must start unquoted.
+                // The compiler cannot see that path because `word_quoted` is
+                // only read again after something pushes into `word`.
+                #[allow(unused_assignments)]
+                {
+                    word_quoted = false;
+                }
+            }
+        };
+    }
+    // Close the current segment (a `;`/`|`/newline boundary).
+    macro_rules! end_segment {
+        () => {
+            if !words.is_empty() {
+                segments.push(std::mem::take(&mut words));
+            }
+        };
+    }
+    // Push an operator token, which by construction is never quoted.
+    macro_rules! push_op {
+        ($op:expr) => {
+            words.push(($op, false))
+        };
+    }
+
     while let Some(ch) = chars.next() {
         if escaped {
             word.push(ch);
+            word_quoted = true;
             escaped = false;
             continue;
         }
@@ -223,48 +309,43 @@ fn lex(text: &str) -> Vec<Vec<String>> {
                 quote = None;
             } else {
                 word.push(ch);
+                word_quoted = true;
             }
             continue;
         }
         if ch == '\'' || ch == '"' {
             quote = Some(ch);
+            // An empty pair (`''`) still marks the token as quoted so that a
+            // following operator scan does not treat a bare quote-derived token
+            // as an operator.
+            word_quoted = true;
             continue;
         }
         if ch.is_whitespace() {
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
-            }
-            if ch == '\n' && !words.is_empty() {
-                segments.push(std::mem::take(&mut words));
+            flush_word!();
+            if ch == '\n' {
+                end_segment!();
             }
             continue;
         }
         if matches!(ch, ';' | '|' | '&') {
             if ch == '&' && chars.peek() == Some(&'>') {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
+                flush_word!();
                 let mut op = String::from("&>");
                 chars.next();
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     op.push('>');
                 }
-                words.push(op);
+                push_op!(op);
                 continue;
             }
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
-            }
-            if !words.is_empty() {
-                segments.push(std::mem::take(&mut words));
-            }
+            flush_word!();
+            end_segment!();
             continue;
         }
         if ch == '>' {
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
-            }
+            flush_word!();
             let mut op = String::from(">");
             if matches!(chars.peek(), Some('>') | Some('|')) {
                 op.push(chars.next().unwrap());
@@ -273,17 +354,13 @@ fn lex(text: &str) -> Vec<Vec<String>> {
                 chars.next();
                 op.push('&');
             }
-            words.push(op);
+            push_op!(op);
             continue;
         }
         word.push(ch);
     }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    if !words.is_empty() {
-        segments.push(words);
-    }
+    flush_word!();
+    end_segment!();
     segments
 }
 #[cfg(test)]
@@ -345,6 +422,61 @@ mod tests {
             "Stop-Process -Name notepad",
             "pkill notepad",
             "kill 999999",
+        ] {
+            assert!(check(command).is_ok(), "{command}");
+        }
+    }
+
+    /// A quoted `>` is an argument, not a redirect.
+    ///
+    /// The lexer strips quotes before the operator scan, so `grep '>' f` produced
+    /// exactly the same token as `echo x > f` and was refused for writing a file
+    /// it never touches. These are ordinary read-only commands that a shell user
+    /// runs constantly, and the refusal taught the model to route around a tool
+    /// that was simply wrong about them.
+    #[test]
+    fn a_quoted_angle_bracket_is_not_a_redirect() {
+        for command in [
+            "grep '>' notes.txt",
+            "grep \">\" notes.txt",
+            "rg --fixed-strings '=>' src/",
+            "awk 'BEGIN { print \"a>b\" }'",
+            "git log --format='%h -> %s'",
+            // A patch body carried on stdin contains `->` inside a heredoc.
+            "python -c 'print(\"=>\")'",
+        ] {
+            assert!(check(command).is_ok(), "{command} should be allowed");
+        }
+    }
+
+    /// The unquoted forms must still be refused, or the fix above would have
+    /// opened the hole it was meant to close.
+    #[test]
+    fn a_real_redirect_is_still_refused() {
+        for command in [
+            "echo hi > out.txt",
+            "echo hi >> out.txt",
+            "echo hi &> out.txt",
+            "printf x 1> out.txt",
+            // Mixed quoting: the operator itself is unquoted, so it still writes.
+            "echo \"hi\" > out.txt",
+            "echo hi >\"out.txt\"",
+            "cat a b >combined.txt",
+        ] {
+            let err = check(command).unwrap_err();
+            assert!(err.contains("ILLEGAL_COMMAND"), "{command} -> {err}");
+        }
+    }
+
+    /// The documented carve-outs must keep working, since they are the only way
+    /// to discard output.
+    #[test]
+    fn discarding_output_stays_allowed() {
+        for command in [
+            "cargo test > /dev/null",
+            "cargo test 2>&1",
+            "cargo test > NUL",
+            "make 2>&1 | tail -20",
         ] {
             assert!(check(command).is_ok(), "{command}");
         }
